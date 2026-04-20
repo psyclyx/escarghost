@@ -47,37 +47,27 @@ fn mmapFont(path: []const u8) ![]const u8 {
     return ptr[0..size];
 }
 
-/// Find a monospace font path. Try config, fc-match, then hardcoded fallbacks.
+const fc = @cImport(@cInclude("fontconfig/fontconfig.h"));
+
+/// Find a monospace font via fontconfig C API (no subprocess).
 fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
     if (config_path.len > 0) return try allocator.dupe(u8, config_path);
 
-    // fc-match
-    const pipe = c.popen("fc-match -f '%{file}' monospace 2>/dev/null", "r");
-    if (pipe) |p| {
-        defer _ = c.pclose(p);
-        var buf: [4096]u8 = undefined;
-        const n = c.fread(&buf, 1, buf.len, p);
-        if (n > 0) {
-            const fc_path = buf[0..n];
-            const z = try allocator.dupeZ(u8, fc_path);
-            defer allocator.free(z);
-            if (c.access(z.ptr, c.F_OK) == 0) {
-                return try allocator.dupe(u8, fc_path);
-            }
-        }
-    }
+    const pattern = fc.FcNameParse("monospace") orelse return error.NoFontFound;
+    defer fc.FcPatternDestroy(pattern);
 
-    const fallbacks = [_][]const u8{
-        "/usr/share/fonts/TTF/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    };
-    for (fallbacks) |path| {
-        const z = try allocator.dupeZ(u8, path);
-        defer allocator.free(z);
-        if (c.access(z.ptr, c.F_OK) == 0) return try allocator.dupe(u8, path);
-    }
-    return error.NoFontFound;
+    _ = fc.FcConfigSubstitute(null, pattern, fc.FcMatchPattern);
+    fc.FcDefaultSubstitute(pattern);
+
+    var result: fc.FcResult = undefined;
+    const match = fc.FcFontMatch(null, pattern, &result) orelse return error.NoFontFound;
+    defer fc.FcPatternDestroy(match);
+
+    var file_ptr: [*c]u8 = undefined;
+    if (fc.FcPatternGetString(match, fc.FC_FILE, 0, &file_ptr) != fc.FcResultMatch)
+        return error.NoFontFound;
+
+    return try allocator.dupe(u8, std.mem.sliceTo(file_ptr, 0));
 }
 
 /// Background font loading — writes result to shared struct.

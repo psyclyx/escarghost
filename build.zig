@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("egl", .{});
     root_module.linkSystemLibrary("xkbcommon", .{});
     root_module.linkSystemLibrary("gl", .{});
+    root_module.linkSystemLibrary("fontconfig", .{});
 
     // Wayland protocol implementations
     root_module.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });

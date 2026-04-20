@@ -24,6 +24,7 @@ pkgs.mkShell {
     wayland-scanner
     libxkbcommon
     harfbuzz
+    fontconfig
   ];
 
   buildInputs = [
