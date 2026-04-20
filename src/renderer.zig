@@ -112,6 +112,8 @@ pub const Renderer = struct {
     has_prev_frame: bool = false,
     prev_cursor_x: u16 = 0,
     prev_cursor_y: u16 = 0,
+    prev_cursor_style: terminal_mod.CursorVisualStyle = .block,
+    prev_cursor_visible: bool = false,
 
     pub var frame_stats: perf.FrameStats = .{};
 
@@ -379,9 +381,12 @@ pub const Renderer = struct {
         const dirty = term.getDirty();
         const cursor = term.getCursor();
 
-        // Check if cursor moved — needs a redraw even if ghostty says nothing is dirty
-        const cursor_moved = cursor.x != self.prev_cursor_x or cursor.y != self.prev_cursor_y;
-        if (dirty == .false_ and !cursor_moved) return false;
+        // Cursor changes need a redraw even if ghostty says cells aren't dirty
+        const cursor_changed = cursor.x != self.prev_cursor_x or
+            cursor.y != self.prev_cursor_y or
+            @intFromEnum(cursor.style) != @intFromEnum(self.prev_cursor_style) or
+            cursor.visible != self.prev_cursor_visible;
+        if (dirty == .false_ and !cursor_changed) return false;
 
         const colors = term.getColors();
         const default_fg = colors.foreground;
@@ -440,6 +445,8 @@ pub const Renderer = struct {
         self.has_prev_frame = true;
         self.prev_cursor_x = cursor.x;
         self.prev_cursor_y = cursor.y;
+        self.prev_cursor_style = cursor.style;
+        self.prev_cursor_visible = cursor.visible;
 
         // Cursor overlay (never baked into cache)
         if (cursor.visible and cursor.in_viewport) {
