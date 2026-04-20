@@ -54,6 +54,7 @@ pub const Wayland = struct {
     pointer: ?*wl.wl_pointer = null,
     decoration_manager: ?*wl.zxdg_decoration_manager_v1 = null,
 
+    shm: ?*wl.wl_shm = null,
     surface: ?*wl.wl_surface = null,
     xdg_surface: ?*wl.xdg_surface = null,
     xdg_toplevel: ?*wl.xdg_toplevel = null,
@@ -84,6 +85,7 @@ pub const Wayland = struct {
     on_focus: ?*const fn (bool) void = null,
 
     pub fn init(self: *Wayland, width: u32, height: u32, title: [:0]const u8) !void {
+        self.shm = null;
         self.compositor = null;
         self.xdg_wm_base = null;
         self.seat = null;
@@ -332,6 +334,8 @@ pub const Wayland = struct {
             if (self.seat) |seat| {
                 _ = wl.wl_seat_add_listener(seat, &seat_listener, @ptrCast(self));
             }
+        } else if (std.mem.eql(u8, iface, "wl_shm")) {
+            self.shm = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wl_shm_interface, 1));
         } else if (std.mem.eql(u8, iface, "zxdg_decoration_manager_v1")) {
             self.decoration_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zxdg_decoration_manager_v1_interface, 1));
         }

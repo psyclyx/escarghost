@@ -4,6 +4,7 @@ const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
 const renderer_mod = @import("renderer.zig");
+const shm_render = @import("shm_render.zig");
 const perf = @import("perf.zig");
 
 const c = @cImport({
@@ -72,11 +73,12 @@ fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const 
 
 /// Background thread: font discovery + parse + atlas build (all CPU, no GL).
 /// Overlaps with EGL init on the main thread.
-fn prepThread(renderer: *renderer_mod.Renderer, font_path_out: *[]const u8, cfg_font_path: []const u8, font_size: f32) void {
+fn prepThread(renderer: *renderer_mod.Renderer, font_path_out: *[]const u8, font_data_out: *[]const u8, cfg_font_path: []const u8, font_size: f32) void {
     const allocator = std.heap.smp_allocator;
     const path = findFontPath(allocator, cfg_font_path) catch return;
     font_path_out.* = path;
     const data = mmapFont(path) catch return;
+    font_data_out.* = data;
     renderer.initCpu(allocator, data, font_size) catch return;
 }
 
@@ -189,7 +191,8 @@ pub fn main(init: std.process.Init) !void {
     var renderer: renderer_mod.Renderer = undefined;
     defer renderer.deinit();
     var font_path: []const u8 = "";
-    const prep_thread = try std.Thread.spawn(.{}, prepThread, .{ &renderer, &font_path, cfg.font_path, cfg.font_size });
+    var font_result_data: []const u8 = "";
+    const prep_thread = try std.Thread.spawn(.{}, prepThread, .{ &renderer, &font_path, &font_result_data, cfg.font_path, cfg.font_size });
 
     // Wait for prep thread — gives us cell metrics (~8ms)
     prep_thread.join();
@@ -215,7 +218,44 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
 
-    // ── Phase 4: EGL init (73ms driver work, shell loading in parallel) ──
+    // ── Phase 4: SHM first frame (freetype CPU rendering) ──
+    // Show real terminal content before EGL is ready.
+    // Read any PTY output, feed to ghostty, rasterize with freetype.
+    {
+        var pty_buf: [4096]u8 = undefined;
+        // Give shell a moment to produce output
+        var poll_fds = [_]c.struct_pollfd{
+            .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
+        };
+        _ = c.poll(&poll_fds, 1, 5); // 5ms max wait
+        if (poll_fds[0].revents & c.POLLIN != 0) {
+            while (true) {
+                const n = pty.read(&pty_buf) catch break;
+                if (n == 0) break;
+                term.feedData(pty_buf[0..n]);
+            }
+        }
+
+        if (wl.shm) |shm| {
+            var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
+            if (frame_opt) |*frame| {
+                defer frame.destroy();
+                frame.renderTerminal(
+                    &term,
+                    font_result_data,
+                    cfg.font_size,
+                    renderer.cell_width,
+                    renderer.cell_height,
+                    cfg.foreground,
+                    cfg.background,
+                );
+                frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                std.debug.print("mollusk: SHM frame ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            }
+        }
+    }
+
+    // ── Phase 5: EGL init (73ms driver work, shell loading in parallel) ──
     try wl.initEglPublic();
 
     std.debug.print("mollusk: EGL ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
