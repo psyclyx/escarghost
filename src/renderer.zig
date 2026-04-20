@@ -57,7 +57,16 @@ pub const Renderer = struct {
         errdefer self.snail_renderer.deinit();
 
         self.snail_renderer.uploadAtlas(&self.atlas);
+
+        // Rendering quality setup
         self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
+        self.snail_renderer.setFillRule(.non_zero); // TrueType standard
+
+        // Enable sRGB framebuffer if available — ensures correct gamma for
+        // blending operations. Snail's shaders apply sRGB gamma to coverage,
+        // but having the framebuffer in sRGB space means GL blending also
+        // happens in linear light.
+        gl.glEnable(gl.GL_FRAMEBUFFER_SRGB);
 
         // Compute cell metrics from font
         const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
@@ -100,10 +109,15 @@ pub const Renderer = struct {
         const colors = term.getColors();
         const cursor = term.getCursor();
 
-        // Clear with background color
+        // Clear with background color (convert to linear for sRGB framebuffer)
         const bg = colors.background.toFloat4(1.0);
         gl.glClearColor(bg[0], bg[1], bg[2], bg[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+
+        // Ensure clean GL state for this frame
+        gl.glDisable(gl.GL_DEPTH_TEST);
+        gl.glEnable(gl.GL_BLEND);
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA); // premultiplied alpha
 
         // Orthographic projection: pixel coords, bottom-left origin (for text pipeline)
         const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
@@ -224,32 +238,36 @@ pub const Renderer = struct {
         if (cursor.visible and cursor.in_viewport) {
             const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
             const cy = @as(f32, @floatFromInt(cursor.y)) * self.cell_height;
-            const cursor_color = colors.foreground.toFloat4(1.0);
+            const cc = if (colors.cursor) |c| c.toFloat4(1.0) else colors.foreground.toFloat4(1.0);
 
             switch (cursor.style) {
-                .block => _ = vec_batch.addRect(
-                    .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height },
-                    .{ cursor_color[0], cursor_color[1], cursor_color[2], 0.5 },
-                    .{ 0, 0, 0, 0 },
-                    0,
-                ),
+                .block => {
+                    // Solid block — draw the block, then re-draw the glyph
+                    // under the cursor with inverted color in the text pass below
+                    _ = vec_batch.addRect(
+                        .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height },
+                        cc,
+                        .{ 0, 0, 0, 0 },
+                        0,
+                    );
+                },
                 .bar => _ = vec_batch.addRect(
                     .{ .x = cx, .y = cy, .w = 2, .h = self.cell_height },
-                    cursor_color,
+                    cc,
                     .{ 0, 0, 0, 0 },
                     0,
                 ),
                 .underline => _ = vec_batch.addRect(
                     .{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2 },
-                    cursor_color,
+                    cc,
                     .{ 0, 0, 0, 0 },
                     0,
                 ),
                 .block_hollow => _ = vec_batch.addRect(
                     .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height },
                     .{ 0, 0, 0, 0 },
-                    cursor_color,
-                    1,
+                    cc,
+                    1.5,
                 ),
             }
         }
@@ -262,6 +280,48 @@ pub const Renderer = struct {
         // Draw text
         if (text_batch.glyphCount() > 0) {
             self.snail_renderer.draw(text_batch.slice(), mvp, self.viewport_w, self.viewport_h);
+        }
+
+        // Re-draw the glyph under a block cursor with inverted color so it's
+        // readable against the solid cursor background
+        if (cursor.visible and cursor.in_viewport and cursor.style == .block) {
+            // Find the cell under the cursor and redraw with bg color
+            term.beginRowIteration();
+            var skip_rows: u16 = 0;
+            while (term.nextRow()) : (skip_rows += 1) {
+                if (skip_rows == cursor.y) {
+                    term.beginCellIteration();
+                    var skip_cols: u16 = 0;
+                    while (term.nextCell()) : (skip_cols += 1) {
+                        if (skip_cols == cursor.x) {
+                            const cell = term.getCellInfo();
+                            if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
+                                var utf8_buf: [4]u8 = undefined;
+                                const utf8_len = std.unicode.utf8Encode(@intCast(cell.codepoint), &utf8_buf) catch 0;
+                                if (utf8_len > 0) {
+                                    const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
+                                    const cy_bl = self.viewport_h - @as(f32, @floatFromInt(cursor.y + 1)) * self.cell_height;
+                                    var inv_batch = snail.Batch.init(self.text_buf);
+                                    _ = inv_batch.addString(
+                                        &self.atlas,
+                                        &self.font,
+                                        utf8_buf[0..utf8_len],
+                                        cx,
+                                        cy_bl + self.cell_height * 0.2,
+                                        self.font_size,
+                                        colors.background.toFloat4(1.0),
+                                    );
+                                    if (inv_batch.glyphCount() > 0) {
+                                        self.snail_renderer.draw(inv_batch.slice(), mvp, self.viewport_w, self.viewport_h);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
         }
 
         term.resetDirty();

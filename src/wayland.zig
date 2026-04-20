@@ -175,19 +175,30 @@ pub const Wayland = struct {
 
         _ = egl.eglBindAPI(egl.EGL_OPENGL_API);
 
-        const config_attribs = [_]egl.EGLint{
+        // Try MSAA 4x first for smoother edges, fall back to no MSAA
+        const base_attribs = [_]egl.EGLint{
             egl.EGL_SURFACE_TYPE,    egl.EGL_WINDOW_BIT,
             egl.EGL_RED_SIZE,        8,
             egl.EGL_GREEN_SIZE,      8,
             egl.EGL_BLUE_SIZE,       8,
             egl.EGL_ALPHA_SIZE,      8,
             egl.EGL_RENDERABLE_TYPE, egl.EGL_OPENGL_BIT,
+        };
+        const msaa_attribs = base_attribs ++ [_]egl.EGLint{
+            egl.EGL_SAMPLE_BUFFERS, 1,
+            egl.EGL_SAMPLES,        4,
+            egl.EGL_NONE,
+        };
+        const plain_attribs = base_attribs ++ [_]egl.EGLint{
             egl.EGL_NONE,
         };
 
         var num_configs: egl.EGLint = 0;
-        if (egl.eglChooseConfig(self.egl_display, &config_attribs, &self.egl_config, 1, &num_configs) == egl.EGL_FALSE)
-            return error.EglConfigFailed;
+        _ = egl.eglChooseConfig(self.egl_display, &msaa_attribs, &self.egl_config, 1, &num_configs);
+        if (num_configs == 0) {
+            if (egl.eglChooseConfig(self.egl_display, &plain_attribs, &self.egl_config, 1, &num_configs) == egl.EGL_FALSE)
+                return error.EglConfigFailed;
+        }
         if (num_configs == 0) return error.EglNoConfig;
 
         const context_attribs = [_]egl.EGLint{
@@ -208,6 +219,10 @@ pub const Wayland = struct {
 
         if (egl.eglMakeCurrent(self.egl_display, self.egl_surface, self.egl_surface, self.egl_context) == egl.EGL_FALSE)
             return error.EglMakeCurrentFailed;
+
+        // Disable EGL vsync — we throttle via wayland frame callbacks instead,
+        // which is more accurate and doesn't block the event loop.
+        _ = egl.eglSwapInterval(self.egl_display, 0);
     }
 
     pub fn deinit(self: *Wayland) void {
