@@ -180,29 +180,24 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
 
-    // ── Phase 2: parallel prep thread + Wayland/EGL ──
-    // Prep thread: fontconfig + mmap + font parse + atlas build (~10ms CPU)
-    // Main thread: Wayland connect + EGL init (~75ms, driver-bound)
-    // The prep thread finishes long before EGL, so CPU work is free.
+    // ── Phase 2: Wayland connect + prep thread ──
+    var wl: wayland_mod.Wayland = undefined;
+    try wl.init(800, 600, "mollusk");
+    defer wl.deinit();
+
+    // Start CPU prep in parallel with the join wait below
     var renderer: renderer_mod.Renderer = undefined;
     defer renderer.deinit();
     var font_path: []const u8 = "";
     const prep_thread = try std.Thread.spawn(.{}, prepThread, .{ &renderer, &font_path, cfg.font_path, cfg.font_size });
 
-    var wl: wayland_mod.Wayland = undefined;
-    try wl.init(800, 600, "mollusk");
-    defer wl.deinit();
-
+    // Wait for prep thread — gives us cell metrics (~8ms)
     prep_thread.join();
     if (font_path.len == 0) return error.FontLoadFailed;
     defer allocator.free(font_path);
 
-    std.debug.print("mollusk: font {s} ({d:.1}ms)\n", .{ font_path, startup_timer.elapsedMs() });
-
-    // ── Phase 3: GPU init (needs EGL context from main thread + CPU data from prep thread) ──
-    try renderer.initGpu();
-
-    // ── Phase 4: now we know the real grid size — fork PTY ──
+    // ── Phase 3: fork PTY with correct grid size ──
+    // Shell starts loading (.zshrc etc) while EGL init runs below.
     const grid = renderer.computeGridSize(wl.width, wl.height);
     renderer.setViewport(wl.width, wl.height);
 
@@ -210,7 +205,6 @@ pub fn main(init: std.process.Init) !void {
     try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
-    // Fork PTY with correct grid size — no resize needed.
     var pty = if (exec_argv.items.len > 0)
         try pty_mod.Pty.spawnCommand(exec_argv.items, grid.cols, grid.rows)
     else
@@ -218,6 +212,16 @@ pub fn main(init: std.process.Init) !void {
     defer pty.close();
 
     term.pty_fd = pty.master_fd;
+
+    std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+
+    // ── Phase 4: EGL init (73ms driver work, shell loading in parallel) ──
+    try wl.initEglPublic();
+
+    std.debug.print("mollusk: EGL ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+
+    // ── Phase 5: GPU init (shader compile + atlas upload) ──
+    try renderer.initGpu();
 
     // Wire callbacks
     g_term = &term;

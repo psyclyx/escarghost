@@ -159,8 +159,11 @@ pub const Wayland = struct {
         while (!self.configured) {
             if (wl.wl_display_roundtrip(self.display) < 0) return error.DispatchFailed;
         }
+    }
 
-        // Init EGL
+    /// Initialize EGL. Separate from init() so caller can do work between
+    /// Wayland setup and EGL (e.g. fork PTY while EGL driver initializes).
+    pub fn initEglPublic(self: *Wayland) !void {
         try self.initEgl();
     }
 
