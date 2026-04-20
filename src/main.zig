@@ -133,9 +133,35 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
-    // Disable GL error checking (we control all GL calls via snail).
-    // Also hint mesa to skip driver probing if possible.
-    _ = c.setenv("MESA_NO_ERROR", "1", 0); // don't override if already set
+    // Mesa hints — don't override if already set (0 = no overwrite)
+    _ = c.setenv("MESA_NO_ERROR", "1", 0); // skip GL error checking
+    _ = c.setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0); // faster shader cache reads
+
+    // Auto-detect mesa driver to skip probing. Read the DRM render node
+    // to figure out which driver mesa will load.
+    {
+        const drm_c = @cImport({
+            @cInclude("fcntl.h");
+            @cInclude("xf86drm.h");
+        });
+        const fd = drm_c.open("/dev/dri/renderD128", drm_c.O_RDWR);
+        if (fd >= 0) {
+            defer _ = c.close(fd);
+            const version = drm_c.drmGetVersion(fd);
+            if (version) |v| {
+                defer drm_c.drmFreeVersion(v);
+                if (v.*.name) |name| {
+                    const kname = name[0..@intCast(v.*.name_len)];
+                    if (std.mem.eql(u8, kname, "i915") or std.mem.eql(u8, kname, "xe"))
+                        _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "iris", 0)
+                    else if (std.mem.eql(u8, kname, "amdgpu"))
+                        _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "radeonsi", 0)
+                    else if (std.mem.eql(u8, kname, "nouveau"))
+                        _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "nouveau", 0);
+                }
+            }
+        }
+    }
 
     // Parse -e flag for command execution
     var exec_argv: std.ArrayListUnmanaged([]const u8) = .empty;
