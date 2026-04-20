@@ -27,28 +27,31 @@ fn detectSubpixelOrder() snail.SubpixelOrder {
     };
 }
 
+/// Pre-built vertex data for a single row. Stored in the scrollback ring.
+/// No GL dependency — pure CPU data that can be replayed instantly.
+const RowCache = struct {
+    text: []f32, // glyph vertices (owned slice within arena)
+    vec: []f32, // vector vertices (bg spans + decorations)
+    row_id: u64, // ghostty row identity handle
+};
+
 pub const Renderer = struct {
     font: snail.Font,
     atlas: snail.Atlas,
     snail_renderer: snail.Renderer,
 
-    // Per-row vertex slots
-    text_buf: []f32,
-    vector_buf: []f32,
-    row_text_len: []u32,
-    row_vec_len: []u32,
-    text_slot_size: u32,
-    vec_slot_size: u32,
+    // Scrollback ring of cached row vertex data.
+    // Indexed by ghostty row ID for O(1) lookup.
+    row_cache: std.AutoHashMap(u64, RowCache),
 
-    // FBO for persistent frame content
-    fbo: gl.GLuint = 0,
-    fbo_tex: gl.GLuint = 0,
-    fbo_w: u32 = 0,
-    fbo_h: u32 = 0,
+    // Frame draw buffers — contiguous, rebuilt each frame from cache.
+    // Only 2 draw calls: all vectors, then all text.
+    draw_text: []f32,
+    draw_vec: []f32,
 
-    // Row identity tracking for scroll detection
-    prev_row_ids: []u64,
-    curr_row_ids: []u64,
+    // Per-row build scratch space (reused each rebuild)
+    scratch_text: []f32,
+    scratch_vec: []f32,
 
     cell_width: f32,
     cell_height: f32,
@@ -57,10 +60,13 @@ pub const Renderer = struct {
     viewport_h: f32,
 
     allocator: std.mem.Allocator,
-    max_rows: u16,
     max_cols: u16,
-    total_rows: u16 = 0,
     has_prev_frame: bool = false,
+
+    // Previous frame's row IDs for dirty detection
+    prev_row_ids: [200]u64 = [_]u64{0} ** 200,
+    prev_cursor_x: u16 = 0,
+    prev_cursor_y: u16 = 0,
 
     pub var frame_stats: perf.FrameStats = .{};
 
@@ -70,10 +76,9 @@ pub const Renderer = struct {
         self.viewport_w = 0;
         self.viewport_h = 0;
         self.has_prev_frame = false;
-        self.fbo = 0;
-        self.fbo_tex = 0;
-        self.fbo_w = 0;
-        self.fbo_h = 0;
+        self.prev_cursor_x = 0;
+        self.prev_cursor_y = 0;
+        self.prev_row_ids = [_]u64{0} ** 200;
 
         self.font = try snail.Font.init(font_data);
         errdefer self.font.deinit();
@@ -88,29 +93,19 @@ pub const Renderer = struct {
         self.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6);
         self.cell_height = @ceil(font_size * 1.2);
 
-        self.max_rows = 200;
         self.max_cols = 400;
-        self.total_rows = 0;
-        self.text_slot_size = @as(u32, self.max_cols) * @as(u32, snail.FLOATS_PER_GLYPH);
-        self.vec_slot_size = @as(u32, self.max_cols) * @as(u32, snail.VECTOR_FLOATS_PER_PRIMITIVE) * 3;
+        self.row_cache = std.AutoHashMap(u64, RowCache).init(allocator);
 
-        self.text_buf = try allocator.alloc(f32, @as(usize, self.max_rows) * self.text_slot_size);
-        errdefer allocator.free(self.text_buf);
-        self.vector_buf = try allocator.alloc(f32, @as(usize, self.max_rows) * self.vec_slot_size);
-        errdefer allocator.free(self.vector_buf);
+        const max_cells: usize = 400 * 200;
+        self.draw_text = try allocator.alloc(f32, max_cells * snail.FLOATS_PER_GLYPH);
+        errdefer allocator.free(self.draw_text);
+        self.draw_vec = try allocator.alloc(f32, max_cells * @as(usize, snail.VECTOR_FLOATS_PER_PRIMITIVE) * 3);
+        errdefer allocator.free(self.draw_vec);
 
-        self.row_text_len = try allocator.alloc(u32, self.max_rows);
-        errdefer allocator.free(self.row_text_len);
-        self.row_vec_len = try allocator.alloc(u32, self.max_rows);
-        errdefer allocator.free(self.row_vec_len);
-        self.prev_row_ids = try allocator.alloc(u64, self.max_rows);
-        errdefer allocator.free(self.prev_row_ids);
-        self.curr_row_ids = try allocator.alloc(u64, self.max_rows);
-
-        @memset(self.row_text_len, 0);
-        @memset(self.row_vec_len, 0);
-        @memset(self.prev_row_ids, 0);
-        @memset(self.curr_row_ids, 0);
+        // Scratch for building one row
+        self.scratch_text = try allocator.alloc(f32, @as(usize, self.max_cols) * snail.FLOATS_PER_GLYPH);
+        errdefer allocator.free(self.scratch_text);
+        self.scratch_vec = try allocator.alloc(f32, @as(usize, self.max_cols) * @as(usize, snail.VECTOR_FLOATS_PER_PRIMITIVE) * 3);
     }
 
     pub fn initGpu(self: *Renderer) !void {
@@ -122,14 +117,17 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
-        if (self.fbo != 0) gl.glDeleteFramebuffers(1, &self.fbo);
-        if (self.fbo_tex != 0) gl.glDeleteTextures(1, &self.fbo_tex);
-        self.allocator.free(self.curr_row_ids);
-        self.allocator.free(self.prev_row_ids);
-        self.allocator.free(self.row_vec_len);
-        self.allocator.free(self.row_text_len);
-        self.allocator.free(self.text_buf);
-        self.allocator.free(self.vector_buf);
+        // Free all cached row vertex data
+        var it = self.row_cache.valueIterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.text);
+            self.allocator.free(entry.vec);
+        }
+        self.row_cache.deinit();
+        self.allocator.free(self.scratch_vec);
+        self.allocator.free(self.scratch_text);
+        self.allocator.free(self.draw_vec);
+        self.allocator.free(self.draw_text);
         self.snail_renderer.deinit();
         self.atlas.deinit();
         self.font.deinit();
@@ -146,65 +144,18 @@ pub const Renderer = struct {
         self.viewport_w = @floatFromInt(w);
         self.viewport_h = @floatFromInt(h);
         self.has_prev_frame = false;
-    }
-
-    fn ensureFbo(self: *Renderer, w: u32, h: u32) void {
-        if (self.fbo_w == w and self.fbo_h == h and self.fbo != 0) return;
-
-        if (self.fbo != 0) gl.glDeleteFramebuffers(1, &self.fbo);
-        if (self.fbo_tex != 0) gl.glDeleteTextures(1, &self.fbo_tex);
-
-        gl.glGenTextures(1, &self.fbo_tex);
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self.fbo_tex);
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, @intCast(w), @intCast(h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, null);
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
-
-        gl.glGenFramebuffers(1, &self.fbo);
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.fbo);
-        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self.fbo_tex, 0);
-
-        self.fbo_w = w;
-        self.fbo_h = h;
-        self.has_prev_frame = false;
-    }
-
-    /// Detect scroll offset by comparing row identity handles.
-    /// Returns the shift: positive = rows moved up (new content at bottom).
-    fn detectScroll(self: *Renderer) i32 {
-        if (self.total_rows == 0) return 0;
-        const n = self.total_rows;
-
-        // Try small offsets first (most common: scroll by 1-5 rows)
-        var best_offset: i32 = 0;
-        var best_matches: u16 = 0;
-
-        // Check offsets -10..+10
-        var offset: i32 = -10;
-        while (offset <= 10) : (offset += 1) {
-            var matches: u16 = 0;
-            for (0..n) |r| {
-                const prev_r = @as(i32, @intCast(r)) + offset;
-                if (prev_r >= 0 and prev_r < n) {
-                    if (self.curr_row_ids[r] != 0 and
-                        self.curr_row_ids[r] == self.prev_row_ids[@intCast(prev_r)])
-                    {
-                        matches += 1;
-                    }
-                }
-            }
-            if (matches > best_matches) {
-                best_matches = matches;
-                best_offset = offset;
-            }
+        // Viewport change invalidates all cached rows (Y positions change)
+        var cache_it = self.row_cache.valueIterator();
+        while (cache_it.next()) |entry| {
+            self.allocator.free(entry.text);
+            self.allocator.free(entry.vec);
         }
-
-        // Only count as scroll if a meaningful fraction of rows matched
-        if (best_matches >= n / 2 and best_offset != 0) return best_offset;
-        return 0;
+        self.row_cache.clearRetainingCapacity();
     }
 
-    fn rebuildRow(
+    /// Build vertex data for a row into scratch buffers.
+    /// Returns (text_len, vec_len) in floats.
+    fn buildRow(
         self: *Renderer,
         term: *Terminal,
         row_idx: u16,
@@ -212,16 +163,13 @@ pub const Renderer = struct {
         default_bg: Rgb,
         cursor: terminal_mod.CursorInfo,
         colors: terminal_mod.RenderColors,
-    ) void {
+    ) struct { text_len: usize, vec_len: usize } {
         const cell_y_tl = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
         const cell_y_bl = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
 
-        const text_start = @as(usize, row_idx) * self.text_slot_size;
-        const vec_start = @as(usize, row_idx) * self.vec_slot_size;
-        var text_batch = snail.Batch.init(self.text_buf[text_start..][0..self.text_slot_size]);
-        var vec_batch = snail.VectorBatch.init(self.vector_buf[vec_start..][0..self.vec_slot_size]);
+        var text_batch = snail.Batch.init(self.scratch_text);
+        var vec_batch = snail.VectorBatch.init(self.scratch_vec);
 
-        // Background span coalescing
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
         var bg_span_len: u16 = 0;
@@ -238,15 +186,13 @@ pub const Renderer = struct {
                 fg = cell_bg orelse default_bg;
                 cell_bg = tmp;
             }
-            if (cell.style.faint != false) {
-                fg = .{
-                    .r = @intFromFloat(@as(f32, @floatFromInt(fg.r)) * 0.5),
-                    .g = @intFromFloat(@as(f32, @floatFromInt(fg.g)) * 0.5),
-                    .b = @intFromFloat(@as(f32, @floatFromInt(fg.b)) * 0.5),
-                };
-            }
+            if (cell.style.faint != false) fg = .{
+                .r = @intFromFloat(@as(f32, @floatFromInt(fg.r)) * 0.5),
+                .g = @intFromFloat(@as(f32, @floatFromInt(fg.g)) * 0.5),
+                .b = @intFromFloat(@as(f32, @floatFromInt(fg.b)) * 0.5),
+            };
 
-            // Background coalescing
+            // BG span coalescing
             const bg_matches = if (cell_bg) |cbg|
                 (if (bg_span_color) |sc| sc.r == cbg.r and sc.g == cbg.g and sc.b == cbg.b else false)
             else
@@ -254,14 +200,16 @@ pub const Renderer = struct {
             if (cell_bg != null and bg_matches) {
                 bg_span_len += 1;
             } else {
-                if (bg_span_len > 0) if (bg_span_color) |sc| {
-                    _ = vec_batch.addRect(.{
-                        .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                        .y = cell_y_tl,
-                        .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                        .h = self.cell_height,
-                    }, sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
-                };
+                if (bg_span_len > 0) {
+                    if (bg_span_color) |sc| {
+                        _ = vec_batch.addRect(.{
+                            .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                            .y = cell_y_tl,
+                            .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                            .h = self.cell_height,
+                        }, sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
+                    }
+                }
                 if (cell_bg) |cbg| {
                     bg_span_start = col_idx;
                     bg_span_color = cbg;
@@ -298,7 +246,6 @@ pub const Renderer = struct {
                             fg.toFloat4(1.0), self.atlas.gl_layer,
                         );
                 }
-
                 if (cell.style.underline != 0)
                     _ = vec_batch.addRect(.{
                         .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
@@ -311,66 +258,42 @@ pub const Renderer = struct {
                     }, fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
             }
         }
-
         // Flush final bg span
-        if (bg_span_len > 0) if (bg_span_color) |sc| {
-            _ = vec_batch.addRect(.{
-                .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                .y = cell_y_tl,
-                .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                .h = self.cell_height,
-            }, sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
-        };
-
-        self.row_text_len[row_idx] = @intCast(text_batch.glyphCount() * snail.FLOATS_PER_GLYPH);
-        self.row_vec_len[row_idx] = @intCast(vec_batch.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE);
-    }
-
-    fn drawRow(self: *Renderer, row: u16, mvp: snail.Mat4) void {
-        const vlen = self.row_vec_len[row];
-        if (vlen > 0) {
-            const start = @as(usize, row) * self.vec_slot_size;
-            self.snail_renderer.drawVector(self.vector_buf[start..][0..vlen], self.viewport_w, self.viewport_h);
-        }
-        const tlen = self.row_text_len[row];
-        if (tlen > 0) {
-            const start = @as(usize, row) * self.text_slot_size;
-            self.snail_renderer.draw(self.text_buf[start..][0..tlen], mvp, self.viewport_w, self.viewport_h);
-        }
-    }
-
-    fn drawCursor(self: *Renderer, cursor: terminal_mod.CursorInfo, colors: terminal_mod.RenderColors, mvp: snail.Mat4) void {
-        if (!cursor.visible or !cursor.in_viewport) return;
-        const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
-        const cy = @as(f32, @floatFromInt(cursor.y)) * self.cell_height;
-        const cc = if (colors.cursor) |col| col.toFloat4(1.0) else colors.foreground.toFloat4(1.0);
-
-        var cbuf: [snail.VECTOR_FLOATS_PER_PRIMITIVE]f32 = undefined;
-        var cb = snail.VectorBatch.init(&cbuf);
-        switch (cursor.style) {
-            .block => _ = cb.addRect(.{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height }, cc, .{ 0, 0, 0, 0 }, 0),
-            .bar => _ = cb.addRect(.{ .x = cx, .y = cy, .w = 2, .h = self.cell_height }, cc, .{ 0, 0, 0, 0 }, 0),
-            .underline => _ = cb.addRect(.{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2 }, cc, .{ 0, 0, 0, 0 }, 0),
-            .block_hollow => _ = cb.addRect(.{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height }, .{ 0, 0, 0, 0 }, cc, 1.5),
-        }
-        self.snail_renderer.drawVector(cb.slice(), self.viewport_w, self.viewport_h);
-
-        // Block cursor: redraw the glyph with bg color
-        if (cursor.style == .block) {
-            const tlen = self.row_text_len[cursor.y];
-            if (tlen > 0) {
-                const start = @as(usize, cursor.y) * self.text_slot_size;
-                self.snail_renderer.draw(self.text_buf[start..][0..tlen], mvp, self.viewport_w, self.viewport_h);
+        if (bg_span_len > 0) {
+            if (bg_span_color) |sc| {
+                _ = vec_batch.addRect(.{
+                    .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                    .y = cell_y_tl,
+                    .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                    .h = self.cell_height,
+                }, sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
             }
         }
+
+        return .{
+            .text_len = text_batch.glyphCount() * snail.FLOATS_PER_GLYPH,
+            .vec_len = vec_batch.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE,
+        };
     }
 
-    fn clearRowRegion(self: *Renderer, row: u16, bg: [4]f32) void {
-        const y_tl = @as(f32, @floatFromInt(row)) * self.cell_height;
-        var buf: [snail.VECTOR_FLOATS_PER_PRIMITIVE]f32 = undefined;
-        var batch = snail.VectorBatch.init(&buf);
-        _ = batch.addRect(.{ .x = 0, .y = y_tl, .w = self.viewport_w, .h = self.cell_height }, bg, .{ 0, 0, 0, 0 }, 0);
-        self.snail_renderer.drawVector(batch.slice(), self.viewport_w, self.viewport_h);
+    /// Cache the scratch buffer contents for a row ID.
+    fn cacheRow(self: *Renderer, row_id: u64, text_len: usize, vec_len: usize) void {
+        // Evict old entry if present
+        if (self.row_cache.fetchRemove(row_id)) |kv| {
+            self.allocator.free(kv.value.text);
+            self.allocator.free(kv.value.vec);
+        }
+
+        const text = self.allocator.dupe(f32, self.scratch_text[0..text_len]) catch return;
+        const vec = self.allocator.dupe(f32, self.scratch_vec[0..vec_len]) catch {
+            self.allocator.free(text);
+            return;
+        };
+
+        self.row_cache.put(row_id, .{ .text = text, .vec = vec, .row_id = row_id }) catch {
+            self.allocator.free(text);
+            self.allocator.free(vec);
+        };
     }
 
     pub fn drawFrame(self: *Renderer, term: *Terminal) !bool {
@@ -380,123 +303,90 @@ pub const Renderer = struct {
         const dirty = term.getDirty();
         if (dirty == .false_) return false;
 
-        const w: u32 = @intFromFloat(self.viewport_w);
-        const h: u32 = @intFromFloat(self.viewport_h);
-        if (w == 0 or h == 0) return false;
-
-        self.ensureFbo(w, h);
-
         const colors = term.getColors();
         const cursor = term.getCursor();
         const default_fg = colors.foreground;
         const default_bg = colors.background;
-        const bg4 = colors.background.toFloat4(1.0);
-        const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
 
-        // Collect row IDs for this frame
+        // Gather visible rows' vertices into contiguous draw buffers.
+        var draw_text_len: usize = 0;
+        var draw_vec_len: usize = 0;
+
         term.beginRowIteration();
         var row_idx: u16 = 0;
         while (term.nextRow()) : (row_idx += 1) {
-            if (row_idx >= self.max_rows) break;
-            self.curr_row_ids[row_idx] = term.getRowId();
-        }
-        const total = row_idx;
+            if (row_idx >= 200) break;
+            const row_id = term.getRowId();
+            const is_dirty = dirty == .full or !self.has_prev_frame or
+                term.isRowDirty() or
+                (cursor.visible and cursor.in_viewport and cursor.y == row_idx) or
+                (self.prev_cursor_y == row_idx); // prev cursor row needs redraw too
 
-        // Detect scroll by comparing row IDs
-        const scroll_delta = if (self.has_prev_frame and total == self.total_rows)
-            self.detectScroll()
-        else
-            @as(i32, 0);
+            if (is_dirty or !self.row_cache.contains(row_id)) {
+                // Build fresh from terminal state
+                const lens = self.buildRow(term, row_idx, default_fg, default_bg, cursor, colors);
+                self.cacheRow(row_id, lens.text_len, lens.vec_len);
 
-        // Render to FBO
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.fbo);
-        gl.glViewport(0, 0, @intCast(w), @intCast(h));
-
-        if (!self.has_prev_frame or dirty == .full) {
-            // Full redraw
-            gl.glClearColor(bg4[0], bg4[1], bg4[2], bg4[3]);
-            gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-            self.snail_renderer.beginFrame();
-
-            term.beginRowIteration();
-            row_idx = 0;
-            while (term.nextRow()) : (row_idx += 1) {
-                if (row_idx >= self.max_rows) break;
-                self.rebuildRow(term, row_idx, default_fg, default_bg, cursor, colors);
-                self.drawRow(row_idx, mvp);
-            }
-            self.drawCursor(cursor, colors, mvp);
-        } else if (scroll_delta != 0) {
-            // Scroll: blit FBO shifted, only draw new rows
-            // Copy FBO to itself with offset using glBlitFramebuffer
-            // We need a second FBO for the source. Use the read/draw framebuffer trick.
-            const shift_px: i32 = @intCast(@as(i32, @intCast(@as(i64, scroll_delta))) * @as(i32, @intFromFloat(self.cell_height)));
-            const ih: i32 = @intCast(h);
-            const iw: i32 = @intCast(w);
-
-            // Blit: copy the shifted region from the FBO to itself
-            // glBlitFramebuffer can't blit within the same FBO, so we
-            // clear and redraw only the new rows instead.
-            gl.glClearColor(bg4[0], bg4[1], bg4[2], bg4[3]);
-            gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-            self.snail_renderer.beginFrame();
-
-            _ = shift_px;
-            _ = ih;
-            _ = iw;
-
-            // Rebuild all rows but reuse vertex data for rows that just shifted.
-            // Row r in this frame corresponds to row (r + scroll_delta) in prev frame.
-            // If that prev row had the same ID, we can copy its vertices.
-            term.beginRowIteration();
-            row_idx = 0;
-            while (term.nextRow()) : (row_idx += 1) {
-                if (row_idx >= self.max_rows) break;
-                const prev_r = @as(i32, @intCast(row_idx)) + scroll_delta;
-                if (prev_r >= 0 and prev_r < total and
-                    self.curr_row_ids[row_idx] == self.prev_row_ids[@intCast(prev_r)])
-                {
-                    // Same row content, just at a different position.
-                    // Rebuild vertices at new position (Y changed).
-                    self.rebuildRow(term, row_idx, default_fg, default_bg, cursor, colors);
-                } else {
-                    // New row — rebuild from scratch
-                    self.rebuildRow(term, row_idx, default_fg, default_bg, cursor, colors);
+                // Append to draw buffers
+                if (lens.vec_len > 0) {
+                    @memcpy(self.draw_vec[draw_vec_len..][0..lens.vec_len], self.scratch_vec[0..lens.vec_len]);
+                    draw_vec_len += lens.vec_len;
                 }
-                self.drawRow(row_idx, mvp);
-            }
-            self.drawCursor(cursor, colors, mvp);
-        } else {
-            // Partial: only redraw dirty rows, FBO retains previous content
-            self.snail_renderer.beginFrame();
-
-            term.beginRowIteration();
-            row_idx = 0;
-            while (term.nextRow()) : (row_idx += 1) {
-                if (row_idx >= self.max_rows) break;
-                const cursor_on_row = cursor.visible and cursor.in_viewport and cursor.y == row_idx;
-                if (term.isRowDirty() or cursor_on_row) {
-                    self.clearRowRegion(row_idx, bg4);
-                    self.rebuildRow(term, row_idx, default_fg, default_bg, cursor, colors);
-                    self.drawRow(row_idx, mvp);
+                if (lens.text_len > 0) {
+                    @memcpy(self.draw_text[draw_text_len..][0..lens.text_len], self.scratch_text[0..lens.text_len]);
+                    draw_text_len += lens.text_len;
+                }
+            } else {
+                // Cache hit — copy cached vertices directly
+                const cached = self.row_cache.get(row_id).?;
+                if (cached.vec.len > 0) {
+                    @memcpy(self.draw_vec[draw_vec_len..][0..cached.vec.len], cached.vec);
+                    draw_vec_len += cached.vec.len;
+                }
+                if (cached.text.len > 0) {
+                    @memcpy(self.draw_text[draw_text_len..][0..cached.text.len], cached.text);
+                    draw_text_len += cached.text.len;
                 }
             }
-            self.drawCursor(cursor, colors, mvp);
+
+            self.prev_row_ids[row_idx] = row_id;
         }
 
-        self.total_rows = total;
         self.has_prev_frame = true;
+        self.prev_cursor_x = cursor.x;
+        self.prev_cursor_y = cursor.y;
 
-        // Swap row ID buffers
-        const tmp = self.prev_row_ids;
-        self.prev_row_ids = self.curr_row_ids;
-        self.curr_row_ids = tmp;
+        // Append cursor to vec buffer
+        if (cursor.visible and cursor.in_viewport) {
+            const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
+            const cy = @as(f32, @floatFromInt(cursor.y)) * self.cell_height;
+            const cc = if (colors.cursor) |col| col.toFloat4(1.0) else colors.foreground.toFloat4(1.0);
 
-        // Blit FBO to screen
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self.fbo);
-        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, 0);
-        gl.glBlitFramebuffer(0, 0, @intCast(w), @intCast(h), 0, 0, @intCast(w), @intCast(h), gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST);
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0);
+            var cbuf: [snail.VECTOR_FLOATS_PER_PRIMITIVE]f32 = undefined;
+            var cb = snail.VectorBatch.init(&cbuf);
+            switch (cursor.style) {
+                .block => _ = cb.addRect(.{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height }, cc, .{ 0, 0, 0, 0 }, 0),
+                .bar => _ = cb.addRect(.{ .x = cx, .y = cy, .w = 2, .h = self.cell_height }, cc, .{ 0, 0, 0, 0 }, 0),
+                .underline => _ = cb.addRect(.{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2 }, cc, .{ 0, 0, 0, 0 }, 0),
+                .block_hollow => _ = cb.addRect(.{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height }, .{ 0, 0, 0, 0 }, cc, 1.5),
+            }
+            const clen = cb.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE;
+            @memcpy(self.draw_vec[draw_vec_len..][0..clen], cb.slice());
+            draw_vec_len += clen;
+        }
+
+        // Draw: clear + 2 draw calls
+        const bg4 = colors.background.toFloat4(1.0);
+        gl.glClearColor(bg4[0], bg4[1], bg4[2], bg4[3]);
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+
+        const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
+        self.snail_renderer.beginFrame();
+
+        if (draw_vec_len > 0)
+            self.snail_renderer.drawVector(self.draw_vec[0..draw_vec_len], self.viewport_w, self.viewport_h);
+        if (draw_text_len > 0)
+            self.snail_renderer.draw(self.draw_text[0..draw_text_len], mvp, self.viewport_w, self.viewport_h);
 
         gl.glFlush();
         term.resetDirty();
