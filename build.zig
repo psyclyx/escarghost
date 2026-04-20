@@ -46,6 +46,15 @@ pub fn build(b: *std.Build) void {
         snail_mod.linkSystemLibrary("OpenGL", .{});
         snail_mod.addImport("vulkan_shaders", vk_stub);
         root_module.addImport("snail", snail_mod);
+
+        // CPU renderer (snail's extra module for software rendering)
+        const cpu_renderer_mod = b.createModule(.{
+            .root_source_file = snail_dep.path("src/extra/cpu_renderer.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cpu_renderer_mod.addImport("snail", snail_mod);
+        root_module.addImport("cpu_renderer", cpu_renderer_mod);
     }
 
     // Wayland + EGL + OpenGL
@@ -55,7 +64,6 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("xkbcommon", .{});
     root_module.linkSystemLibrary("OpenGL", .{});
     root_module.linkSystemLibrary("fontconfig", .{});
-    root_module.linkSystemLibrary("freetype2", .{});
 
     // Wayland protocol implementations
     root_module.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });

@@ -243,7 +243,7 @@ pub fn main(init: std.process.Init) !void {
             var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
             if (frame_opt) |*frame| {
                 defer frame.destroy();
-                frame.renderTerminal(&term, font_result_data, cfg.font_size, renderer.cell_width, renderer.cell_height, cfg.foreground, cfg.background);
+                frame.renderTerminal(&term, &renderer.atlas, &renderer.font, cfg.font_size, renderer.cell_width, renderer.cell_height, cfg.foreground, cfg.background);
                 frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
             }
         }
