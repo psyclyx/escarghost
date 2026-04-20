@@ -92,23 +92,29 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
     const utf8 = if (ev.utf8_len > 0) ev.utf8[0..ev.utf8_len] else null;
-    const gkey = keysymToGhosttyKey(ev.keysym);
 
+    // If xkb produced UTF-8 (including control chars like \x04 for ctrl+d,
+    // \x03 for ctrl+c, \r for Enter, \t for Tab, etc), send it directly.
+    // This is correct for standard terminal protocols. The ghostty encoder
+    // is only needed for keys that have no UTF-8 representation (arrows,
+    // function keys, etc).
+    if (utf8) |text| {
+        g_pty.write(text) catch {};
+        return;
+    }
+
+    // No UTF-8 → use ghostty encoder for escape sequences
+    const gkey = keysymToGhosttyKey(ev.keysym);
     if (gkey != 0) {
         const encoded = g_term.encodeKey(
             gkey,
             ghostty_c.GHOSTTY_KEY_ACTION_PRESS,
             modsToGhostty(ev.mods),
-            utf8,
+            null,
         );
         if (encoded) |data| {
             g_pty.write(data) catch {};
-            return;
         }
-    }
-
-    if (utf8) |text| {
-        g_pty.write(text) catch {};
     }
 }
 
