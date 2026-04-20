@@ -178,6 +178,18 @@ pub const Terminal = struct {
             return error.RenderStateUpdateFailed;
     }
 
+    /// Get the raw row identity handle for the current row iterator position.
+    /// Compare between frames to detect row reuse (scroll detection).
+    pub fn getRowId(self: *Terminal) u64 {
+        var raw: c.GhosttyRow = 0;
+        _ = c.ghostty_render_state_row_get(
+            self.row_iterator,
+            c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+            @ptrCast(&raw),
+        );
+        return raw;
+    }
+
     pub fn getDirty(self: *Terminal) Dirty {
         var dirty: c.GhosttyRenderStateDirty = c.GHOSTTY_RENDER_STATE_DIRTY_FALSE;
         _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);

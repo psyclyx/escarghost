@@ -241,10 +241,6 @@ pub const Wayland = struct {
             return error.EglMakeCurrentFailed;
 
         _ = egl.eglSwapInterval(self.egl_display, 0);
-
-        // Preserve back buffer contents across swaps so partial redraws
-        // can overdraw only dirty rows without clearing.
-        _ = egl.eglSurfaceAttrib(self.egl_display, self.egl_surface, egl.EGL_SWAP_BEHAVIOR, egl.EGL_BUFFER_PRESERVED);
     }
 
     pub fn deinit(self: *Wayland) void {
