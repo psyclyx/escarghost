@@ -174,7 +174,7 @@ pub const Renderer = struct {
         self.font.deinit();
     }
 
-    fn clearCache(self: *Renderer) void {
+    pub fn clearCache(self: *Renderer) void {
         var it = self.row_cache.valueIterator();
         while (it.next()) |e| {
             self.allocator.free(e.text);

@@ -352,11 +352,24 @@ pub const Terminal = struct {
     }
 
     pub fn scrollViewport(self: *Terminal, delta: isize) void {
-        const behavior: c.GhosttyTerminalScrollViewport = .{
+        c.ghostty_terminal_scroll_viewport(self.handle, .{
             .tag = c.GHOSTTY_SCROLL_VIEWPORT_DELTA,
             .value = .{ .delta = @intCast(delta) },
-        };
-        c.ghostty_terminal_scroll_viewport(self.handle, behavior);
+        });
+    }
+
+    pub fn scrollToTop(self: *Terminal) void {
+        c.ghostty_terminal_scroll_viewport(self.handle, .{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_TOP,
+            .value = .{ .delta = 0 },
+        });
+    }
+
+    pub fn scrollToBottom(self: *Terminal) void {
+        c.ghostty_terminal_scroll_viewport(self.handle, .{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
+            .value = .{ .delta = 0 },
+        });
     }
 
     // Persistent buffer for encoded key output (avoids dangling stack pointer)

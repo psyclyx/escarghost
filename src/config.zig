@@ -26,6 +26,13 @@ pub const Config = struct {
     base16: [16]Rgb,
     palette: [256]Rgb,
 
+    // Key repeat (0 = use compositor default)
+    repeat_rate: u32 = 0, // keys per second
+    repeat_delay: u32 = 0, // ms before repeat starts
+
+    // Scroll
+    scroll_lines: u32 = 3, // lines per scroll event
+
     // Track ownership of heap-allocated strings
     owns_font_path: bool = false,
     owns_shell: bool = false,

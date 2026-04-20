@@ -15,6 +15,8 @@ const xkb = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
 });
 
+const time_c = @cImport(@cInclude("time.h"));
+
 const gl = @cImport({
     @cInclude("GL/gl.h");
 });
@@ -77,6 +79,12 @@ pub const Wayland = struct {
     closed: bool = false,
     frame_pending: bool = false,
     focused: bool = false,
+
+    // Key repeat state
+    repeat_rate: u32 = 25, // keys/sec (from compositor)
+    repeat_delay: u32 = 600, // ms (from compositor)
+    repeat_key: ?KeyEvent = null, // currently repeating key
+    repeat_deadline_ns: i128 = 0, // next repeat fire time
 
     // Callbacks
     on_key: ?*const fn (KeyEvent) void = null,
@@ -284,6 +292,32 @@ pub const Wayland = struct {
         }
     }
 
+    /// Check and fire key repeat. Returns ms until next repeat (for poll timeout).
+    pub fn pumpRepeat(self: *Wayland) ?u32 {
+        const key = self.repeat_key orelse return null;
+        if (self.repeat_rate == 0) return null;
+
+        var ts: time_c.struct_timespec = undefined;
+        _ = time_c.clock_gettime(time_c.CLOCK_MONOTONIC, &ts);
+        const now_ns: i128 = @as(i128, ts.tv_sec) * 1_000_000_000 + ts.tv_nsec;
+
+        if (now_ns >= self.repeat_deadline_ns) {
+            // Fire repeat
+            var repeat_ev = key;
+            repeat_ev.state = .repeat;
+            if (self.on_key) |cb| cb(repeat_ev);
+
+            // Schedule next repeat
+            const interval_ns: i128 = @divTrunc(1_000_000_000, @as(i128, self.repeat_rate));
+            self.repeat_deadline_ns = now_ns + interval_ns;
+            return @intCast(@divTrunc(interval_ns, 1_000_000));
+        }
+
+        // Return ms until next fire
+        const remaining = self.repeat_deadline_ns - now_ns;
+        return @intCast(@max(1, @divTrunc(remaining, 1_000_000)));
+    }
+
     pub fn setTitle(self: *Wayland, title: [:0]const u8) void {
         if (self.xdg_toplevel) |tl| {
             wl.xdg_toplevel_set_title(tl, title.ptr);
@@ -451,6 +485,7 @@ pub const Wayland = struct {
     fn keyboardLeave(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, _: ?*wl.wl_surface) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.focused = false;
+        self.repeat_key = null;
         if (self.on_focus) |cb| cb(false);
     }
 
@@ -475,6 +510,18 @@ pub const Wayland = struct {
         // need to reach the key handler for proper encoding.
 
         if (self.on_key) |cb| cb(ev);
+
+        // Track key repeat
+        if (ev.state == .pressed and self.repeat_rate > 0) {
+            self.repeat_key = ev;
+            // First repeat after delay
+            var ts: time_c.struct_timespec = undefined;
+            _ = time_c.clock_gettime(time_c.CLOCK_MONOTONIC, &ts);
+            const now_ns: i128 = @as(i128, ts.tv_sec) * 1_000_000_000 + ts.tv_nsec;
+            self.repeat_deadline_ns = now_ns + @as(i128, self.repeat_delay) * 1_000_000;
+        } else if (ev.state == .released) {
+            self.repeat_key = null;
+        }
     }
 
     fn keyboardModifiers(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, depressed: u32, latched: u32, locked: u32, group: u32) callconv(.c) void {
@@ -484,7 +531,11 @@ pub const Wayland = struct {
         }
     }
 
-    fn keyboardRepeatInfo(_: ?*anyopaque, _: ?*wl.wl_keyboard, _: i32, _: i32) callconv(.c) void {}
+    fn keyboardRepeatInfo(data: ?*anyopaque, _: ?*wl.wl_keyboard, rate: i32, delay: i32) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        if (rate > 0) self.repeat_rate = @intCast(rate);
+        if (delay > 0) self.repeat_delay = @intCast(delay);
+    }
 
     fn getCurrentMods(self: *Wayland) Mods {
         const state = self.xkb_state orelse return .{};

@@ -88,24 +88,49 @@ var g_pty: *pty_mod.Pty = undefined;
 var g_renderer: *renderer_mod.Renderer = undefined;
 var g_wl: *wayland_mod.Wayland = undefined;
 
+var g_scroll_lines: u32 = 3;
+
 fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
+    // Mollusk bindings (intercepted before sending to PTY)
+    if (ev.mods.ctrl and ev.mods.shift) {
+        switch (ev.keysym) {
+            // Zoom: Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0
+            xkb_syms.XKB_KEY_plus, xkb_syms.XKB_KEY_equal => { zoomIn(); return; },
+            xkb_syms.XKB_KEY_minus, xkb_syms.XKB_KEY_underscore => { zoomOut(); return; },
+            xkb_syms.XKB_KEY_0, xkb_syms.XKB_KEY_parenright => { zoomReset(); return; },
+            // Scroll: Ctrl+Shift+Up/Down/PageUp/PageDown/Home/End
+            xkb_syms.XKB_KEY_Up => { g_term.scrollViewport(-1); return; },
+            xkb_syms.XKB_KEY_Down => { g_term.scrollViewport(1); return; },
+            xkb_syms.XKB_KEY_Page_Up => { g_term.scrollViewport(-@as(isize, g_scroll_lines * 10)); return; },
+            xkb_syms.XKB_KEY_Page_Down => { g_term.scrollViewport(@as(isize, g_scroll_lines * 10)); return; },
+            xkb_syms.XKB_KEY_Home => { g_term.scrollToTop(); return; },
+            xkb_syms.XKB_KEY_End => { g_term.scrollToBottom(); return; },
+            else => {},
+        }
+    }
+    // Shift+PageUp/Down for scroll (common terminal convention)
+    if (ev.mods.shift and !ev.mods.ctrl) {
+        switch (ev.keysym) {
+            xkb_syms.XKB_KEY_Page_Up => { g_term.scrollViewport(-@as(isize, g_scroll_lines * 10)); return; },
+            xkb_syms.XKB_KEY_Page_Down => { g_term.scrollViewport(@as(isize, g_scroll_lines * 10)); return; },
+            else => {},
+        }
+    }
+
     const utf8 = if (ev.utf8_len > 0) ev.utf8[0..ev.utf8_len] else null;
 
-    // If xkb produced UTF-8 (including control chars like \x04 for ctrl+d,
-    // \x03 for ctrl+c, \r for Enter, \t for Tab, etc), send it directly.
-    // This is correct for standard terminal protocols. The ghostty encoder
-    // is only needed for keys that have no UTF-8 representation (arrows,
-    // function keys, etc).
     if (utf8) |text| {
+        // Scroll to bottom on typing (common terminal behavior)
+        g_term.scrollToBottom();
         g_pty.write(text) catch {};
         return;
     }
 
-    // No UTF-8 → use ghostty encoder for escape sequences
     const gkey = keysymToGhosttyKey(ev.keysym);
     if (gkey != 0) {
+        g_term.scrollToBottom();
         const encoded = g_term.encodeKey(
             gkey,
             ghostty_c.GHOSTTY_KEY_ACTION_PRESS,
@@ -116,6 +141,51 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
             g_pty.write(data) catch {};
         }
     }
+}
+
+fn onMouse(ev: wayland_mod.MouseEvent) void {
+    if (ev.kind == .scroll) {
+        const lines: isize = if (ev.scroll_dy > 0) @intCast(g_scroll_lines) else -@as(isize, @intCast(g_scroll_lines));
+        g_term.scrollViewport(lines);
+    }
+}
+
+var g_base_font_size: f32 = 14.0;
+
+fn zoomIn() void {
+    g_renderer.font_size = @min(g_renderer.font_size + 1.0, 72.0);
+    applyZoom();
+}
+
+fn zoomOut() void {
+    g_renderer.font_size = @max(g_renderer.font_size - 1.0, 6.0);
+    applyZoom();
+}
+
+fn zoomReset() void {
+    g_renderer.font_size = g_base_font_size;
+    applyZoom();
+}
+
+fn applyZoom() void {
+    // Recompute cell metrics for new font size
+    const units_per_em: f32 = @floatFromInt(g_renderer.font.unitsPerEm());
+    const scale = g_renderer.font_size / units_per_em;
+    const m_gid = g_renderer.font.glyphIndex('M') catch 0;
+    const m_info = g_renderer.atlas.getGlyph(m_gid);
+    g_renderer.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(g_renderer.font_size * 0.6);
+    g_renderer.cell_height = @ceil(g_renderer.font_size * 1.2);
+
+    // Resize terminal grid
+    const grid = g_renderer.computeGridSize(@intFromFloat(g_renderer.viewport_w), @intFromFloat(g_renderer.viewport_h));
+    if (grid.cols > 0 and grid.rows > 0) {
+        g_term.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.cell_width), @intFromFloat(g_renderer.cell_height)) catch {};
+        g_pty.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.viewport_w), @intFromFloat(g_renderer.viewport_h));
+    }
+
+    // Invalidate vertex cache (cell positions changed)
+    g_renderer.generation += 1;
+    g_renderer.clearCache();
 }
 
 fn onResize(w: u32, h: u32) void {
@@ -218,8 +288,11 @@ pub fn main(init: std.process.Init) !void {
     g_renderer = &renderer;
     g_wl = &wl;
     wl.on_key = onKey;
+    wl.on_mouse = onMouse;
     wl.on_resize = onResize;
     wl.on_focus = onFocus;
+    g_scroll_lines = cfg.scroll_lines;
+    g_base_font_size = cfg.font_size;
 
     std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
 
@@ -265,12 +338,15 @@ pub fn main(init: std.process.Init) !void {
     while (!wl.closed and !child_exited) {
         wl.flush();
 
+        // Key repeat timeout — wake up in time for next repeat event
+        const repeat_timeout: c_int = if (wl.pumpRepeat()) |ms| @intCast(ms) else -1;
+
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },
             .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
         };
 
-        _ = c.poll(&pollfds, 2, -1);
+        _ = c.poll(&pollfds, 2, repeat_timeout);
 
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.dispatch() catch break;
