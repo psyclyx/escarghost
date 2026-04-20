@@ -24,51 +24,38 @@ pub const Renderer = struct {
 
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, font_data: []const u8, font_size: f32) !Renderer {
-        var font = try snail.Font.init(font_data);
-        errdefer font.deinit();
+    pub fn init(self: *Renderer, allocator: std.mem.Allocator, font_data: []const u8, font_size: f32) !void {
+        self.allocator = allocator;
+        self.font_size = font_size;
+        self.viewport_w = 0;
+        self.viewport_h = 0;
 
-        var atlas = try snail.Atlas.initAscii(allocator, &font, &snail.ASCII_PRINTABLE);
-        errdefer atlas.deinit();
+        self.font = try snail.Font.init(font_data);
+        errdefer self.font.deinit();
 
-        var snail_renderer = try snail.Renderer.init();
-        errdefer snail_renderer.deinit();
+        // Atlas takes &self.font — pointer is stable since self is caller-owned
+        self.atlas = try snail.Atlas.initAscii(allocator, &self.font, &snail.ASCII_PRINTABLE);
+        errdefer self.atlas.deinit();
 
-        snail_renderer.uploadAtlas(&atlas);
+        self.snail_renderer = try snail.Renderer.init();
+        errdefer self.snail_renderer.deinit();
+
+        self.snail_renderer.uploadAtlas(&self.atlas);
 
         // Compute cell metrics from font
-        const units_per_em: f32 = @floatFromInt(font.unitsPerEm());
+        const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
         const scale = font_size / units_per_em;
 
-        // Cell width = advance width of 'M' (monospace assumption)
-        const m_gid = font.glyphIndex('M') catch 0;
-        const m_info = atlas.getGlyph(m_gid);
-        const cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6);
+        const m_gid = self.font.glyphIndex('M') catch 0;
+        const m_info = self.atlas.getGlyph(m_gid);
+        self.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6);
+        self.cell_height = @ceil(font_size * 1.2);
 
-        // Cell height = font_size * line_height_ratio
-        const cell_height = @ceil(font_size * 1.2);
-
-        // Pre-allocate vertex buffers (generous for large terminals)
         const max_glyphs = 400 * 120;
-        const text_buf = try allocator.alloc(f32, max_glyphs * snail.FLOATS_PER_GLYPH);
-        errdefer allocator.free(text_buf);
+        self.text_buf = try allocator.alloc(f32, max_glyphs * snail.FLOATS_PER_GLYPH);
+        errdefer allocator.free(self.text_buf);
 
-        const vector_buf = try allocator.alloc(f32, max_glyphs * snail.VECTOR_FLOATS_PER_PRIMITIVE);
-        errdefer allocator.free(vector_buf);
-
-        return .{
-            .font = font,
-            .atlas = atlas,
-            .snail_renderer = snail_renderer,
-            .text_buf = text_buf,
-            .vector_buf = vector_buf,
-            .cell_width = cell_width,
-            .cell_height = cell_height,
-            .font_size = font_size,
-            .viewport_w = 0,
-            .viewport_h = 0,
-            .allocator = allocator,
-        };
+        self.vector_buf = try allocator.alloc(f32, max_glyphs * snail.VECTOR_FLOATS_PER_PRIMITIVE);
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -93,9 +80,6 @@ pub const Renderer = struct {
     pub fn drawFrame(self: *Renderer, term: *Terminal) !void {
         try term.updateRenderState();
 
-        const dirty = term.getDirty();
-        if (dirty == .false_) return;
-
         const colors = term.getColors();
         const cursor = term.getCursor();
 
@@ -104,7 +88,7 @@ pub const Renderer = struct {
         gl.glClearColor(bg[0], bg[1], bg[2], bg[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
-        // Orthographic projection: pixel coords, bottom-left origin
+        // Orthographic projection: pixel coords, bottom-left origin (for text pipeline)
         const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
 
         self.snail_renderer.beginFrame();
@@ -115,7 +99,26 @@ pub const Renderer = struct {
         const default_fg = colors.foreground;
         const default_bg = colors.background;
 
-        // Walk rows and cells
+        // First pass: collect any missing codepoints for the atlas
+        var needs_atlas_update = false;
+        term.beginRowIteration();
+        while (term.nextRow()) {
+            term.beginCellIteration();
+            while (term.nextCell()) {
+                const cell = term.getCellInfo();
+                if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
+                    const cps = [1]u32{cell.codepoint};
+                    if (self.atlas.addCodepoints(&cps) catch false) {
+                        needs_atlas_update = true;
+                    }
+                }
+            }
+        }
+        if (needs_atlas_update) {
+            self.snail_renderer.uploadAtlas(&self.atlas);
+        }
+
+        // Second pass: build vertex batches
         term.beginRowIteration();
         var row_idx: u16 = 0;
         while (term.nextRow()) : (row_idx += 1) {
@@ -125,12 +128,12 @@ pub const Renderer = struct {
                 const cell = term.getCellInfo();
 
                 const cell_x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
-                // Vector pipeline uses top-left origin (y-flip in shader)
+                // Vector pipeline: top-left origin (shader flips y)
                 const cell_y_tl = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
-                // Text pipeline uses bottom-left origin (standard GL via MVP)
+                // Text pipeline: bottom-left origin (standard GL via MVP)
                 const cell_y_bl = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
 
-                // Resolve colors, handling inverse
+                // Resolve colors
                 var fg = cell.fg orelse default_fg;
                 var cell_bg = cell.bg;
                 if (cell.style.inverse != false) {
@@ -146,7 +149,7 @@ pub const Renderer = struct {
                     };
                 }
 
-                // Background rect (vector pipeline = top-left origin)
+                // Background rect
                 if (cell_bg) |cbg| {
                     _ = vec_batch.addRect(
                         .{ .x = cell_x, .y = cell_y_tl, .w = self.cell_width, .h = self.cell_height },
@@ -156,8 +159,8 @@ pub const Renderer = struct {
                     );
                 }
 
-                // Text — use single-character addString for per-cell rendering
-                if (cell.has_text and cell.codepoint > 0x20) {
+                // Text
+                if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
                     var utf8_buf: [4]u8 = undefined;
                     const utf8_len = std.unicode.utf8Encode(
                         @intCast(cell.codepoint),
@@ -165,13 +168,6 @@ pub const Renderer = struct {
                     ) catch 0;
 
                     if (utf8_len > 0) {
-                        // Ensure glyph is in atlas
-                        const cps = [1]u32{cell.codepoint};
-                        if (self.atlas.addCodepoints(&cps) catch false) {
-                            self.snail_renderer.uploadAtlas(&self.atlas);
-                        }
-
-                        // Text pipeline uses bottom-left origin
                         const text_y = cell_y_bl + self.cell_height * 0.2;
                         _ = text_batch.addString(
                             &self.atlas,
@@ -185,7 +181,7 @@ pub const Renderer = struct {
                     }
                 }
 
-                // Underline (vector = top-left; underline at bottom of cell)
+                // Underline
                 if (cell.style.underline != 0 and cell.has_text) {
                     _ = vec_batch.addRect(
                         .{ .x = cell_x, .y = cell_y_tl + self.cell_height - 1, .w = self.cell_width, .h = 1 },
@@ -207,7 +203,7 @@ pub const Renderer = struct {
             }
         }
 
-        // Add cursor to the vector batch (top-left origin)
+        // Cursor (vector pipeline = top-left origin)
         if (cursor.visible and cursor.in_viewport) {
             const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
             const cy = @as(f32, @floatFromInt(cursor.y)) * self.cell_height;
@@ -227,7 +223,7 @@ pub const Renderer = struct {
                     0,
                 ),
                 .underline => _ = vec_batch.addRect(
-                    .{ .x = cx, .y = cy, .w = self.cell_width, .h = 2 },
+                    .{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2 },
                     cursor_color,
                     .{ 0, 0, 0, 0 },
                     0,
@@ -241,7 +237,7 @@ pub const Renderer = struct {
             }
         }
 
-        // Draw backgrounds + decorations + cursor
+        // Draw vectors (backgrounds + decorations + cursor)
         if (vec_batch.shapeCount() > 0) {
             self.snail_renderer.drawVector(vec_batch.slice(), self.viewport_w, self.viewport_h);
         }

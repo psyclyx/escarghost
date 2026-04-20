@@ -95,18 +95,10 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
     const utf8 = if (ev.utf8_len > 0) ev.utf8[0..ev.utf8_len] else null;
-
-    // If we have printable UTF-8 and no interesting modifiers, just send it.
-    // This handles all letters, digits, punctuation, Enter (\r), Tab (\t), etc.
-    if (utf8) |text| {
-        if (!ev.mods.ctrl and !ev.mods.alt) {
-            g_pty.write(text) catch {};
-            return;
-        }
-    }
-
-    // For modified keys and special keys, use the ghostty encoder
     const gkey = keysymToGhosttyKey(ev.keysym);
+
+    // Try ghostty encoder for special keys and modified keys.
+    // This handles arrow keys, function keys, ctrl+c, etc.
     if (gkey != 0) {
         const encoded = g_term.encodeKey(
             gkey,
@@ -120,7 +112,8 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
         }
     }
 
-    // Last resort: send raw UTF-8 even with modifiers
+    // Fallback: send raw UTF-8 from xkb (handles regular text,
+    // and ctrl+key combos where xkb produces the control char directly)
     if (utf8) |text| {
         g_pty.write(text) catch {};
     }
@@ -171,7 +164,8 @@ pub fn main() !void {
     defer wl.deinit();
 
     // Init renderer (needs active GL context)
-    var renderer = try renderer_mod.Renderer.init(allocator, font_data, cfg.font_size);
+    var renderer: renderer_mod.Renderer = undefined;
+    try renderer.init(allocator, font_data, cfg.font_size);
     defer renderer.deinit();
 
     std.debug.print("mollusk: cell size {d:.1}x{d:.1}\n", .{ renderer.cell_width, renderer.cell_height });
@@ -216,7 +210,6 @@ pub fn main() !void {
     // Event loop
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
-    var needs_render = true; // render first frame
 
     while (!wl.closed and !child_exited) {
         wl.flush();
@@ -226,7 +219,7 @@ pub fn main() !void {
             .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
         };
 
-        _ = c.poll(&pollfds, 2, if (needs_render and !wl.frame_pending) @as(c_int, 0) else @as(c_int, 16));
+        _ = c.poll(&pollfds, 2, 16);
 
         // Handle Wayland events
         if (pollfds[0].revents & c.POLLIN != 0) {
@@ -248,7 +241,6 @@ pub fn main() !void {
                     break;
                 }
                 term.feedData(pty_buf[0..n]);
-                needs_render = true;
             }
         }
 
@@ -257,12 +249,12 @@ pub fn main() !void {
             child_exited = true;
         }
 
-        // Render
-        if (!wl.frame_pending and needs_render) {
+        // Render every frame — the renderer is fast enough and this avoids
+        // dirty-tracking bugs with cursor-only changes
+        if (!wl.frame_pending) {
             renderer.drawFrame(&term) catch {};
             wl.swapBuffers();
             wl.requestFrame();
-            needs_render = false;
         }
     }
 

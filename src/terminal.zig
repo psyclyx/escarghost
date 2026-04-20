@@ -352,6 +352,9 @@ pub const Terminal = struct {
         c.ghostty_terminal_scroll_viewport(self.handle, behavior);
     }
 
+    // Persistent buffer for encoded key output (avoids dangling stack pointer)
+    var encode_buf: [128]u8 = undefined;
+
     pub fn encodeKey(
         self: *Terminal,
         key: c.GhosttyKey,
@@ -374,13 +377,14 @@ pub const Terminal = struct {
             _ = c.ghostty_key_event_set_utf8(self.key_event, null, 0);
         }
 
-        // Encode
-        var buf: [128]u8 = undefined;
+        // Encode into persistent buffer
         var written: usize = 0;
-        _ = c.ghostty_key_encoder_encode(self.key_encoder, self.key_event, &buf, buf.len, &written);
+        _ = c.ghostty_key_encoder_encode(self.key_encoder, self.key_event, &encode_buf, encode_buf.len, &written);
         if (written == 0) return null;
-        return buf[0..written];
+        return encode_buf[0..written];
     }
+
+    var mouse_encode_buf: [128]u8 = undefined;
 
     pub fn encodeMouse(
         self: *Terminal,
@@ -401,11 +405,10 @@ pub const Terminal = struct {
         _ = c.ghostty_mouse_event_set_mods(self.mouse_event, mods);
         _ = c.ghostty_mouse_event_set_position(self.mouse_event, .{ .x = x, .y = y });
 
-        var buf: [128]u8 = undefined;
         var written: usize = 0;
-        _ = c.ghostty_mouse_encoder_encode(self.mouse_encoder, self.mouse_event, &buf, buf.len, &written);
+        _ = c.ghostty_mouse_encoder_encode(self.mouse_encoder, self.mouse_event, &mouse_encode_buf, mouse_encode_buf.len, &written);
         if (written == 0) return null;
-        return buf[0..written];
+        return mouse_encode_buf[0..written];
     }
 
     pub fn getTitle(self: *Terminal) []const u8 {
