@@ -282,26 +282,41 @@ pub const Terminal = struct {
     };
 
     pub fn getCellInfo(self: *Terminal) CellInfo {
-        var info: CellInfo = undefined;
-        info.has_text = false;
-        info.graphemes_len = 0;
-        info.fg = null;
-        info.bg = null;
-        info.style = std.mem.zeroes(c.GhosttyStyle);
-        info.style.size = @sizeOf(c.GhosttyStyle);
-        info.raw = 0;
-        info.codepoint = 0;
+        var graphemes_len: u32 = 0;
+        var style: c.GhosttyStyle = undefined;
+        style.size = @sizeOf(c.GhosttyStyle);
+        var fg_rgb: c.GhosttyColorRgb = undefined;
+        var bg_rgb: c.GhosttyColorRgb = undefined;
 
-        // Get graphemes length
-        _ = c.ghostty_render_state_row_cells_get(
-            self.row_cells,
+        // Batch query: 4 fields in one C call instead of 4 separate calls
+        const keys = [4]c.GhosttyRenderStateRowCellsData{
             c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
-            &info.graphemes_len,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+        };
+        var values = [4]?*anyopaque{
+            @ptrCast(&graphemes_len),
+            @ptrCast(&style),
+            @ptrCast(&fg_rgb),
+            @ptrCast(&bg_rgb),
+        };
+        var written: usize = 0;
+        _ = c.ghostty_render_state_row_cells_get_multi(
+            self.row_cells, 4, &keys, &values, &written,
         );
-        info.has_text = info.graphemes_len > 0;
+
+        var info: CellInfo = .{
+            .codepoint = 0,
+            .has_text = graphemes_len > 0,
+            .graphemes_len = graphemes_len,
+            .fg = if (written >= 3) fromGhosttyRgb(fg_rgb) else null,
+            .bg = if (written >= 4) fromGhosttyRgb(bg_rgb) else null,
+            .style = style,
+            .raw = 0,
+        };
 
         if (info.has_text) {
-            // Get the base codepoint via graphemes buffer
             var cp_buf: [64]u32 = undefined;
             _ = c.ghostty_render_state_row_cells_get(
                 self.row_cells,
@@ -310,40 +325,6 @@ pub const Terminal = struct {
             );
             info.codepoint = cp_buf[0];
         }
-
-        // Get style
-        _ = c.ghostty_render_state_row_cells_get(
-            self.row_cells,
-            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
-            &info.style,
-        );
-
-        // Get fg color
-        var fg_rgb: c.GhosttyColorRgb = undefined;
-        if (c.ghostty_render_state_row_cells_get(
-            self.row_cells,
-            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
-            &fg_rgb,
-        ) == c.GHOSTTY_SUCCESS) {
-            info.fg = fromGhosttyRgb(fg_rgb);
-        }
-
-        // Get bg color
-        var bg_rgb: c.GhosttyColorRgb = undefined;
-        if (c.ghostty_render_state_row_cells_get(
-            self.row_cells,
-            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
-            &bg_rgb,
-        ) == c.GHOSTTY_SUCCESS) {
-            info.bg = fromGhosttyRgb(bg_rgb);
-        }
-
-        // Get raw cell
-        _ = c.ghostty_render_state_row_cells_get(
-            self.row_cells,
-            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
-            &info.raw,
-        );
 
         return info;
     }

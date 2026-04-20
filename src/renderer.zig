@@ -296,6 +296,9 @@ pub const Renderer = struct {
             }
         }
 
+        // Flush GL pipeline so frame_timer captures actual GPU work
+        gl.glFlush();
+
         term.resetDirty();
 
         frame_stats.record(frame_timer.elapsedUs());
