@@ -5,6 +5,8 @@ const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
 const renderer_mod = @import("renderer.zig");
 
+const perf = @import("perf.zig");
+
 const c = @cImport({
     @cInclude("poll.h");
     @cInclude("stdlib.h");
@@ -142,6 +144,7 @@ fn onFocus(focused: bool) void {
 }
 
 pub fn main() !void {
+    const startup_timer = perf.Timer.now();
     const allocator = std.heap.smp_allocator;
 
     // Load config
@@ -205,11 +208,13 @@ pub fn main() !void {
     wl.on_resize = onResize;
     wl.on_focus = onFocus;
 
-    std.debug.print("mollusk: ready\n", .{});
+    std.debug.print("mollusk: ready ({d:.1}ms startup)\n", .{startup_timer.elapsedMs()});
 
     // Event loop
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
+    var has_pty_data = false;
+    var first_paint = true;
 
     while (!wl.closed and !child_exited) {
         wl.flush();
@@ -219,14 +224,16 @@ pub fn main() !void {
             .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
         };
 
-        _ = c.poll(&pollfds, 2, 16);
+        // Block indefinitely when idle — no CPU burn, no battery drain.
+        // Wake on wayland events (input, frame callback) or PTY data.
+        _ = c.poll(&pollfds, 2, -1);
 
         // Handle Wayland events
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.dispatch() catch break;
         }
 
-        // Handle PTY data
+        // Handle PTY data — drain all available without blocking
         if (pollfds[1].revents & c.POLLIN != 0) {
             while (true) {
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
@@ -241,23 +248,30 @@ pub fn main() !void {
                     break;
                 }
                 term.feedData(pty_buf[0..n]);
+                has_pty_data = true;
             }
         }
 
-        // Check if child exited
-        if (pty.checkChild()) |_| {
-            child_exited = true;
-        }
+        // Check child exit
+        if (pty.checkChild()) |_| child_exited = true;
 
-        // Render every frame — the renderer is fast enough and this avoids
-        // dirty-tracking bugs with cursor-only changes
+        // Render — only when frame callback allows and we have something to show
         if (!wl.frame_pending) {
-            renderer.drawFrame(&term) catch {};
-            wl.swapBuffers();
-            wl.requestFrame();
+            const drew = renderer.drawFrame(&term) catch false;
+            if (drew or has_pty_data) {
+                wl.swapBuffers();
+                wl.requestFrame();
+                if (first_paint) {
+                    std.debug.print("mollusk: first paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                    first_paint = false;
+                }
+            }
+            has_pty_data = false;
         }
     }
 
+    // Print perf summary
+    renderer_mod.Renderer.frame_stats.log("frame");
     std.debug.print("mollusk: exiting\n", .{});
 }
 

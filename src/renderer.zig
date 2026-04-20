@@ -2,6 +2,7 @@ const std = @import("std");
 const snail = @import("snail");
 const terminal_mod = @import("terminal.zig");
 const color = @import("color.zig");
+const perf = @import("perf.zig");
 const Rgb = color.Rgb;
 const Terminal = terminal_mod.Terminal;
 
@@ -40,6 +41,9 @@ pub const Renderer = struct {
 
     allocator: std.mem.Allocator,
 
+    // Perf tracking
+    pub var frame_stats: perf.FrameStats = .{};
+
     pub fn init(self: *Renderer, allocator: std.mem.Allocator, font_data: []const u8, font_size: f32) !void {
         self.allocator = allocator;
         self.font_size = font_size;
@@ -49,7 +53,6 @@ pub const Renderer = struct {
         self.font = try snail.Font.init(font_data);
         errdefer self.font.deinit();
 
-        // Atlas takes &self.font — pointer is stable since self is caller-owned
         self.atlas = try snail.Atlas.initAscii(allocator, &self.font, &snail.ASCII_PRINTABLE);
         errdefer self.atlas.deinit();
 
@@ -57,28 +60,22 @@ pub const Renderer = struct {
         errdefer self.snail_renderer.deinit();
 
         self.snail_renderer.uploadAtlas(&self.atlas);
-
-        // Rendering quality setup
         self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
-        self.snail_renderer.setFillRule(.non_zero); // TrueType standard
+        self.snail_renderer.setFillRule(.non_zero);
 
-        // Note: do NOT enable GL_FRAMEBUFFER_SRGB — snail's shaders already
-        // apply sRGB gamma to coverage values. Enabling it would double-correct.
-
-        // Compute cell metrics from font
+        // Compute cell metrics
         const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
         const scale = font_size / units_per_em;
-
         const m_gid = self.font.glyphIndex('M') catch 0;
         const m_info = self.atlas.getGlyph(m_gid);
         self.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6);
         self.cell_height = @ceil(font_size * 1.2);
 
-        const max_glyphs = 400 * 120;
-        self.text_buf = try allocator.alloc(f32, max_glyphs * snail.FLOATS_PER_GLYPH);
+        // Vertex buffers — sized for worst case
+        const max_cells = 400 * 150;
+        self.text_buf = try allocator.alloc(f32, max_cells * snail.FLOATS_PER_GLYPH);
         errdefer allocator.free(self.text_buf);
-
-        self.vector_buf = try allocator.alloc(f32, max_glyphs * snail.VECTOR_FLOATS_PER_PRIMITIVE);
+        self.vector_buf = try allocator.alloc(f32, max_cells * snail.VECTOR_FLOATS_PER_PRIMITIVE);
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -100,23 +97,20 @@ pub const Renderer = struct {
         self.viewport_h = @floatFromInt(h);
     }
 
-    pub fn drawFrame(self: *Renderer, term: *Terminal) !void {
+    /// Returns true if a frame was actually drawn (dirty content existed).
+    pub fn drawFrame(self: *Renderer, term: *Terminal) !bool {
+        const frame_timer = perf.Timer.now();
+
         try term.updateRenderState();
+        if (term.getDirty() == .false_) return false;
 
         const colors = term.getColors();
         const cursor = term.getCursor();
 
-        // Clear with background color (convert to linear for sRGB framebuffer)
         const bg = colors.background.toFloat4(1.0);
         gl.glClearColor(bg[0], bg[1], bg[2], bg[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
-        // Ensure clean GL state for this frame
-        gl.glDisable(gl.GL_DEPTH_TEST);
-        gl.glEnable(gl.GL_BLEND);
-        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA); // premultiplied alpha
-
-        // Orthographic projection: pixel coords, bottom-left origin (for text pipeline)
         const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
 
         self.snail_renderer.beginFrame();
@@ -127,39 +121,19 @@ pub const Renderer = struct {
         const default_fg = colors.foreground;
         const default_bg = colors.background;
 
-        // First pass: collect any missing codepoints for the atlas
-        var needs_atlas_update = false;
-        term.beginRowIteration();
-        while (term.nextRow()) {
-            term.beginCellIteration();
-            while (term.nextCell()) {
-                const cell = term.getCellInfo();
-                if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
-                    const cps = [1]u32{cell.codepoint};
-                    if (self.atlas.addCodepoints(&cps) catch false) {
-                        needs_atlas_update = true;
-                    }
-                }
-            }
-        }
-        if (needs_atlas_update) {
-            self.snail_renderer.uploadAtlas(&self.atlas);
-        }
-
-        // Second pass: build vertex batches
+        // Single pass: build vertex batches. Atlas misses handled inline
+        // (rare — only on first encounter of a new codepoint).
         term.beginRowIteration();
         var row_idx: u16 = 0;
         while (term.nextRow()) : (row_idx += 1) {
+            const cell_y_tl = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
+            const cell_y_bl = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
+
             term.beginCellIteration();
             var col_idx: u16 = 0;
             while (term.nextCell()) : (col_idx += 1) {
                 const cell = term.getCellInfo();
-
                 const cell_x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
-                // Vector pipeline: top-left origin (shader flips y)
-                const cell_y_tl = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
-                // Text pipeline: bottom-left origin (standard GL via MVP)
-                const cell_y_bl = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
 
                 // Resolve colors
                 var fg = cell.fg orelse default_fg;
@@ -177,7 +151,7 @@ pub const Renderer = struct {
                     };
                 }
 
-                // Background rect
+                // Background
                 if (cell_bg) |cbg| {
                     _ = vec_batch.addRect(
                         .{ .x = cell_x, .y = cell_y_tl, .w = self.cell_width, .h = self.cell_height },
@@ -190,19 +164,22 @@ pub const Renderer = struct {
                 // Text
                 if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
                     var utf8_buf: [4]u8 = undefined;
-                    const utf8_len = std.unicode.utf8Encode(
-                        @intCast(cell.codepoint),
-                        &utf8_buf,
-                    ) catch 0;
-
+                    const utf8_len = std.unicode.utf8Encode(@intCast(cell.codepoint), &utf8_buf) catch 0;
                     if (utf8_len > 0) {
-                        const text_y = cell_y_bl + self.cell_height * 0.2;
+                        // Atlas miss — rare path
+                        if (self.atlas.getGlyph(self.font.glyphIndex(cell.codepoint) catch 0) == null) {
+                            const cps = [1]u32{cell.codepoint};
+                            if (self.atlas.addCodepoints(&cps) catch false) {
+                                self.snail_renderer.uploadAtlas(&self.atlas);
+                            }
+                        }
+
                         _ = text_batch.addString(
                             &self.atlas,
                             &self.font,
                             utf8_buf[0..utf8_len],
                             cell_x,
-                            text_y,
+                            cell_y_bl + self.cell_height * 0.2,
                             self.font_size,
                             fg.toFloat4(1.0),
                         );
@@ -231,79 +208,61 @@ pub const Renderer = struct {
             }
         }
 
-        // Cursor (vector pipeline = top-left origin)
+        // Cursor
         if (cursor.visible and cursor.in_viewport) {
             const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
             const cy = @as(f32, @floatFromInt(cursor.y)) * self.cell_height;
-            const cc = if (colors.cursor) |c| c.toFloat4(1.0) else colors.foreground.toFloat4(1.0);
+            const cc = if (colors.cursor) |col| col.toFloat4(1.0) else colors.foreground.toFloat4(1.0);
 
             switch (cursor.style) {
-                .block => {
-                    // Solid block — draw the block, then re-draw the glyph
-                    // under the cursor with inverted color in the text pass below
-                    _ = vec_batch.addRect(
-                        .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height },
-                        cc,
-                        .{ 0, 0, 0, 0 },
-                        0,
-                    );
-                },
+                .block => _ = vec_batch.addRect(
+                    .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height },
+                    cc, .{ 0, 0, 0, 0 }, 0,
+                ),
                 .bar => _ = vec_batch.addRect(
                     .{ .x = cx, .y = cy, .w = 2, .h = self.cell_height },
-                    cc,
-                    .{ 0, 0, 0, 0 },
-                    0,
+                    cc, .{ 0, 0, 0, 0 }, 0,
                 ),
                 .underline => _ = vec_batch.addRect(
                     .{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2 },
-                    cc,
-                    .{ 0, 0, 0, 0 },
-                    0,
+                    cc, .{ 0, 0, 0, 0 }, 0,
                 ),
                 .block_hollow => _ = vec_batch.addRect(
                     .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height },
-                    .{ 0, 0, 0, 0 },
-                    cc,
-                    1.5,
+                    .{ 0, 0, 0, 0 }, cc, 1.5,
                 ),
             }
         }
 
-        // Draw vectors (backgrounds + decorations + cursor)
+        // Draw
         if (vec_batch.shapeCount() > 0) {
             self.snail_renderer.drawVector(vec_batch.slice(), self.viewport_w, self.viewport_h);
         }
-
-        // Draw text
         if (text_batch.glyphCount() > 0) {
             self.snail_renderer.draw(text_batch.slice(), mvp, self.viewport_w, self.viewport_h);
         }
 
-        // Re-draw the glyph under a block cursor with inverted color so it's
-        // readable against the solid cursor background
+        // Block cursor: re-draw glyph with inverted color
         if (cursor.visible and cursor.in_viewport and cursor.style == .block) {
-            // Find the cell under the cursor and redraw with bg color
             term.beginRowIteration();
-            var skip_rows: u16 = 0;
-            while (term.nextRow()) : (skip_rows += 1) {
-                if (skip_rows == cursor.y) {
+            var sr: u16 = 0;
+            while (term.nextRow()) : (sr += 1) {
+                if (sr == cursor.y) {
                     term.beginCellIteration();
-                    var skip_cols: u16 = 0;
-                    while (term.nextCell()) : (skip_cols += 1) {
-                        if (skip_cols == cursor.x) {
+                    var sc: u16 = 0;
+                    while (term.nextCell()) : (sc += 1) {
+                        if (sc == cursor.x) {
                             const cell = term.getCellInfo();
                             if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
                                 var utf8_buf: [4]u8 = undefined;
                                 const utf8_len = std.unicode.utf8Encode(@intCast(cell.codepoint), &utf8_buf) catch 0;
                                 if (utf8_len > 0) {
-                                    const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
                                     const cy_bl = self.viewport_h - @as(f32, @floatFromInt(cursor.y + 1)) * self.cell_height;
                                     var inv_batch = snail.Batch.init(self.text_buf);
                                     _ = inv_batch.addString(
-                                        &self.atlas,
-                                        &self.font,
+                                        &self.atlas, &self.font,
                                         utf8_buf[0..utf8_len],
-                                        cx,
+                                        @as(f32, @floatFromInt(cursor.x)) * self.cell_width,
                                         cy_bl + self.cell_height * 0.2,
                                         self.font_size,
                                         colors.background.toFloat4(1.0),
@@ -322,5 +281,8 @@ pub const Renderer = struct {
         }
 
         term.resetDirty();
+
+        frame_stats.record(frame_timer.elapsedUs());
+        return true;
     }
 };
