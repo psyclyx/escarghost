@@ -145,11 +145,16 @@ pub const Renderer = struct {
         var text_batch = snail.Batch.init(self.text_buf[text_start..][0..self.text_slot_size]);
         var vec_batch = snail.VectorBatch.init(self.vector_buf[vec_start..][0..self.vec_slot_size]);
 
+        // Background span coalescing state
+        var bg_span_start: u16 = 0;
+        var bg_span_color: ?Rgb = null;
+        var bg_span_len: u16 = 0;
+        var last_content_col: u16 = 0;
+
         term.beginCellIteration();
         var col_idx: u16 = 0;
         while (term.nextCell()) : (col_idx += 1) {
             const cell = term.getCellInfo();
-            const cell_x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
 
             var fg = cell.fg orelse default_fg;
             var cell_bg = cell.bg;
@@ -166,17 +171,42 @@ pub const Renderer = struct {
                 };
             }
 
+            // Background span coalescing: extend current span if same color,
+            // otherwise flush the span and start a new one.
+            const bg_matches = if (cell_bg) |cbg| (if (bg_span_color) |sc| sc.r == cbg.r and sc.g == cbg.g and sc.b == cbg.b else false) else false;
+            if (cell_bg != null and bg_matches) {
+                bg_span_len += 1;
+            } else {
+                // Flush previous span
+                if (bg_span_len > 0) {
+                    if (bg_span_color) |sc| {
+                        _ = vec_batch.addRect(
+                            .{
+                                .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                                .y = cell_y_tl,
+                                .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                                .h = self.cell_height,
+                            },
+                            sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
+                        );
+                    }
+                }
+                // Start new span
+                if (cell_bg) |cbg| {
+                    bg_span_start = col_idx;
+                    bg_span_color = cbg;
+                    bg_span_len = 1;
+                } else {
+                    bg_span_color = null;
+                    bg_span_len = 0;
+                }
+            }
+
             const is_cursor_cell = cursor.visible and cursor.in_viewport and
                 cursor.style == .block and col_idx == cursor.x and row_idx == cursor.y;
 
-            if (cell_bg) |cbg| {
-                _ = vec_batch.addRect(
-                    .{ .x = cell_x, .y = cell_y_tl, .w = self.cell_width, .h = self.cell_height },
-                    cbg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
-                );
-            }
-
             if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
+                last_content_col = col_idx;
                 const gid = self.font.glyphIndex(cell.codepoint) catch 0;
                 if (self.atlas.getGlyph(gid)) |info| {
                     const glyph_color = if (is_cursor_cell)
@@ -184,7 +214,8 @@ pub const Renderer = struct {
                     else
                         fg.toFloat4(1.0);
                     _ = text_batch.addGlyph(
-                        cell_x, cell_y_bl + self.cell_height * 0.2,
+                        @as(f32, @floatFromInt(col_idx)) * self.cell_width,
+                        cell_y_bl + self.cell_height * 0.2,
                         self.font_size, info.bbox, info.band_entry,
                         glyph_color, self.atlas.gl_layer,
                     );
@@ -195,24 +226,44 @@ pub const Renderer = struct {
                     const gid2 = self.font.glyphIndex(cell.codepoint) catch 0;
                     if (self.atlas.getGlyph(gid2)) |info| {
                         _ = text_batch.addGlyph(
-                            cell_x, cell_y_bl + self.cell_height * 0.2,
+                            @as(f32, @floatFromInt(col_idx)) * self.cell_width,
+                            cell_y_bl + self.cell_height * 0.2,
                             self.font_size, info.bbox, info.band_entry,
                             fg.toFloat4(1.0), self.atlas.gl_layer,
                         );
                     }
                 }
-            }
 
-            if (cell.style.underline != 0 and cell.has_text)
+                if (cell.style.underline != 0) {
+                    const cell_x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
+                    _ = vec_batch.addRect(
+                        .{ .x = cell_x, .y = cell_y_tl + self.cell_height - 1, .w = self.cell_width, .h = 1 },
+                        fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
+                    );
+                }
+                if (cell.style.strikethrough != false) {
+                    const cell_x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
+                    _ = vec_batch.addRect(
+                        .{ .x = cell_x, .y = cell_y_tl + self.cell_height * 0.45, .w = self.cell_width, .h = 1 },
+                        fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
+                    );
+                }
+            }
+        }
+
+        // Flush final bg span
+        if (bg_span_len > 0) {
+            if (bg_span_color) |sc| {
                 _ = vec_batch.addRect(
-                    .{ .x = cell_x, .y = cell_y_tl + self.cell_height - 1, .w = self.cell_width, .h = 1 },
-                    fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
+                    .{
+                        .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                        .y = cell_y_tl,
+                        .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                        .h = self.cell_height,
+                    },
+                    sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
                 );
-            if (cell.style.strikethrough != false and cell.has_text)
-                _ = vec_batch.addRect(
-                    .{ .x = cell_x, .y = cell_y_tl + self.cell_height * 0.45, .w = self.cell_width, .h = 1 },
-                    fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0,
-                );
+            }
         }
 
         self.row_text_len[row_idx] = @intCast(text_batch.glyphCount() * snail.FLOATS_PER_GLYPH);
