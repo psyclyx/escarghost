@@ -267,6 +267,10 @@ pub const Terminal = struct {
         return c.ghostty_render_state_row_cells_next(self.row_cells);
     }
 
+    pub fn selectCell(self: *Terminal, col: u16) bool {
+        return c.ghostty_render_state_row_cells_select(self.row_cells, col) == c.GHOSTTY_SUCCESS;
+    }
+
     pub const CellInfo = struct {
         codepoint: u32,
         has_text: bool,

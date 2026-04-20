@@ -166,28 +166,38 @@ pub const Renderer = struct {
                     );
                 }
 
-                // Text
+                // Text — direct glyph vertex generation, no HarfBuzz/layout overhead
                 if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
-                    var utf8_buf: [4]u8 = undefined;
-                    const utf8_len = std.unicode.utf8Encode(@intCast(cell.codepoint), &utf8_buf) catch 0;
-                    if (utf8_len > 0) {
-                        // Atlas miss — rare path
-                        if (self.atlas.getGlyph(self.font.glyphIndex(cell.codepoint) catch 0) == null) {
-                            const cps = [1]u32{cell.codepoint};
-                            if (self.atlas.addCodepoints(&cps) catch false) {
-                                self.snail_renderer.uploadAtlas(&self.atlas);
-                            }
-                        }
-
-                        _ = text_batch.addString(
-                            &self.atlas,
-                            &self.font,
-                            utf8_buf[0..utf8_len],
+                    const gid = self.font.glyphIndex(cell.codepoint) catch 0;
+                    if (self.atlas.getGlyph(gid)) |info| {
+                        _ = text_batch.addGlyph(
                             cell_x,
                             cell_y_bl + self.cell_height * 0.2,
                             self.font_size,
+                            info.bbox,
+                            info.band_entry,
                             fg.toFloat4(1.0),
+                            self.atlas.gl_layer,
                         );
+                    } else {
+                        // Atlas miss — add codepoint and re-upload (rare)
+                        const cps = [1]u32{cell.codepoint};
+                        if (self.atlas.addCodepoints(&cps) catch false) {
+                            self.snail_renderer.uploadAtlas(&self.atlas);
+                        }
+                        // Retry after upload
+                        const gid2 = self.font.glyphIndex(cell.codepoint) catch 0;
+                        if (self.atlas.getGlyph(gid2)) |info| {
+                            _ = text_batch.addGlyph(
+                                cell_x,
+                                cell_y_bl + self.cell_height * 0.2,
+                                self.font_size,
+                                info.bbox,
+                                info.band_entry,
+                                fg.toFloat4(1.0),
+                                self.atlas.gl_layer,
+                            );
+                        }
                     }
                 }
 
@@ -249,35 +259,32 @@ pub const Renderer = struct {
 
         // Block cursor: re-draw glyph with inverted color
         if (cursor.visible and cursor.in_viewport and cursor.style == .block) {
+            // Use select() to jump directly to the cursor cell instead of iterating
             term.beginRowIteration();
             var sr: u16 = 0;
             while (term.nextRow()) : (sr += 1) {
                 if (sr == cursor.y) {
                     term.beginCellIteration();
-                    var sc: u16 = 0;
-                    while (term.nextCell()) : (sc += 1) {
-                        if (sc == cursor.x) {
-                            const cell = term.getCellInfo();
-                            if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
-                                var utf8_buf: [4]u8 = undefined;
-                                const utf8_len = std.unicode.utf8Encode(@intCast(cell.codepoint), &utf8_buf) catch 0;
-                                if (utf8_len > 0) {
-                                    const cy_bl = self.viewport_h - @as(f32, @floatFromInt(cursor.y + 1)) * self.cell_height;
-                                    var inv_batch = snail.Batch.init(self.text_buf);
-                                    _ = inv_batch.addString(
-                                        &self.atlas, &self.font,
-                                        utf8_buf[0..utf8_len],
-                                        @as(f32, @floatFromInt(cursor.x)) * self.cell_width,
-                                        cy_bl + self.cell_height * 0.2,
-                                        self.font_size,
-                                        colors.background.toFloat4(1.0),
-                                    );
-                                    if (inv_batch.glyphCount() > 0) {
-                                        self.snail_renderer.draw(inv_batch.slice(), mvp, self.viewport_w, self.viewport_h);
-                                    }
+                    if (term.selectCell(cursor.x)) {
+                        const cell = term.getCellInfo();
+                        if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
+                            const gid = self.font.glyphIndex(cell.codepoint) catch 0;
+                            if (self.atlas.getGlyph(gid)) |info| {
+                                const cy_bl = self.viewport_h - @as(f32, @floatFromInt(cursor.y + 1)) * self.cell_height;
+                                var inv_batch = snail.Batch.init(self.text_buf);
+                                _ = inv_batch.addGlyph(
+                                    @as(f32, @floatFromInt(cursor.x)) * self.cell_width,
+                                    cy_bl + self.cell_height * 0.2,
+                                    self.font_size,
+                                    info.bbox,
+                                    info.band_entry,
+                                    colors.background.toFloat4(1.0),
+                                    self.atlas.gl_layer,
+                                );
+                                if (inv_batch.glyphCount() > 0) {
+                                    self.snail_renderer.draw(inv_batch.slice(), mvp, self.viewport_w, self.viewport_h);
                                 }
                             }
-                            break;
                         }
                     }
                     break;

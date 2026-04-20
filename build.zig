@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
         const snail_dep = b.dependency("snail", .{});
         const snail_opts = b.addOptions();
         snail_opts.addOption(bool, "enable_profiling", false);
-        snail_opts.addOption(bool, "enable_harfbuzz", true);
+        snail_opts.addOption(bool, "enable_harfbuzz", false);
         snail_opts.addOption(bool, "enable_vulkan", false);
         snail_opts.addOption(bool, "force_gl33", false);
 
@@ -44,7 +44,6 @@ pub fn build(b: *std.Build) void {
         });
         snail_mod.addOptions("build_options", snail_opts);
         snail_mod.linkSystemLibrary("gl", .{});
-        snail_mod.linkSystemLibrary("harfbuzz", .{});
         snail_mod.addImport("vulkan_shaders", vk_stub);
         root_module.addImport("snail", snail_mod);
     }
@@ -77,6 +76,25 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run mollusk");
     run_step.dependOn(&run_cmd.step);
+
+    // Benchmark (no GL, CPU-side perf)
+    {
+        const bench_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        });
+        if (vt_include) |inc| bench_module.addIncludePath(.{ .cwd_relative = inc });
+        if (vt_static_lib) |lib_path| bench_module.addObjectFile(.{ .cwd_relative = lib_path });
+        bench_module.linkSystemLibrary("fontconfig", .{});
+
+        const bench_exe = b.addExecutable(.{ .name = "mollusk-bench", .root_module = bench_module });
+        b.installArtifact(bench_exe);
+        const bench_run = b.addRunArtifact(bench_exe);
+        const bench_step = b.step("bench", "Run CPU benchmarks");
+        bench_step.dependOn(&bench_run.step);
+    }
 
     // Headless test (no GL, exercises terminal + render state iteration)
     {
