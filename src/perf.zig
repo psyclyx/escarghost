@@ -17,9 +17,9 @@ pub const Timer = struct {
     pub fn elapsedNs(self: Timer) u64 {
         var end: c.struct_timespec = undefined;
         _ = c.clock_gettime(c.CLOCK_MONOTONIC, &end);
-        const s: u64 = @intCast(end.tv_sec - self.start.tv_sec);
-        const ns: i64 = end.tv_nsec - self.start.tv_nsec;
-        return s * 1_000_000_000 + @as(u64, @intCast(ns));
+        const total_start: i128 = @as(i128, self.start.tv_sec) * 1_000_000_000 + self.start.tv_nsec;
+        const total_end: i128 = @as(i128, end.tv_sec) * 1_000_000_000 + end.tv_nsec;
+        return @intCast(total_end - total_start);
     }
 
     pub fn elapsedUs(self: Timer) f64 {

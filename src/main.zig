@@ -4,13 +4,16 @@ const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
 const renderer_mod = @import("renderer.zig");
-
 const perf = @import("perf.zig");
 
 const c = @cImport({
     @cInclude("poll.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
+    @cInclude("sys/mman.h");
+    @cInclude("sys/stat.h");
+    @cInclude("fcntl.h");
+    @cInclude("unistd.h");
 });
 
 const ghostty_c = @cImport(@cInclude("ghostty/vt.h"));
@@ -21,73 +24,75 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(ptr, 0);
 }
 
-/// Find a monospace font. Try config path, then fc-match, then common paths.
-fn findFont(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
-    // Config-specified font
-    if (config_path.len > 0) {
-        return try allocator.dupe(u8, config_path);
-    }
+/// mmap a font file — zero copy, stays mapped for process lifetime.
+fn mmapFont(path: []const u8) ![]const u8 {
+    const path_z = std.heap.smp_allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+    defer std.heap.smp_allocator.free(path_z);
 
-    // Try fc-match for a monospace font
-    {
-        const pipe = c.popen("fc-match -f '%{file}' monospace 2>/dev/null", "r");
-        if (pipe) |p| {
-            defer _ = c.pclose(p);
-            var fc_buf: [4096]u8 = undefined;
-            const n = c.fread(&fc_buf, 1, fc_buf.len, p);
-            if (n > 0) {
-                const fc_path = fc_buf[0..n];
-                // Verify file exists
-                const fc_z = try allocator.dupeZ(u8, fc_path);
-                defer allocator.free(fc_z);
-                if (c.fopen(fc_z.ptr, "rb")) |fp| {
-                    _ = c.fclose(fp);
-                    return try allocator.dupe(u8, fc_path);
-                }
+    const fd = c.open(path_z.ptr, c.O_RDONLY);
+    if (fd < 0) return error.FileNotFound;
+
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) < 0) {
+        _ = c.close(fd);
+        return error.StatFailed;
+    }
+    const size: usize = @intCast(st.st_size);
+
+    const map = c.mmap(null, size, c.PROT_READ, c.MAP_PRIVATE, fd, 0);
+    _ = c.close(fd); // fd can be closed after mmap
+    if (map == c.MAP_FAILED) return error.MmapFailed;
+
+    const ptr: [*]const u8 = @ptrCast(map);
+    return ptr[0..size];
+}
+
+/// Find a monospace font path. Try config, fc-match, then hardcoded fallbacks.
+fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
+    if (config_path.len > 0) return try allocator.dupe(u8, config_path);
+
+    // fc-match
+    const pipe = c.popen("fc-match -f '%{file}' monospace 2>/dev/null", "r");
+    if (pipe) |p| {
+        defer _ = c.pclose(p);
+        var buf: [4096]u8 = undefined;
+        const n = c.fread(&buf, 1, buf.len, p);
+        if (n > 0) {
+            const fc_path = buf[0..n];
+            const z = try allocator.dupeZ(u8, fc_path);
+            defer allocator.free(z);
+            if (c.access(z.ptr, c.F_OK) == 0) {
+                return try allocator.dupe(u8, fc_path);
             }
         }
     }
 
-    // Common system paths
     const fallbacks = [_][]const u8{
         "/usr/share/fonts/TTF/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     };
     for (fallbacks) |path| {
-        const path_z = try allocator.dupeZ(u8, path);
-        defer allocator.free(path_z);
-        if (c.fopen(path_z.ptr, "rb")) |fp| {
-            _ = c.fclose(fp);
-            return try allocator.dupe(u8, path);
-        }
+        const z = try allocator.dupeZ(u8, path);
+        defer allocator.free(z);
+        if (c.access(z.ptr, c.F_OK) == 0) return try allocator.dupe(u8, path);
     }
-
     return error.NoFontFound;
 }
 
-fn readFileC(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
+/// Background font loading — writes result to shared struct.
+const FontResult = struct {
+    path: []const u8 = "",
+    data: []const u8 = "",
+};
 
-    const fp = c.fopen(path_z.ptr, "rb") orelse return error.FileNotFound;
-    defer _ = c.fclose(fp);
-
-    _ = c.fseek(fp, 0, c.SEEK_END);
-    const size_raw = c.ftell(fp);
-    if (size_raw < 0) return error.ReadFailed;
-    const size: usize = @intCast(size_raw);
-    _ = c.fseek(fp, 0, c.SEEK_SET);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-
-    if (c.fread(buf.ptr, 1, size, fp) != size) return error.ReadFailed;
-    return buf;
+fn fontThread(result: *FontResult, cfg_font_path: []const u8) void {
+    const allocator = std.heap.smp_allocator;
+    result.path = findFontPath(allocator, cfg_font_path) catch return;
+    result.data = mmapFont(result.path) catch return;
 }
 
-// Shared state for callbacks (avoids closures which aren't possible with C-callable fns)
+// Shared state for callbacks
 var g_term: *terminal_mod.Terminal = undefined;
 var g_pty: *pty_mod.Pty = undefined;
 var g_renderer: *renderer_mod.Renderer = undefined;
@@ -99,8 +104,6 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     const utf8 = if (ev.utf8_len > 0) ev.utf8[0..ev.utf8_len] else null;
     const gkey = keysymToGhosttyKey(ev.keysym);
 
-    // Try ghostty encoder for special keys and modified keys.
-    // This handles arrow keys, function keys, ctrl+c, etc.
     if (gkey != 0) {
         const encoded = g_term.encodeKey(
             gkey,
@@ -114,8 +117,6 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
         }
     }
 
-    // Fallback: send raw UTF-8 from xkb (handles regular text,
-    // and ctrl+key combos where xkb produces the control char directly)
     if (utf8) |text| {
         g_pty.write(text) catch {};
     }
@@ -124,93 +125,71 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
 fn onResize(w: u32, h: u32) void {
     const grid = g_renderer.computeGridSize(w, h);
     if (grid.cols == 0 or grid.rows == 0) return;
-
     g_renderer.setViewport(w, h);
-
-    g_term.resize(
-        grid.cols,
-        grid.rows,
-        @intFromFloat(g_renderer.cell_width),
-        @intFromFloat(g_renderer.cell_height),
-    ) catch {};
-
+    g_term.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.cell_width), @intFromFloat(g_renderer.cell_height)) catch {};
     g_pty.resize(grid.cols, grid.rows, w, h);
 }
 
 fn onFocus(focused: bool) void {
-    // Encode focus event if terminal has focus reporting enabled
     _ = focused;
-    // TODO: ghostty_focus_encode
 }
 
 pub fn main() !void {
     const startup_timer = perf.Timer.now();
     const allocator = std.heap.smp_allocator;
 
-    // Load config
+    // ── Phase 1: config (fast, ~1ms) ──
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
 
-    // Find and load font
-    const font_path = try findFont(allocator, cfg.font_path);
-    defer allocator.free(font_path);
+    // ── Phase 2: parallel font discovery + Wayland connect ──
+    // Font thread: fc-match + mmap (can take 30ms+ due to subprocess)
+    // Main thread: Wayland connect + EGL init (~50ms)
+    var font_result: FontResult = .{};
+    const font_thread = try std.Thread.spawn(.{}, fontThread, .{ &font_result, cfg.font_path });
 
-    const font_data = try readFileC(allocator, font_path);
-    defer allocator.free(font_data);
-
-    std.debug.print("mollusk: using font {s}\n", .{font_path});
-
-    // Init Wayland + EGL (need GL context before snail)
-    // Start with a rough window size, will resize after font metrics are known
     var wl: wayland_mod.Wayland = undefined;
     try wl.init(800, 600, "mollusk");
     defer wl.deinit();
 
-    // Init renderer (needs active GL context)
+    font_thread.join();
+    if (font_result.data.len == 0) return error.FontLoadFailed;
+    defer allocator.free(font_result.path);
+
+    std.debug.print("mollusk: font {s} ({d:.1}ms)\n", .{ font_result.path, startup_timer.elapsedMs() });
+
+    // ── Phase 3: snail init (needs GL context + font data) ──
     var renderer: renderer_mod.Renderer = undefined;
-    try renderer.init(allocator, font_data, cfg.font_size);
+    try renderer.init(allocator, font_result.data, cfg.font_size);
     defer renderer.deinit();
 
-    std.debug.print("mollusk: cell size {d:.1}x{d:.1}\n", .{ renderer.cell_width, renderer.cell_height });
-
-    // Compute grid from actual window size
+    // ── Phase 4: now we know the real grid size — fork PTY ──
     const grid = renderer.computeGridSize(wl.width, wl.height);
     renderer.setViewport(wl.width, wl.height);
 
-    std.debug.print("mollusk: grid {}x{} in {}x{} window\n", .{ grid.cols, grid.rows, wl.width, wl.height });
-
-    // Init terminal
     var term: terminal_mod.Terminal = undefined;
-    try term.init(
-        grid.cols,
-        grid.rows,
-        cfg.max_scrollback,
-        cfg.palette,
-        cfg.foreground,
-        cfg.background,
-    );
+    try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
-    // Spawn PTY
+    // Fork PTY with correct grid size — no resize needed.
+    // Shell startup (.zshrc etc) overlaps with first render.
     var pty = try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
     defer pty.close();
 
-    // Wire terminal to PTY
     term.pty_fd = pty.master_fd;
 
-    // Set up globals for callbacks
+    // Wire callbacks
     g_term = &term;
     g_pty = &pty;
     g_renderer = &renderer;
     g_wl = &wl;
-
     wl.on_key = onKey;
     wl.on_resize = onResize;
     wl.on_focus = onFocus;
 
-    std.debug.print("mollusk: ready ({d:.1}ms startup)\n", .{startup_timer.elapsedMs()});
+    std.debug.print("mollusk: {}x{} ready ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
 
-    // Event loop
+    // ── Event loop ──
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
     var has_pty_data = false;
@@ -224,38 +203,26 @@ pub fn main() !void {
             .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
         };
 
-        // Block indefinitely when idle — no CPU burn, no battery drain.
-        // Wake on wayland events (input, frame callback) or PTY data.
         _ = c.poll(&pollfds, 2, -1);
 
-        // Handle Wayland events
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.dispatch() catch break;
         }
 
-        // Handle PTY data — drain all available without blocking
         if (pollfds[1].revents & c.POLLIN != 0) {
             while (true) {
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
-                    else => {
-                        child_exited = true;
-                        break;
-                    },
+                    else => { child_exited = true; break; },
                 };
-                if (n == 0) {
-                    child_exited = true;
-                    break;
-                }
+                if (n == 0) { child_exited = true; break; }
                 term.feedData(pty_buf[0..n]);
                 has_pty_data = true;
             }
         }
 
-        // Check child exit
         if (pty.checkChild()) |_| child_exited = true;
 
-        // Render — only when frame callback allows and we have something to show
         if (!wl.frame_pending) {
             const drew = renderer.drawFrame(&term) catch false;
             if (drew or has_pty_data) {
@@ -270,7 +237,6 @@ pub fn main() !void {
         }
     }
 
-    // Print perf summary
     renderer_mod.Renderer.frame_stats.log("frame");
     std.debug.print("mollusk: exiting\n", .{});
 }
@@ -278,12 +244,9 @@ pub fn main() !void {
 fn keysymToGhosttyKey(keysym: u32) c_uint {
     const ks: c_int = @intCast(keysym);
     return @intCast(switch (ks) {
-        // Letters
         xkb_syms.XKB_KEY_a...xkb_syms.XKB_KEY_z => ghostty_c.GHOSTTY_KEY_A + (ks - xkb_syms.XKB_KEY_a),
         xkb_syms.XKB_KEY_A...xkb_syms.XKB_KEY_Z => ghostty_c.GHOSTTY_KEY_A + (ks - xkb_syms.XKB_KEY_A),
-        // Digits
         xkb_syms.XKB_KEY_0...xkb_syms.XKB_KEY_9 => ghostty_c.GHOSTTY_KEY_DIGIT_0 + (ks - xkb_syms.XKB_KEY_0),
-        // Special
         xkb_syms.XKB_KEY_Return => ghostty_c.GHOSTTY_KEY_ENTER,
         xkb_syms.XKB_KEY_KP_Enter => ghostty_c.GHOSTTY_KEY_NUMPAD_ENTER,
         xkb_syms.XKB_KEY_Tab => ghostty_c.GHOSTTY_KEY_TAB,
@@ -300,7 +263,6 @@ fn keysymToGhosttyKey(keysym: u32) c_uint {
         xkb_syms.XKB_KEY_Down => ghostty_c.GHOSTTY_KEY_ARROW_DOWN,
         xkb_syms.XKB_KEY_Left => ghostty_c.GHOSTTY_KEY_ARROW_LEFT,
         xkb_syms.XKB_KEY_Right => ghostty_c.GHOSTTY_KEY_ARROW_RIGHT,
-        // Punctuation / symbols
         xkb_syms.XKB_KEY_space => ghostty_c.GHOSTTY_KEY_SPACE,
         xkb_syms.XKB_KEY_apostrophe => ghostty_c.GHOSTTY_KEY_QUOTE,
         xkb_syms.XKB_KEY_comma => ghostty_c.GHOSTTY_KEY_COMMA,
@@ -313,10 +275,8 @@ fn keysymToGhosttyKey(keysym: u32) c_uint {
         xkb_syms.XKB_KEY_bracketright => ghostty_c.GHOSTTY_KEY_BRACKET_RIGHT,
         xkb_syms.XKB_KEY_backslash => ghostty_c.GHOSTTY_KEY_BACKSLASH,
         xkb_syms.XKB_KEY_grave => ghostty_c.GHOSTTY_KEY_BACKQUOTE,
-        // Function keys
         xkb_syms.XKB_KEY_F1...xkb_syms.XKB_KEY_F12 => ghostty_c.GHOSTTY_KEY_F1 + (ks - xkb_syms.XKB_KEY_F1),
         xkb_syms.XKB_KEY_F13...xkb_syms.XKB_KEY_F25 => ghostty_c.GHOSTTY_KEY_F13 + (ks - xkb_syms.XKB_KEY_F13),
-        // Modifiers — don't produce output, ignore
         xkb_syms.XKB_KEY_Shift_L, xkb_syms.XKB_KEY_Shift_R,
         xkb_syms.XKB_KEY_Control_L, xkb_syms.XKB_KEY_Control_R,
         xkb_syms.XKB_KEY_Alt_L, xkb_syms.XKB_KEY_Alt_R,
