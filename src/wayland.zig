@@ -240,9 +240,11 @@ pub const Wayland = struct {
         if (egl.eglMakeCurrent(self.egl_display, self.egl_surface, self.egl_surface, self.egl_context) == egl.EGL_FALSE)
             return error.EglMakeCurrentFailed;
 
-        // Disable EGL vsync — we throttle via wayland frame callbacks instead,
-        // which is more accurate and doesn't block the event loop.
         _ = egl.eglSwapInterval(self.egl_display, 0);
+
+        // Preserve back buffer contents across swaps so partial redraws
+        // can overdraw only dirty rows without clearing.
+        _ = egl.eglSurfaceAttrib(self.egl_display, self.egl_surface, egl.EGL_SWAP_BEHAVIOR, egl.EGL_BUFFER_PRESERVED);
     }
 
     pub fn deinit(self: *Wayland) void {

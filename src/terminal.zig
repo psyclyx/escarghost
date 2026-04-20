@@ -259,6 +259,16 @@ pub const Terminal = struct {
         return c.ghostty_render_state_row_iterator_next(self.row_iterator);
     }
 
+    pub fn isRowDirty(self: *Terminal) bool {
+        var dirty: bool = true;
+        _ = c.ghostty_render_state_row_get(
+            self.row_iterator,
+            c.GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
+            @ptrCast(&dirty),
+        );
+        return dirty;
+    }
+
     pub fn beginCellIteration(self: *Terminal) void {
         _ = c.ghostty_render_state_row_get(self.row_iterator, c.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, @ptrCast(&self.row_cells));
     }
