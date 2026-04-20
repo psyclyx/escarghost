@@ -6,6 +6,22 @@ const Rgb = color.Rgb;
 const Terminal = terminal_mod.Terminal;
 
 const gl = @cImport(@cInclude("GL/gl.h"));
+const c_stdio = @cImport(@cInclude("stdio.h"));
+
+fn detectSubpixelOrder() snail.SubpixelOrder {
+    const pipe = c_stdio.popen("fc-match --format '%{rgba}' : 2>/dev/null", "r") orelse return .rgb;
+    defer _ = c_stdio.pclose(pipe);
+    var buf: [64]u8 = undefined;
+    const n = c_stdio.fread(&buf, 1, buf.len, pipe);
+    if (n == 0) return .rgb;
+    const s = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    if (std.mem.eql(u8, s, "rgb")) return .rgb;
+    if (std.mem.eql(u8, s, "bgr")) return .bgr;
+    if (std.mem.eql(u8, s, "vrgb")) return .vrgb;
+    if (std.mem.eql(u8, s, "vbgr")) return .vbgr;
+    if (std.mem.eql(u8, s, "none")) return .none;
+    return .rgb;
+}
 
 pub const Renderer = struct {
     font: snail.Font,
@@ -41,6 +57,7 @@ pub const Renderer = struct {
         errdefer self.snail_renderer.deinit();
 
         self.snail_renderer.uploadAtlas(&self.atlas);
+        self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
 
         // Compute cell metrics from font
         const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
