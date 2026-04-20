@@ -15,15 +15,13 @@ pub fn build(b: *std.Build) void {
     // Built separately with its own zig version; consumed as a C library.
     // In the nix shell, GHOSTTY_VT_INCLUDE and GHOSTTY_VT_LIB are set automatically.
     // Non-nix users can pass -Dghostty-vt-include=... -Dghostty-vt-static-lib=...
-    {
-        const vt_include = b.option([]const u8, "ghostty-vt-include", "Path to libghostty-vt headers")
-            orelse b.graph.environ_map.get("GHOSTTY_VT_INCLUDE");
-        const vt_static_lib = b.option([]const u8, "ghostty-vt-static-lib", "Full path to libghostty-vt.a")
-            orelse b.graph.environ_map.get("GHOSTTY_VT_LIB");
+    const vt_include = b.option([]const u8, "ghostty-vt-include", "Path to libghostty-vt headers")
+        orelse b.graph.environ_map.get("GHOSTTY_VT_INCLUDE");
+    const vt_static_lib = b.option([]const u8, "ghostty-vt-static-lib", "Full path to libghostty-vt.a")
+        orelse b.graph.environ_map.get("GHOSTTY_VT_LIB");
 
-        if (vt_include) |inc| root_module.addIncludePath(.{ .cwd_relative = inc });
-        if (vt_static_lib) |lib_path| root_module.addObjectFile(.{ .cwd_relative = lib_path });
-    }
+    if (vt_include) |inc| root_module.addIncludePath(.{ .cwd_relative = inc });
+    if (vt_static_lib) |lib_path| root_module.addObjectFile(.{ .cwd_relative = lib_path });
 
     // Snail: GPU Bézier text rendering
     {
@@ -79,16 +77,26 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run mollusk");
     run_step.dependOn(&run_cmd.step);
 
-    // Tests
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    // Headless test (no GL, exercises terminal + render state iteration)
+    {
+        const headless_module = b.createModule(.{
+            .root_source_file = b.path("src/headless_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
 
-    const unit_tests = b.addTest(.{ .root_module = test_module });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+        if (vt_include) |inc| headless_module.addIncludePath(.{ .cwd_relative = inc });
+        if (vt_static_lib) |lib_path| headless_module.addObjectFile(.{ .cwd_relative = lib_path });
+
+        const headless_exe = b.addExecutable(.{
+            .name = "mollusk-headless-test",
+            .root_module = headless_module,
+        });
+        b.installArtifact(headless_exe);
+
+        const headless_run = b.addRunArtifact(headless_exe);
+        const headless_step = b.step("test-headless", "Run headless terminal tests");
+        headless_step.dependOn(&headless_run.step);
+    }
 }
