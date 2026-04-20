@@ -1,0 +1,438 @@
+const std = @import("std");
+const color = @import("color.zig");
+const Rgb = color.Rgb;
+
+const c = @cImport({
+    @cInclude("ghostty/vt.h");
+});
+
+fn ghosttyRgb(rgb: Rgb) c.GhosttyColorRgb {
+    return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
+}
+
+fn fromGhosttyRgb(rgb: c.GhosttyColorRgb) Rgb {
+    return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
+}
+
+pub const Dirty = enum {
+    false_,
+    partial,
+    full,
+};
+
+pub const CursorVisualStyle = enum {
+    bar,
+    block,
+    underline,
+    block_hollow,
+};
+
+pub const CursorInfo = struct {
+    visible: bool,
+    in_viewport: bool,
+    x: u16,
+    y: u16,
+    style: CursorVisualStyle,
+    blinking: bool,
+};
+
+pub const CellStyle = extern struct {
+    size: usize = @sizeOf(CellStyle),
+    fg_color: c.GhosttyStyleColor = .{ .tag = c.GHOSTTY_STYLE_COLOR_NONE, .value = undefined },
+    bg_color: c.GhosttyStyleColor = .{ .tag = c.GHOSTTY_STYLE_COLOR_NONE, .value = undefined },
+    underline_color: c.GhosttyStyleColor = .{ .tag = c.GHOSTTY_STYLE_COLOR_NONE, .value = undefined },
+    bold: bool = false,
+    italic: bool = false,
+    faint: bool = false,
+    blink: bool = false,
+    inverse: bool = false,
+    invisible: bool = false,
+    strikethrough: bool = false,
+    overline: bool = false,
+    underline: c_int = 0,
+};
+
+pub const RenderColors = struct {
+    foreground: Rgb,
+    background: Rgb,
+    cursor: ?Rgb,
+    palette: [256]Rgb,
+};
+
+pub const Terminal = struct {
+    handle: c.GhosttyTerminal,
+    render_state: c.GhosttyRenderState,
+    row_iterator: c.GhosttyRenderStateRowIterator,
+    row_cells: c.GhosttyRenderStateRowCells,
+    key_encoder: c.GhosttyKeyEncoder,
+    key_event: c.GhosttyKeyEvent,
+    mouse_encoder: c.GhosttyMouseEncoder,
+    mouse_event: c.GhosttyMouseEvent,
+
+    pty_fd: std.posix.fd_t = -1,
+    title: []const u8 = "",
+
+    // Callbacks
+    on_bell: ?*const fn () void = null,
+    on_title_changed: ?*const fn ([]const u8) void = null,
+
+    pub fn init(
+        self: *Terminal,
+        cols: u16,
+        rows: u16,
+        max_scrollback: usize,
+        palette: [256]Rgb,
+        fg: Rgb,
+        bg: Rgb,
+    ) !void {
+
+        // Create terminal
+        const opts: c.GhosttyTerminalOptions = .{
+            .cols = cols,
+            .rows = rows,
+            .max_scrollback = max_scrollback,
+        };
+        if (c.ghostty_terminal_new(null, &self.handle, opts) != c.GHOSTTY_SUCCESS)
+            return error.TerminalInitFailed;
+        errdefer c.ghostty_terminal_free(self.handle);
+
+        // Create render state
+        if (c.ghostty_render_state_new(null, &self.render_state) != c.GHOSTTY_SUCCESS)
+            return error.RenderStateInitFailed;
+        errdefer c.ghostty_render_state_free(self.render_state);
+
+        // Create row iterator
+        if (c.ghostty_render_state_row_iterator_new(null, &self.row_iterator) != c.GHOSTTY_SUCCESS)
+            return error.RowIteratorInitFailed;
+        errdefer c.ghostty_render_state_row_iterator_free(self.row_iterator);
+
+        // Create row cells
+        if (c.ghostty_render_state_row_cells_new(null, &self.row_cells) != c.GHOSTTY_SUCCESS)
+            return error.RowCellsInitFailed;
+        errdefer c.ghostty_render_state_row_cells_free(self.row_cells);
+
+        // Create key encoder + event
+        if (c.ghostty_key_encoder_new(null, &self.key_encoder) != c.GHOSTTY_SUCCESS)
+            return error.KeyEncoderInitFailed;
+        errdefer c.ghostty_key_encoder_free(self.key_encoder);
+
+        if (c.ghostty_key_event_new(null, &self.key_event) != c.GHOSTTY_SUCCESS)
+            return error.KeyEventInitFailed;
+        errdefer c.ghostty_key_event_free(self.key_event);
+
+        // Create mouse encoder + event
+        if (c.ghostty_mouse_encoder_new(null, &self.mouse_encoder) != c.GHOSTTY_SUCCESS)
+            return error.MouseEncoderInitFailed;
+        errdefer c.ghostty_mouse_encoder_free(self.mouse_encoder);
+
+        if (c.ghostty_mouse_event_new(null, &self.mouse_event) != c.GHOSTTY_SUCCESS)
+            return error.MouseEventInitFailed;
+        // no more errdefer needed after last init
+
+        self.pty_fd = -1;
+        self.title = "";
+        self.on_bell = null;
+        self.on_title_changed = null;
+
+        // Set colors
+        var palette_c: [256]c.GhosttyColorRgb = undefined;
+        for (0..256) |i| palette_c[i] = ghosttyRgb(palette[i]);
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, &palette_c);
+
+        var fg_c = ghosttyRgb(fg);
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg_c);
+
+        var bg_c = ghosttyRgb(bg);
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg_c);
+
+        // Register callbacks
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_USERDATA, @ptrCast(self));
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_WRITE_PTY, @ptrCast(&writePtyCallback));
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_BELL, @ptrCast(&bellCallback));
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, @ptrCast(&titleChangedCallback));
+
+    }
+
+    pub fn deinit(self: *Terminal) void {
+        c.ghostty_mouse_event_free(self.mouse_event);
+        c.ghostty_mouse_encoder_free(self.mouse_encoder);
+        c.ghostty_key_event_free(self.key_event);
+        c.ghostty_key_encoder_free(self.key_encoder);
+        c.ghostty_render_state_row_cells_free(self.row_cells);
+        c.ghostty_render_state_row_iterator_free(self.row_iterator);
+        c.ghostty_render_state_free(self.render_state);
+        c.ghostty_terminal_free(self.handle);
+    }
+
+    pub fn feedData(self: *Terminal, data: []const u8) void {
+        c.ghostty_terminal_vt_write(self.handle, data.ptr, data.len);
+    }
+
+    pub fn resize(self: *Terminal, cols: u16, rows: u16, cell_w: u32, cell_h: u32) !void {
+        if (c.ghostty_terminal_resize(self.handle, cols, rows, cell_w, cell_h) != c.GHOSTTY_SUCCESS)
+            return error.ResizeFailed;
+    }
+
+    pub fn updateRenderState(self: *Terminal) !void {
+        if (c.ghostty_render_state_update(self.render_state, self.handle) != c.GHOSTTY_SUCCESS)
+            return error.RenderStateUpdateFailed;
+    }
+
+    pub fn getDirty(self: *Terminal) Dirty {
+        var dirty: c.GhosttyRenderStateDirty = c.GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
+        return switch (dirty) {
+            c.GHOSTTY_RENDER_STATE_DIRTY_FALSE => .false_,
+            c.GHOSTTY_RENDER_STATE_DIRTY_PARTIAL => .partial,
+            c.GHOSTTY_RENDER_STATE_DIRTY_FULL => .full,
+            else => .full,
+        };
+    }
+
+    pub fn resetDirty(self: *Terminal) void {
+        var dirty_false: c.GhosttyRenderStateDirty = c.GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+        _ = c.ghostty_render_state_set(self.render_state, c.GHOSTTY_RENDER_STATE_OPTION_DIRTY, &dirty_false);
+
+        // Also reset per-row dirty flags
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, @ptrCast(&self.row_iterator));
+        var row_dirty_false: bool = false;
+        while (c.ghostty_render_state_row_iterator_next(self.row_iterator)) {
+            _ = c.ghostty_render_state_row_set(
+                self.row_iterator,
+                c.GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY,
+                &row_dirty_false,
+            );
+        }
+    }
+
+    pub fn getColors(self: *Terminal) RenderColors {
+        var colors: c.GhosttyRenderStateColors = undefined;
+        colors.size = @sizeOf(c.GhosttyRenderStateColors);
+        _ = c.ghostty_render_state_colors_get(self.render_state, &colors);
+
+        var result: RenderColors = undefined;
+        result.foreground = fromGhosttyRgb(colors.foreground);
+        result.background = fromGhosttyRgb(colors.background);
+        result.cursor = if (colors.cursor_has_value) fromGhosttyRgb(colors.cursor) else null;
+        for (0..256) |i| {
+            result.palette[i] = fromGhosttyRgb(colors.palette[i]);
+        }
+        return result;
+    }
+
+    pub fn getCursor(self: *Terminal) CursorInfo {
+        var visible: bool = false;
+        var in_viewport: bool = false;
+        var x: u16 = 0;
+        var y: u16 = 0;
+        var style: c.GhosttyRenderStateCursorVisualStyle = c.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+        var blinking: bool = false;
+
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &visible);
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &in_viewport);
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &x);
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &y);
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE, &style);
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING, &blinking);
+
+        return .{
+            .visible = visible,
+            .in_viewport = in_viewport,
+            .x = x,
+            .y = y,
+            .style = switch (style) {
+                c.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR => .bar,
+                c.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK => .block,
+                c.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE => .underline,
+                c.GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW => .block_hollow,
+                else => .block,
+            },
+            .blinking = blinking,
+        };
+    }
+
+    pub fn beginRowIteration(self: *Terminal) void {
+        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, @ptrCast(&self.row_iterator));
+    }
+
+    pub fn nextRow(self: *Terminal) bool {
+        return c.ghostty_render_state_row_iterator_next(self.row_iterator);
+    }
+
+    pub fn beginCellIteration(self: *Terminal) void {
+        _ = c.ghostty_render_state_row_get(self.row_iterator, c.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, @ptrCast(&self.row_cells));
+    }
+
+    pub fn nextCell(self: *Terminal) bool {
+        return c.ghostty_render_state_row_cells_next(self.row_cells);
+    }
+
+    pub const CellInfo = struct {
+        codepoint: u32,
+        has_text: bool,
+        graphemes_len: u32,
+        fg: ?Rgb,
+        bg: ?Rgb,
+        style: c.GhosttyStyle,
+        raw: c.GhosttyCell,
+    };
+
+    pub fn getCellInfo(self: *Terminal) CellInfo {
+        var info: CellInfo = undefined;
+        info.has_text = false;
+        info.graphemes_len = 0;
+        info.fg = null;
+        info.bg = null;
+        info.style = std.mem.zeroes(c.GhosttyStyle);
+        info.style.size = @sizeOf(c.GhosttyStyle);
+        info.raw = 0;
+        info.codepoint = 0;
+
+        // Get graphemes length
+        _ = c.ghostty_render_state_row_cells_get(
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
+            &info.graphemes_len,
+        );
+        info.has_text = info.graphemes_len > 0;
+
+        if (info.has_text) {
+            // Get the base codepoint via graphemes buffer
+            var cp_buf: [64]u32 = undefined;
+            _ = c.ghostty_render_state_row_cells_get(
+                self.row_cells,
+                c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                &cp_buf,
+            );
+            info.codepoint = cp_buf[0];
+        }
+
+        // Get style
+        _ = c.ghostty_render_state_row_cells_get(
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
+            &info.style,
+        );
+
+        // Get fg color
+        var fg_rgb: c.GhosttyColorRgb = undefined;
+        if (c.ghostty_render_state_row_cells_get(
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+            &fg_rgb,
+        ) == c.GHOSTTY_SUCCESS) {
+            info.fg = fromGhosttyRgb(fg_rgb);
+        }
+
+        // Get bg color
+        var bg_rgb: c.GhosttyColorRgb = undefined;
+        if (c.ghostty_render_state_row_cells_get(
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+            &bg_rgb,
+        ) == c.GHOSTTY_SUCCESS) {
+            info.bg = fromGhosttyRgb(bg_rgb);
+        }
+
+        // Get raw cell
+        _ = c.ghostty_render_state_row_cells_get(
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+            &info.raw,
+        );
+
+        return info;
+    }
+
+    pub fn scrollViewport(self: *Terminal, delta: isize) void {
+        const behavior: c.GhosttyTerminalScrollViewport = .{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_DELTA,
+            .value = .{ .delta = @intCast(delta) },
+        };
+        c.ghostty_terminal_scroll_viewport(self.handle, behavior);
+    }
+
+    pub fn encodeKey(
+        self: *Terminal,
+        key: c.GhosttyKey,
+        action: c.GhosttyKeyAction,
+        mods: c.GhosttyMods,
+        utf8: ?[]const u8,
+    ) ?[]const u8 {
+        // Sync encoder settings from terminal state
+        _ = c.ghostty_key_encoder_setopt_from_terminal(self.key_encoder, self.handle);
+
+        // Set up key event
+        _ = c.ghostty_key_event_set_action(self.key_event, action);
+        _ = c.ghostty_key_event_set_key(self.key_event, key);
+        _ = c.ghostty_key_event_set_mods(self.key_event, mods);
+        _ = c.ghostty_key_event_set_composing(self.key_event, false);
+
+        if (utf8) |text| {
+            _ = c.ghostty_key_event_set_utf8(self.key_event, text.ptr, text.len);
+        } else {
+            _ = c.ghostty_key_event_set_utf8(self.key_event, null, 0);
+        }
+
+        // Encode
+        var buf: [128]u8 = undefined;
+        var written: usize = 0;
+        _ = c.ghostty_key_encoder_encode(self.key_encoder, self.key_event, &buf, buf.len, &written);
+        if (written == 0) return null;
+        return buf[0..written];
+    }
+
+    pub fn encodeMouse(
+        self: *Terminal,
+        action: c.GhosttyMouseAction,
+        button: c.GhosttyMouseButton,
+        mods: c.GhosttyMods,
+        x: f64,
+        y: f64,
+    ) ?[]const u8 {
+        _ = c.ghostty_mouse_encoder_setopt_from_terminal(self.mouse_encoder, self.handle);
+
+        _ = c.ghostty_mouse_event_set_action(self.mouse_event, action);
+        if (action == c.GHOSTTY_MOUSE_ACTION_MOTION) {
+            _ = c.ghostty_mouse_event_clear_button(self.mouse_event);
+        } else {
+            _ = c.ghostty_mouse_event_set_button(self.mouse_event, button);
+        }
+        _ = c.ghostty_mouse_event_set_mods(self.mouse_event, mods);
+        _ = c.ghostty_mouse_event_set_position(self.mouse_event, .{ .x = x, .y = y });
+
+        var buf: [128]u8 = undefined;
+        var written: usize = 0;
+        _ = c.ghostty_mouse_encoder_encode(self.mouse_encoder, self.mouse_event, &buf, buf.len, &written);
+        if (written == 0) return null;
+        return buf[0..written];
+    }
+
+    pub fn getTitle(self: *Terminal) []const u8 {
+        var title_str: c.GhosttyString = .{ .ptr = null, .len = 0 };
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_TITLE, &title_str);
+        if (title_str.ptr) |ptr| {
+            return ptr[0..title_str.len];
+        }
+        return "";
+    }
+
+    // ── C-callable callbacks ──
+
+    fn writePtyCallback(_: c.GhosttyTerminal, userdata: ?*anyopaque, data: [*c]const u8, len: usize) callconv(.c) void {
+        const self: *Terminal = @ptrCast(@alignCast(userdata));
+        if (self.pty_fd >= 0 and data != null) {
+            _ = std.c.write(self.pty_fd, data, len);
+        }
+    }
+
+    fn bellCallback(_: c.GhosttyTerminal, userdata: ?*anyopaque) callconv(.c) void {
+        const self: *Terminal = @ptrCast(@alignCast(userdata));
+        if (self.on_bell) |cb| cb();
+    }
+
+    fn titleChangedCallback(_: c.GhosttyTerminal, userdata: ?*anyopaque) callconv(.c) void {
+        const self: *Terminal = @ptrCast(@alignCast(userdata));
+        if (self.on_title_changed) |cb| cb(self.getTitle());
+    }
+};

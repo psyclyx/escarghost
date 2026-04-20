@@ -1,0 +1,64 @@
+{
+  "pins": {
+    "flake-compat": {
+      "type": "Git",
+      "repository": {
+        "type": "Forgejo",
+        "server": "https://git.lix.systems/",
+        "owner": "lix-project",
+        "repo": "flake-compat"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "549f2762aebeff29a2e5ece7a7dc0f955281a1d1",
+      "url": "https://git.lix.systems/lix-project/flake-compat/archive/549f2762aebeff29a2e5ece7a7dc0f955281a1d1.tar.gz",
+      "hash": "sha256-NKw96t+BgHIYzHUjkTK95FqYRVKB8DHpVhefWSz/kTw="
+    },
+    "ghostty": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "ghostty-org",
+        "repo": "ghostty"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "dcc39dcd401975ee77a642fa15ba7bb9f6d85b96",
+      "url": "https://github.com/ghostty-org/ghostty/archive/dcc39dcd401975ee77a642fa15ba7bb9f6d85b96.tar.gz",
+      "hash": "sha256-dnk4veKoZpWQPnwTaCtpfaE4WQi0tg1JSpM4/P/Rfe0="
+    },
+    "nixpkgs-unstable": {
+      "type": "Channel",
+      "name": "nixpkgs-unstable",
+      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.05pre981196.b86751bc4085/nixexprs.tar.xz",
+      "hash": "sha256-mBqzkn7oJti2hqeO8iTbDxKw+1ifxpP53feQ0CEXies="
+    },
+    "snail": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "psyclyx",
+        "repo": "snail"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "bc246cf4dd25290464b2fdf9096a431871c5a813",
+      "url": "https://github.com/psyclyx/snail/archive/bc246cf4dd25290464b2fdf9096a431871c5a813.tar.gz",
+      "hash": "sha256-AOw7WXgXRP5uzhg6B0IvdoeFff7eTGFVpDwBljEOc9s="
+    },
+    "zig-overlay": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "mitchellh",
+        "repo": "zig-overlay"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "85afd94c8dca42d229c7e9f59bc78dea6effa2ba",
+      "url": "https://github.com/mitchellh/zig-overlay/archive/85afd94c8dca42d229c7e9f59bc78dea6effa2ba.tar.gz",
+      "hash": "sha256-GZZ/NFERMnEsbJuRlBpoGprdrVFyDCaHjKlkgWPukTY="
+    }
+  },
+  "version": 7
+}
