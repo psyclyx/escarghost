@@ -377,10 +377,13 @@ pub const Renderer = struct {
 
         try term.updateRenderState();
         const dirty = term.getDirty();
-        if (dirty == .false_) return false;
+        const cursor = term.getCursor();
+
+        // Check if cursor moved — needs a redraw even if ghostty says nothing is dirty
+        const cursor_moved = cursor.x != self.prev_cursor_x or cursor.y != self.prev_cursor_y;
+        if (dirty == .false_ and !cursor_moved) return false;
 
         const colors = term.getColors();
-        const cursor = term.getCursor();
         const default_fg = colors.foreground;
         const default_bg = colors.background;
 
