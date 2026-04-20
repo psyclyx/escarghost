@@ -133,6 +133,10 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
+    // Disable GL error checking (we control all GL calls via snail).
+    // Also hint mesa to skip driver probing if possible.
+    _ = c.setenv("MESA_NO_ERROR", "1", 0); // don't override if already set
+
     // Parse -e flag for command execution
     var exec_argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer exec_argv.deinit(allocator);

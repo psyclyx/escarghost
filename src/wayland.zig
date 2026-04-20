@@ -165,7 +165,17 @@ pub const Wayland = struct {
     }
 
     fn initEgl(self: *Wayland) !void {
-        self.egl_display = egl.eglGetDisplay(@ptrCast(self.display));
+        // Use eglGetPlatformDisplay (EGL 1.5) to skip platform detection probing.
+        // EGL_PLATFORM_WAYLAND_KHR = 0x31D8
+        const eglGetPlatformDisplay_ = @as(
+            ?*const fn (u32, ?*anyopaque, ?[*]const egl.EGLAttrib) callconv(.c) egl.EGLDisplay,
+            @ptrCast(egl.eglGetProcAddress("eglGetPlatformDisplay")),
+        );
+        if (eglGetPlatformDisplay_) |getPlatformDisplay| {
+            self.egl_display = getPlatformDisplay(0x31D8, @ptrCast(self.display), null);
+        } else {
+            self.egl_display = egl.eglGetDisplay(@ptrCast(self.display));
+        }
         if (self.egl_display == egl.EGL_NO_DISPLAY) return error.EglDisplayFailed;
 
         var major: egl.EGLint = 0;
