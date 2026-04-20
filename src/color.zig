@@ -16,6 +16,7 @@ pub const Rgb = struct {
         };
     }
 
+    /// Convert to float4 in sRGB space (for CPU rendering / SHM output).
     pub fn toFloat4(self: Rgb, alpha: f32) [4]f32 {
         return .{
             @as(f32, @floatFromInt(self.r)) / 255.0,
@@ -23,6 +24,21 @@ pub const Rgb = struct {
             @as(f32, @floatFromInt(self.b)) / 255.0,
             alpha,
         };
+    }
+
+    /// Convert to float4 in LINEAR space (for GPU rendering with GL_FRAMEBUFFER_SRGB).
+    pub fn toLinearFloat4(self: Rgb, alpha: f32) [4]f32 {
+        return .{
+            srgbToLinearF(@as(f32, @floatFromInt(self.r)) / 255.0),
+            srgbToLinearF(@as(f32, @floatFromInt(self.g)) / 255.0),
+            srgbToLinearF(@as(f32, @floatFromInt(self.b)) / 255.0),
+            alpha,
+        };
+    }
+
+    fn srgbToLinearF(v: f32) f32 {
+        if (v <= 0.04045) return v / 12.92;
+        return std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
     }
 };
 

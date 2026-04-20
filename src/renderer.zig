@@ -249,7 +249,7 @@ pub const Renderer = struct {
                             .y = cell_y_tl,
                             .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
                             .h = self.cell_height,
-                        }, sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
+                        }, sc.toLinearFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
                     }
                 }
                 if (cell_bg) |cbg| {
@@ -269,7 +269,7 @@ pub const Renderer = struct {
                         @as(f32, @floatFromInt(col_idx)) * self.cell_width,
                         cell_y_bl + self.cell_height * 0.2,
                         self.font_size, info.bbox, info.band_entry,
-                        fg.toFloat4(1.0), self.atlas.gl_layer,
+                        fg.toLinearFloat4(1.0), self.atlas.gl_layer,
                     );
                 } else {
                     const cps = [1]u32{cell.codepoint};
@@ -281,19 +281,19 @@ pub const Renderer = struct {
                             @as(f32, @floatFromInt(col_idx)) * self.cell_width,
                             cell_y_bl + self.cell_height * 0.2,
                             self.font_size, info.bbox, info.band_entry,
-                            fg.toFloat4(1.0), self.atlas.gl_layer,
+                            fg.toLinearFloat4(1.0), self.atlas.gl_layer,
                         );
                 }
                 if (cell.style.underline != 0)
                     _ = vec_batch.addRect(.{
                         .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
                         .y = cell_y_tl + self.cell_height - 1, .w = self.cell_width, .h = 1,
-                    }, fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
+                    }, fg.toLinearFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
                 if (cell.style.strikethrough != false)
                     _ = vec_batch.addRect(.{
                         .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
                         .y = cell_y_tl + self.cell_height * 0.45, .w = self.cell_width, .h = 1,
-                    }, fg.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
+                    }, fg.toLinearFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
             }
         }
         if (bg_span_len > 0) {
@@ -303,7 +303,7 @@ pub const Renderer = struct {
                     .y = cell_y_tl,
                     .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
                     .h = self.cell_height,
-                }, sc.toFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
+                }, sc.toLinearFloat4(1.0), .{ 0, 0, 0, 0 }, 0);
             }
         }
 
@@ -442,7 +442,7 @@ pub const Renderer = struct {
         if (cursor.visible and cursor.in_viewport) {
             const cx = @as(f32, @floatFromInt(cursor.x)) * self.cell_width;
             const cy = @as(f32, @floatFromInt(cursor.y)) * self.cell_height;
-            const cc = if (colors.cursor) |col| col.toFloat4(1.0) else colors.foreground.toFloat4(1.0);
+            const cc = if (colors.cursor) |col| col.toLinearFloat4(1.0) else colors.foreground.toLinearFloat4(1.0);
 
             var cbuf: [snail.VECTOR_FLOATS_PER_PRIMITIVE]f32 = undefined;
             var cb = snail.VectorBatch.init(&cbuf);
@@ -469,7 +469,7 @@ pub const Renderer = struct {
                             _ = inv_batch.addGlyph(
                                 cx, cursor_text_y, self.font_size,
                                 info.bbox, info.band_entry,
-                                colors.background.toFloat4(1.0),
+                                colors.background.toLinearFloat4(1.0),
                                 self.atlas.gl_layer,
                             );
                             @memcpy(self.draw_text[draw_text_len..][0..snail.FLOATS_PER_GLYPH], inv_batch.slice());
@@ -481,7 +481,7 @@ pub const Renderer = struct {
         }
 
         // Draw
-        const bg4 = colors.background.toFloat4(1.0);
+        const bg4 = colors.background.toLinearFloat4(1.0);
         gl.glClearColor(bg4[0], bg4[1], bg4[2], bg4[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
