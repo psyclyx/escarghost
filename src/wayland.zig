@@ -211,14 +211,24 @@ pub const Wayland = struct {
         }
         if (num_configs == 0) return error.EglNoConfig;
 
-        const context_attribs = [_]egl.EGLint{
+        // Try GL 4.4 first (enables persistent mapped VBOs in snail), fall back to 3.3
+        const gl44_attribs = [_]egl.EGLint{
+            egl.EGL_CONTEXT_MAJOR_VERSION, 4,
+            egl.EGL_CONTEXT_MINOR_VERSION, 4,
+            egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            egl.EGL_NONE,
+        };
+        const gl33_attribs = [_]egl.EGLint{
             egl.EGL_CONTEXT_MAJOR_VERSION, 3,
             egl.EGL_CONTEXT_MINOR_VERSION, 3,
             egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
             egl.EGL_NONE,
         };
 
-        self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &context_attribs);
+        self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &gl44_attribs);
+        if (self.egl_context == egl.EGL_NO_CONTEXT) {
+            self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &gl33_attribs);
+        }
         if (self.egl_context == egl.EGL_NO_CONTEXT) return error.EglContextFailed;
 
         self.egl_window = wl.wl_egl_window_create(self.surface.?, @intCast(self.width), @intCast(self.height));
