@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         snail_mod.addOptions("build_options", snail_opts);
-        snail_mod.linkSystemLibrary("gl", .{});
+        snail_mod.linkSystemLibrary("OpenGL", .{});
         snail_mod.addImport("vulkan_shaders", vk_stub);
         root_module.addImport("snail", snail_mod);
     }
@@ -53,9 +53,8 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("wayland-egl", .{});
     root_module.linkSystemLibrary("egl", .{});
     root_module.linkSystemLibrary("xkbcommon", .{});
-    root_module.linkSystemLibrary("gl", .{});
+    root_module.linkSystemLibrary("OpenGL", .{});
     root_module.linkSystemLibrary("fontconfig", .{});
-    root_module.linkSystemLibrary("libdrm", .{});
 
     // Wayland protocol implementations
     root_module.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });

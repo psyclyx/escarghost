@@ -137,28 +137,24 @@ pub fn main(init: std.process.Init) !void {
     _ = c.setenv("MESA_NO_ERROR", "1", 0); // skip GL error checking
     _ = c.setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0); // faster shader cache reads
 
-    // Auto-detect mesa driver to skip probing. Read the DRM render node
-    // to figure out which driver mesa will load.
+    // Auto-detect mesa driver via sysfs (no libdrm dependency).
     {
-        const drm_c = @cImport({
-            @cInclude("fcntl.h");
-            @cInclude("xf86drm.h");
-        });
-        const fd = drm_c.open("/dev/dri/renderD128", drm_c.O_RDWR);
-        if (fd >= 0) {
-            defer _ = c.close(fd);
-            const version = drm_c.drmGetVersion(fd);
-            if (version) |v| {
-                defer drm_c.drmFreeVersion(v);
-                if (v.*.name) |name| {
-                    const kname = name[0..@intCast(v.*.name_len)];
-                    if (std.mem.eql(u8, kname, "i915") or std.mem.eql(u8, kname, "xe"))
-                        _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "iris", 0)
-                    else if (std.mem.eql(u8, kname, "amdgpu"))
-                        _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "radeonsi", 0)
-                    else if (std.mem.eql(u8, kname, "nouveau"))
-                        _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "nouveau", 0);
-                }
+        var driver_buf: [256]u8 = undefined;
+        const fp = c.fopen("/sys/class/drm/renderD128/device/driver/module/drivers", "r");
+        if (fp) |f| {
+            defer _ = c.fclose(f);
+            const n = c.fread(&driver_buf, 1, driver_buf.len - 1, f);
+            if (n > 0) {
+                driver_buf[n] = 0;
+                const s = driver_buf[0..n];
+                if (std.mem.indexOf(u8, s, "i915") != null or std.mem.indexOf(u8, s, "xe") != null)
+                    _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "iris", 0)
+                else if (std.mem.indexOf(u8, s, "amdgpu") != null)
+                    _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "radeonsi", 0)
+                else if (std.mem.indexOf(u8, s, "nouveau") != null)
+                    _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "nouveau", 0)
+                else if (std.mem.indexOf(u8, s, "nvidia") != null)
+                    _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "nvidia", 0);
             }
         }
     }

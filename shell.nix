@@ -25,7 +25,6 @@ pkgs.mkShell {
     libxkbcommon
     harfbuzz
     fontconfig
-    libdrm
   ];
 
   buildInputs = [
