@@ -62,11 +62,8 @@ pub const Renderer = struct {
         self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
         self.snail_renderer.setFillRule(.non_zero); // TrueType standard
 
-        // Enable sRGB framebuffer if available — ensures correct gamma for
-        // blending operations. Snail's shaders apply sRGB gamma to coverage,
-        // but having the framebuffer in sRGB space means GL blending also
-        // happens in linear light.
-        gl.glEnable(gl.GL_FRAMEBUFFER_SRGB);
+        // Note: do NOT enable GL_FRAMEBUFFER_SRGB — snail's shaders already
+        // apply sRGB gamma to coverage values. Enabling it would double-correct.
 
         // Compute cell metrics from font
         const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
