@@ -14,6 +14,11 @@ pub const Pty = struct {
     child_pid: c.pid_t,
 
     pub fn spawn(shell: []const u8, cols: u16, rows: u16) !Pty {
+        return spawnCommand(&[_][]const u8{shell}, cols, rows);
+    }
+
+    pub fn spawnCommand(argv: []const []const u8, cols: u16, rows: u16) !Pty {
+        if (argv.len == 0) return error.EmptyArgv;
         var master: c_int = undefined;
         var slave: c_int = undefined;
 
@@ -45,16 +50,17 @@ pub const Pty = struct {
             _ = c.dup2(slave, c.STDERR_FILENO);
             if (slave > c.STDERR_FILENO) _ = c.close(slave);
 
-            // Null-terminate the shell path for exec
-            var shell_buf: [4096]u8 = undefined;
-            if (shell.len >= shell_buf.len) c._exit(127);
-            @memcpy(shell_buf[0..shell.len], shell);
-            shell_buf[shell.len] = 0;
-            const shell_z: [*:0]const u8 = shell_buf[0..shell.len :0];
+            // Build null-terminated argv for exec
+            var c_argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
+            var bufs: [64][4096]u8 = undefined;
+            for (argv, 0..) |arg, i| {
+                if (i >= 63 or arg.len >= 4096) c._exit(127);
+                @memcpy(bufs[i][0..arg.len], arg);
+                bufs[i][arg.len] = 0;
+                c_argv[i] = bufs[i][0..arg.len :0];
+            }
 
-            // exec the shell (use execv since we have the full path)
-            const argv_arr = [2:null]?[*:0]const u8{ shell_z, null };
-            _ = c.execv(shell_z, @ptrCast(&argv_arr));
+            _ = c.execv(c_argv[0].?, @ptrCast(&c_argv));
             c._exit(127);
         }
 
@@ -111,18 +117,26 @@ pub const Pty = struct {
     }
 
     pub fn close(self: *Pty) void {
-        _ = c.close(self.master_fd);
-        _ = c.waitpid(self.child_pid, null, 0);
+        if (self.master_fd >= 0) {
+            _ = c.close(self.master_fd);
+            self.master_fd = -1;
+        }
+        if (self.child_pid > 0) {
+            _ = c.waitpid(self.child_pid, null, 0);
+            self.child_pid = -1;
+        }
     }
 
     /// Check if child has exited without blocking.
     pub fn checkChild(self: *Pty) ?i32 {
+        if (self.child_pid <= 0) return 0;
         var status: c_int = 0;
         const ret = c.waitpid(self.child_pid, &status, c.WNOHANG);
         if (ret > 0) {
+            self.child_pid = -1; // already waited
             if (c.WIFEXITED(status)) return c.WEXITSTATUS(status);
-            return -1; // signaled
+            return -1;
         }
-        return null; // still running
+        return null;
     }
 };

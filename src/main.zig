@@ -130,9 +130,27 @@ fn onFocus(focused: bool) void {
     _ = focused;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const startup_timer = perf.Timer.now();
     const allocator = std.heap.smp_allocator;
+    _ = init.gpa;
+
+    // Parse -e flag for command execution
+    var exec_argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer exec_argv.deinit(allocator);
+    {
+        var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+        _ = args_iter.next(); // skip argv[0]
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "-e")) {
+                // Everything after -e is the command
+                while (args_iter.next()) |cmd_arg| {
+                    try exec_argv.append(allocator, cmd_arg);
+                }
+                break;
+            }
+        }
+    }
 
     // ── Phase 1: config (fast, ~1ms) ──
     var cfg = try config_mod.load(allocator);
@@ -168,8 +186,10 @@ pub fn main() !void {
     defer term.deinit();
 
     // Fork PTY with correct grid size — no resize needed.
-    // Shell startup (.zshrc etc) overlaps with first render.
-    var pty = try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
+    var pty = if (exec_argv.items.len > 0)
+        try pty_mod.Pty.spawnCommand(exec_argv.items, grid.cols, grid.rows)
+    else
+        try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
     defer pty.close();
 
     term.pty_fd = pty.master_fd;
