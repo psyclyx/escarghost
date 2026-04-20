@@ -70,16 +70,14 @@ fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const 
     return try allocator.dupe(u8, std.mem.sliceTo(file_ptr, 0));
 }
 
-/// Background font loading — writes result to shared struct.
-const FontResult = struct {
-    path: []const u8 = "",
-    data: []const u8 = "",
-};
-
-fn fontThread(result: *FontResult, cfg_font_path: []const u8) void {
+/// Background thread: font discovery + parse + atlas build (all CPU, no GL).
+/// Overlaps with EGL init on the main thread.
+fn prepThread(renderer: *renderer_mod.Renderer, font_path_out: *[]const u8, cfg_font_path: []const u8, font_size: f32) void {
     const allocator = std.heap.smp_allocator;
-    result.path = findFontPath(allocator, cfg_font_path) catch return;
-    result.data = mmapFont(result.path) catch return;
+    const path = findFontPath(allocator, cfg_font_path) catch return;
+    font_path_out.* = path;
+    const data = mmapFont(path) catch return;
+    renderer.initCpu(allocator, data, font_size) catch return;
 }
 
 // Shared state for callbacks
@@ -156,26 +154,27 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
 
-    // ── Phase 2: parallel font discovery + Wayland connect ──
-    // Font thread: fc-match + mmap (can take 30ms+ due to subprocess)
-    // Main thread: Wayland connect + EGL init (~50ms)
-    var font_result: FontResult = .{};
-    const font_thread = try std.Thread.spawn(.{}, fontThread, .{ &font_result, cfg.font_path });
+    // ── Phase 2: parallel prep thread + Wayland/EGL ──
+    // Prep thread: fontconfig + mmap + font parse + atlas build (~10ms CPU)
+    // Main thread: Wayland connect + EGL init (~75ms, driver-bound)
+    // The prep thread finishes long before EGL, so CPU work is free.
+    var renderer: renderer_mod.Renderer = undefined;
+    defer renderer.deinit();
+    var font_path: []const u8 = "";
+    const prep_thread = try std.Thread.spawn(.{}, prepThread, .{ &renderer, &font_path, cfg.font_path, cfg.font_size });
 
     var wl: wayland_mod.Wayland = undefined;
     try wl.init(800, 600, "mollusk");
     defer wl.deinit();
 
-    font_thread.join();
-    if (font_result.data.len == 0) return error.FontLoadFailed;
-    defer allocator.free(font_result.path);
+    prep_thread.join();
+    if (font_path.len == 0) return error.FontLoadFailed;
+    defer allocator.free(font_path);
 
-    std.debug.print("mollusk: font {s} ({d:.1}ms)\n", .{ font_result.path, startup_timer.elapsedMs() });
+    std.debug.print("mollusk: font {s} ({d:.1}ms)\n", .{ font_path, startup_timer.elapsedMs() });
 
-    // ── Phase 3: snail init (needs GL context + font data) ──
-    var renderer: renderer_mod.Renderer = undefined;
-    try renderer.init(allocator, font_result.data, cfg.font_size);
-    defer renderer.deinit();
+    // ── Phase 3: GPU init (needs EGL context from main thread + CPU data from prep thread) ──
+    try renderer.initGpu();
 
     // ── Phase 4: now we know the real grid size — fork PTY ──
     const grid = renderer.computeGridSize(wl.width, wl.height);

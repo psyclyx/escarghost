@@ -49,7 +49,9 @@ pub const Renderer = struct {
     // Perf tracking
     pub var frame_stats: perf.FrameStats = .{};
 
-    pub fn init(self: *Renderer, allocator: std.mem.Allocator, font_data: []const u8, font_size: f32) !void {
+    /// Phase 1: CPU-side init — font parse, atlas build, cell metrics.
+    /// No GL needed. Can run on a background thread.
+    pub fn initCpu(self: *Renderer, allocator: std.mem.Allocator, font_data: []const u8, font_size: f32) !void {
         self.allocator = allocator;
         self.font_size = font_size;
         self.viewport_w = 0;
@@ -61,14 +63,7 @@ pub const Renderer = struct {
         self.atlas = try snail.Atlas.initAscii(allocator, &self.font, &snail.ASCII_PRINTABLE);
         errdefer self.atlas.deinit();
 
-        self.snail_renderer = try snail.Renderer.init();
-        errdefer self.snail_renderer.deinit();
-
-        self.snail_renderer.uploadAtlas(&self.atlas);
-        self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
-        self.snail_renderer.setFillRule(.non_zero);
-
-        // Compute cell metrics
+        // Cell metrics (no GL needed)
         const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
         const scale = font_size / units_per_em;
         const m_gid = self.font.glyphIndex('M') catch 0;
@@ -76,11 +71,20 @@ pub const Renderer = struct {
         self.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6);
         self.cell_height = @ceil(font_size * 1.2);
 
-        // Vertex buffers — sized for worst case
+        // Vertex buffers
         const max_cells = 400 * 150;
         self.text_buf = try allocator.alloc(f32, max_cells * snail.FLOATS_PER_GLYPH);
         errdefer allocator.free(self.text_buf);
         self.vector_buf = try allocator.alloc(f32, max_cells * snail.VECTOR_FLOATS_PER_PRIMITIVE);
+    }
+
+    /// Phase 2: GPU-side init — shader compile, texture upload.
+    /// Must be called on the GL thread after initCpu and after EGL context is current.
+    pub fn initGpu(self: *Renderer) !void {
+        self.snail_renderer = try snail.Renderer.init();
+        self.snail_renderer.uploadAtlas(&self.atlas);
+        self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
+        self.snail_renderer.setFillRule(.non_zero);
     }
 
     pub fn deinit(self: *Renderer) void {
