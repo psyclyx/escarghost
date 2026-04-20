@@ -154,7 +154,6 @@ pub const Renderer = struct {
     }
 
     /// Build vertex data for a row into scratch buffers.
-    /// Returns (text_len, vec_len) in floats.
     fn buildRow(
         self: *Renderer,
         term: *Terminal,
@@ -316,40 +315,27 @@ pub const Renderer = struct {
         var row_idx: u16 = 0;
         while (term.nextRow()) : (row_idx += 1) {
             if (row_idx >= 200) break;
-            const row_id = term.getRowId();
-            const is_dirty = dirty == .full or !self.has_prev_frame or
+
+            // Determine if this row needs rebuilding
+            const needs_rebuild = dirty == .full or !self.has_prev_frame or
                 term.isRowDirty() or
                 (cursor.visible and cursor.in_viewport and cursor.y == row_idx) or
-                (self.prev_cursor_y == row_idx); // prev cursor row needs redraw too
+                (self.prev_cursor_y == row_idx);
 
-            if (is_dirty or !self.row_cache.contains(row_id)) {
-                // Build fresh from terminal state
-                const lens = self.buildRow(term, row_idx, default_fg, default_bg, cursor, colors);
-                self.cacheRow(row_id, lens.text_len, lens.vec_len);
-
-                // Append to draw buffers
-                if (lens.vec_len > 0) {
-                    @memcpy(self.draw_vec[draw_vec_len..][0..lens.vec_len], self.scratch_vec[0..lens.vec_len]);
-                    draw_vec_len += lens.vec_len;
-                }
-                if (lens.text_len > 0) {
-                    @memcpy(self.draw_text[draw_text_len..][0..lens.text_len], self.scratch_text[0..lens.text_len]);
-                    draw_text_len += lens.text_len;
-                }
-            } else {
-                // Cache hit — copy cached vertices directly
-                const cached = self.row_cache.get(row_id).?;
-                if (cached.vec.len > 0) {
-                    @memcpy(self.draw_vec[draw_vec_len..][0..cached.vec.len], cached.vec);
-                    draw_vec_len += cached.vec.len;
-                }
-                if (cached.text.len > 0) {
-                    @memcpy(self.draw_text[draw_text_len..][0..cached.text.len], cached.text);
-                    draw_text_len += cached.text.len;
-                }
+            // Always rebuild — glClear requires all rows in draw buffer.
+            // Cache is not used yet (needs position-independent vertices).
+            _ = needs_rebuild;
+            const lens = self.buildRow(term, row_idx, default_fg, default_bg, cursor, colors);
+            if (lens.vec_len > 0) {
+                @memcpy(self.draw_vec[draw_vec_len..][0..lens.vec_len], self.scratch_vec[0..lens.vec_len]);
+                draw_vec_len += lens.vec_len;
+            }
+            if (lens.text_len > 0) {
+                @memcpy(self.draw_text[draw_text_len..][0..lens.text_len], self.scratch_text[0..lens.text_len]);
+                draw_text_len += lens.text_len;
             }
 
-            self.prev_row_ids[row_idx] = row_id;
+            self.prev_row_ids[row_idx] = term.getRowId();
         }
 
         self.has_prev_frame = true;
