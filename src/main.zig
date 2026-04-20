@@ -187,20 +187,17 @@ pub fn main(init: std.process.Init) !void {
     try wl.init(800, 600, "mollusk");
     defer wl.deinit();
 
-    // Start CPU prep in parallel with the join wait below
     var renderer: renderer_mod.Renderer = undefined;
     defer renderer.deinit();
     var font_path: []const u8 = "";
     var font_result_data: []const u8 = "";
     const prep_thread = try std.Thread.spawn(.{}, prepThread, .{ &renderer, &font_path, &font_result_data, cfg.font_path, cfg.font_size });
 
-    // Wait for prep thread — gives us cell metrics (~8ms)
     prep_thread.join();
     if (font_path.len == 0) return error.FontLoadFailed;
     defer allocator.free(font_path);
 
-    // ── Phase 3: fork PTY with correct grid size ──
-    // Shell starts loading (.zshrc etc) while EGL init runs below.
+    // ── Phase 3: fork PTY ──
     const grid = renderer.computeGridSize(wl.width, wl.height);
     renderer.setViewport(wl.width, wl.height);
 
@@ -216,54 +213,6 @@ pub fn main(init: std.process.Init) !void {
 
     term.pty_fd = pty.master_fd;
 
-    std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
-
-    // ── Phase 4: SHM first frame (freetype CPU rendering) ──
-    // Show real terminal content before EGL is ready.
-    // Read any PTY output, feed to ghostty, rasterize with freetype.
-    {
-        var pty_buf: [4096]u8 = undefined;
-        // Give shell a moment to produce output
-        var poll_fds = [_]c.struct_pollfd{
-            .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
-        };
-        _ = c.poll(&poll_fds, 1, 5); // 5ms max wait
-        if (poll_fds[0].revents & c.POLLIN != 0) {
-            while (true) {
-                const n = pty.read(&pty_buf) catch break;
-                if (n == 0) break;
-                term.feedData(pty_buf[0..n]);
-            }
-        }
-
-        if (wl.shm) |shm| {
-            var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
-            if (frame_opt) |*frame| {
-                defer frame.destroy();
-                frame.renderTerminal(
-                    &term,
-                    font_result_data,
-                    cfg.font_size,
-                    renderer.cell_width,
-                    renderer.cell_height,
-                    cfg.foreground,
-                    cfg.background,
-                );
-                frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                std.debug.print("mollusk: SHM frame ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
-            }
-        }
-    }
-
-    // ── Phase 5: EGL init (73ms driver work, shell loading in parallel) ──
-    try wl.initEglPublic();
-
-    std.debug.print("mollusk: EGL ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
-
-    // ── Phase 5: GPU init (shader compile + atlas upload) ──
-    try renderer.initGpu();
-
-    // Wire callbacks
     g_term = &term;
     g_pty = &pty;
     g_renderer = &renderer;
@@ -272,7 +221,43 @@ pub fn main(init: std.process.Init) !void {
     wl.on_resize = onResize;
     wl.on_focus = onFocus;
 
-    std.debug.print("mollusk: {}x{} ready ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+    std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+
+    // ── Phase 4: SHM first frame ──
+    // Drain any early shell output, render with freetype, show immediately.
+    // Shell continues loading .zshrc during EGL init below.
+    {
+        var pty_buf: [4096]u8 = undefined;
+        var poll_fds = [_]c.struct_pollfd{
+            .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
+        };
+        _ = c.poll(&poll_fds, 1, 5);
+        if (poll_fds[0].revents & c.POLLIN != 0) {
+            while (true) {
+                const n = pty.read(&pty_buf) catch break;
+                if (n == 0) break;
+                term.feedData(pty_buf[0..n]);
+            }
+        }
+        if (wl.shm) |shm| {
+            var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
+            if (frame_opt) |*frame| {
+                defer frame.destroy();
+                frame.renderTerminal(&term, font_result_data, cfg.font_size, renderer.cell_width, renderer.cell_height, cfg.foreground, cfg.background);
+                frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+            }
+        }
+        std.debug.print("mollusk: SHM frame ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
+
+    // ── Phase 5: EGL init (73ms, shell loading in parallel) ──
+    try wl.initEglContext();
+    try wl.initEglSurface();
+    std.debug.print("mollusk: EGL ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+
+    // ── Phase 6: GPU init ──
+    try renderer.initGpu();
+    std.debug.print("mollusk: {}x{} GPU ready ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
 
     // ── Event loop ──
     var pty_buf: [65536]u8 = undefined;

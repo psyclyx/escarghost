@@ -163,15 +163,10 @@ pub const Wayland = struct {
         }
     }
 
-    /// Initialize EGL. Separate from init() so caller can do work between
-    /// Wayland setup and EGL (e.g. fork PTY while EGL driver initializes).
-    pub fn initEglPublic(self: *Wayland) !void {
-        try self.initEgl();
-    }
-
-    fn initEgl(self: *Wayland) !void {
-        // Use eglGetPlatformDisplay (EGL 1.5) to skip platform detection probing.
-        // EGL_PLATFORM_WAYLAND_KHR = 0x31D8
+    /// EGL Phase 1: display + context. Can run on a background thread —
+    /// mesa's Wayland EGL platform creates its own internal wl_event_queue
+    /// so it doesn't race with the main thread's default queue dispatch.
+    pub fn initEglContext(self: *Wayland) !void {
         const eglGetPlatformDisplay_ = @as(
             ?*const fn (u32, ?*anyopaque, ?[*]const egl.EGLAttrib) callconv(.c) egl.EGLDisplay,
             @ptrCast(egl.eglGetProcAddress("eglGetPlatformDisplay")),
@@ -187,55 +182,36 @@ pub const Wayland = struct {
         var minor: egl.EGLint = 0;
         if (egl.eglInitialize(self.egl_display, &major, &minor) == egl.EGL_FALSE)
             return error.EglInitFailed;
-
         _ = egl.eglBindAPI(egl.EGL_OPENGL_API);
 
-        // Try MSAA 4x first for smoother edges, fall back to no MSAA
-        const base_attribs = [_]egl.EGLint{
+        const base = [_]egl.EGLint{
             egl.EGL_SURFACE_TYPE,    egl.EGL_WINDOW_BIT,
-            egl.EGL_RED_SIZE,        8,
-            egl.EGL_GREEN_SIZE,      8,
-            egl.EGL_BLUE_SIZE,       8,
-            egl.EGL_ALPHA_SIZE,      8,
+            egl.EGL_RED_SIZE, 8, egl.EGL_GREEN_SIZE, 8, egl.EGL_BLUE_SIZE, 8, egl.EGL_ALPHA_SIZE, 8,
             egl.EGL_RENDERABLE_TYPE, egl.EGL_OPENGL_BIT,
         };
-        const msaa_attribs = base_attribs ++ [_]egl.EGLint{
-            egl.EGL_SAMPLE_BUFFERS, 1,
-            egl.EGL_SAMPLES,        4,
-            egl.EGL_NONE,
-        };
-        const plain_attribs = base_attribs ++ [_]egl.EGLint{
-            egl.EGL_NONE,
-        };
+        const msaa = base ++ [_]egl.EGLint{ egl.EGL_SAMPLE_BUFFERS, 1, egl.EGL_SAMPLES, 4, egl.EGL_NONE };
+        const plain = base ++ [_]egl.EGLint{ egl.EGL_NONE };
 
-        var num_configs: egl.EGLint = 0;
-        _ = egl.eglChooseConfig(self.egl_display, &msaa_attribs, &self.egl_config, 1, &num_configs);
-        if (num_configs == 0) {
-            if (egl.eglChooseConfig(self.egl_display, &plain_attribs, &self.egl_config, 1, &num_configs) == egl.EGL_FALSE)
+        var num: egl.EGLint = 0;
+        _ = egl.eglChooseConfig(self.egl_display, &msaa, &self.egl_config, 1, &num);
+        if (num == 0) {
+            if (egl.eglChooseConfig(self.egl_display, &plain, &self.egl_config, 1, &num) == egl.EGL_FALSE)
                 return error.EglConfigFailed;
         }
-        if (num_configs == 0) return error.EglNoConfig;
+        if (num == 0) return error.EglNoConfig;
 
-        // Try GL 4.4 first (enables persistent mapped VBOs in snail), fall back to 3.3
-        const gl44_attribs = [_]egl.EGLint{
-            egl.EGL_CONTEXT_MAJOR_VERSION, 4,
-            egl.EGL_CONTEXT_MINOR_VERSION, 4,
-            egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-            egl.EGL_NONE,
-        };
-        const gl33_attribs = [_]egl.EGLint{
-            egl.EGL_CONTEXT_MAJOR_VERSION, 3,
-            egl.EGL_CONTEXT_MINOR_VERSION, 3,
-            egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-            egl.EGL_NONE,
-        };
+        const gl44 = [_]egl.EGLint{ egl.EGL_CONTEXT_MAJOR_VERSION, 4, egl.EGL_CONTEXT_MINOR_VERSION, 4, egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, egl.EGL_NONE };
+        const gl33 = [_]egl.EGLint{ egl.EGL_CONTEXT_MAJOR_VERSION, 3, egl.EGL_CONTEXT_MINOR_VERSION, 3, egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, egl.EGL_NONE };
 
-        self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &gl44_attribs);
-        if (self.egl_context == egl.EGL_NO_CONTEXT) {
-            self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &gl33_attribs);
-        }
+        self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &gl44);
+        if (self.egl_context == egl.EGL_NO_CONTEXT)
+            self.egl_context = egl.eglCreateContext(self.egl_display, self.egl_config, egl.EGL_NO_CONTEXT, &gl33);
         if (self.egl_context == egl.EGL_NO_CONTEXT) return error.EglContextFailed;
+    }
 
+    /// EGL Phase 2: window surface + make current. Must be called on the
+    /// main thread after initEglContext() completes and wl_surface exists.
+    pub fn initEglSurface(self: *Wayland) !void {
         self.egl_window = wl.wl_egl_window_create(self.surface.?, @intCast(self.width), @intCast(self.height));
         if (self.egl_window == null) return error.EglWindowFailed;
 
@@ -244,9 +220,9 @@ pub const Wayland = struct {
 
         if (egl.eglMakeCurrent(self.egl_display, self.egl_surface, self.egl_surface, self.egl_context) == egl.EGL_FALSE)
             return error.EglMakeCurrentFailed;
-
         _ = egl.eglSwapInterval(self.egl_display, 0);
     }
+
 
     pub fn deinit(self: *Wayland) void {
         if (self.xkb_state) |s| xkb.xkb_state_unref(s);
