@@ -223,46 +223,43 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
 
-    // ── Phase 4: SHM first frame ──
-    // Drain any early shell output, render with freetype, show immediately.
-    // Shell continues loading .zshrc during EGL init below.
+    // ── Phase 4: SHM first frame → EGL init → event loop ──
+    // Show terminal content via CPU renderer, then block for EGL, then loop.
     {
-        var pty_buf: [4096]u8 = undefined;
-        var poll_fds = [_]c.struct_pollfd{
-            .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
-        };
-        _ = c.poll(&poll_fds, 1, 5);
-        if (poll_fds[0].revents & c.POLLIN != 0) {
+        // Drain early PTY output
+        var early_buf: [4096]u8 = undefined;
+        var early_fds = [_]c.struct_pollfd{.{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 }};
+        _ = c.poll(&early_fds, 1, 5);
+        if (early_fds[0].revents & c.POLLIN != 0) {
             while (true) {
-                const n = pty.read(&pty_buf) catch break;
+                const n = pty.read(&early_buf) catch break;
                 if (n == 0) break;
-                term.feedData(pty_buf[0..n]);
+                term.feedData(early_buf[0..n]);
             }
         }
+
+        // Render SHM frame with snail CPU rasterizer
         if (wl.shm) |shm| {
             var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
             if (frame_opt) |*frame| {
                 defer frame.destroy();
                 frame.renderTerminal(&term, &renderer.atlas, &renderer.font, cfg.font_size, renderer.cell_width, renderer.cell_height, cfg.foreground, cfg.background);
                 frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                std.debug.print("mollusk: SHM paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
         }
-        std.debug.print("mollusk: SHM frame ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
-    // ── Phase 5: EGL init (73ms, shell loading in parallel) ──
+    // EGL init blocks ~73ms. Terminal is visible (SHM frame) during this.
+    // Shell continues loading in parallel.
     try wl.initEglContext();
     try wl.initEglSurface();
-    std.debug.print("mollusk: EGL ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
-
-    // ── Phase 6: GPU init ──
     try renderer.initGpu();
-    std.debug.print("mollusk: {}x{} GPU ready ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+    std.debug.print("mollusk: GPU ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
 
-    // ── Event loop ──
+    // ── Event loop (GPU rendering) ──
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
-    var has_pty_data = false;
     var first_paint = true;
 
     while (!wl.closed and !child_exited) {
@@ -287,7 +284,6 @@ pub fn main(init: std.process.Init) !void {
                 };
                 if (n == 0) { child_exited = true; break; }
                 term.feedData(pty_buf[0..n]);
-                has_pty_data = true;
             }
         }
 
@@ -295,15 +291,14 @@ pub fn main(init: std.process.Init) !void {
 
         if (!wl.frame_pending) {
             const drew = renderer.drawFrame(&term) catch false;
-            if (drew or has_pty_data) {
+            if (drew) {
                 wl.swapBuffers();
                 wl.requestFrame();
                 if (first_paint) {
-                    std.debug.print("mollusk: first paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                    std.debug.print("mollusk: first GPU paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                     first_paint = false;
                 }
             }
-            has_pty_data = false;
         }
     }
 
