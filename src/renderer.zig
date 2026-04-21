@@ -206,13 +206,14 @@ pub const Renderer = struct {
         term: *Terminal,
         default_fg: Rgb,
         default_bg: Rgb,
-    ) struct { text_len: usize, vec_len: usize } {
+    ) struct { text_len: usize, vec_len: usize, atlas_changed: bool } {
         // Y=0 origin for both pipelines. Actual Y applied via patchTextY/patchVecY.
         const cell_y_tl: f32 = 0;
         const cell_y_bl: f32 = 0; // text baseline offset added below
 
         var text_batch = snail.Batch.init(self.scratch_text);
         var vec_batch = snail.VectorBatch.init(self.scratch_vec);
+        var atlas_changed = false;
 
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
@@ -275,8 +276,10 @@ pub const Renderer = struct {
                     );
                 } else {
                     const cps = [1]u32{cell.codepoint};
-                    if (self.atlas.addCodepoints(&cps) catch false)
+                    if (self.atlas.addCodepoints(&cps) catch false) {
                         self.snail_renderer.uploadAtlas(&self.atlas);
+                        atlas_changed = true;
+                    }
                     const gid2 = self.font.glyphIndex(cell.codepoint) catch 0;
                     if (self.atlas.getGlyph(gid2)) |info|
                         _ = text_batch.addGlyph(
@@ -312,6 +315,7 @@ pub const Renderer = struct {
         return .{
             .text_len = text_batch.glyphCount() * snail.FLOATS_PER_GLYPH,
             .vec_len = vec_batch.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE,
+            .atlas_changed = atlas_changed,
         };
     }
 
@@ -428,6 +432,16 @@ pub const Renderer = struct {
 
             // Cache miss or dirty — rebuild at Y=0, cache, then copy + Y-patch
             const lens = self.buildRow(term, default_fg, default_bg);
+
+            // Atlas grew mid-frame — earlier rows have stale UVs.
+            // Invalidate cache and restart the entire frame.
+            if (lens.atlas_changed) {
+                self.generation += 1;
+                self.clearCache();
+                self.has_prev_frame = false;
+                return try self.drawFrame(term);
+            }
+
             self.cacheRow(row_id, lens.text_len, lens.vec_len);
 
             if (lens.vec_len > 0) {
@@ -488,6 +502,12 @@ pub const Renderer = struct {
                     }
                 }
             }
+        }
+
+        if (draw_text_len == 0 and draw_vec_len == 0) {
+            // No content to draw — skip frame to avoid blank flash
+            std.debug.print("mollusk: skipped blank frame (rows={}, dirty={}, has_prev={})\n", .{ row_idx, @intFromEnum(dirty), self.has_prev_frame });
+            return false;
         }
 
         // Draw

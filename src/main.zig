@@ -89,6 +89,7 @@ var g_renderer: *renderer_mod.Renderer = undefined;
 var g_wl: *wayland_mod.Wayland = undefined;
 
 var g_scroll_lines: u32 = 3;
+var g_needs_redraw: bool = false;
 
 fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
@@ -185,7 +186,9 @@ fn applyZoom() void {
 
     // Invalidate vertex cache (cell positions changed)
     g_renderer.generation += 1;
+    g_renderer.has_prev_frame = false;
     g_renderer.clearCache();
+    g_needs_redraw = true;
 }
 
 fn onResize(w: u32, h: u32) void {
@@ -194,6 +197,7 @@ fn onResize(w: u32, h: u32) void {
     g_renderer.setViewport(w, h);
     g_term.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.cell_width), @intFromFloat(g_renderer.cell_height)) catch {};
     g_pty.resize(grid.cols, grid.rows, w, h);
+    g_needs_redraw = true;
 }
 
 fn onFocus(focused: bool) void {
@@ -297,8 +301,17 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
 
     // ── Phase 4: SHM first frame → EGL init → event loop ──
-    // Show terminal content via CPU renderer, then block for EGL, then loop.
-    {
+    // Show background immediately, then CPU-render terminal content.
+    if (wl.shm) |shm| {
+        // Background-only frame — get the window on screen ASAP
+        var bg_frame = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
+        if (bg_frame) |*frame| {
+            frame.fillBackground(cfg.background);
+            frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+            std.debug.print("mollusk: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            frame.destroy();
+        }
+
         // Drain early PTY output
         var early_buf: [4096]u8 = undefined;
         var early_fds = [_]c.struct_pollfd{.{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 }};
@@ -311,15 +324,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // Render SHM frame with snail CPU rasterizer
-        if (wl.shm) |shm| {
-            var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
-            if (frame_opt) |*frame| {
-                defer frame.destroy();
-                frame.renderTerminal(&term, &renderer.atlas, &renderer.font, cfg.font_size, renderer.cell_width, renderer.cell_height, cfg.foreground, cfg.background);
-                frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                std.debug.print("mollusk: SHM paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
-            }
+        // Full SHM frame with terminal content
+        var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
+        if (frame_opt) |*frame| {
+            defer frame.destroy();
+            frame.renderTerminal(&term, &renderer.atlas, &renderer.font, cfg.font_size, renderer.cell_width, renderer.cell_height, cfg.foreground, cfg.background);
+            frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+            std.debug.print("mollusk: SHM paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
     }
 
@@ -350,6 +361,19 @@ pub fn main(init: std.process.Init) !void {
 
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.dispatch() catch break;
+        }
+
+        // After zoom/resize, draw before reading PTY so the reflowed
+        // content is presented before the shell's SIGWINCH response
+        // can clear the prompt line.
+        if (g_needs_redraw) {
+            g_needs_redraw = false;
+            const drew = renderer.drawFrame(&term) catch false;
+            if (drew) {
+                wl.swapBuffers();
+                if (!wl.frame_pending)
+                    wl.requestFrame();
+            }
         }
 
         if (pollfds[1].revents & c.POLLIN != 0) {

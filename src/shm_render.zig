@@ -74,6 +74,13 @@ pub const ShmFrame = struct {
         };
     }
 
+    pub fn fillBackground(self: *ShmFrame, bg: Rgb) void {
+        const pixel: u32 = 0xff000000 | (@as(u32, bg.r) << 16) | (@as(u32, bg.g) << 8) | bg.b;
+        const pixels: [*]u32 = @ptrCast(@alignCast(self.map_ptr.?));
+        const count = (self.width * self.height);
+        @memset(pixels[0..count], pixel);
+    }
+
     pub fn destroy(self: *ShmFrame) void {
         if (self.wl_buffer) |b| wl.wl_buffer_destroy(b);
         if (self.wl_pool) |p| wl.wl_shm_pool_destroy(p);
