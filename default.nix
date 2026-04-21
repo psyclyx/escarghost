@@ -20,7 +20,7 @@ let
     stdenv.cc.cc.lib
     wayland
     libxkbcommon
-    harfbuzz
+    fontconfig
   ];
 
   allBuildInputs = runtimeLibs ++ (with pkgs; [ wayland-protocols ]) ++ [
@@ -31,6 +31,7 @@ let
     root = ./.;
     fileset = pkgs.lib.fileset.unions [
       ./src
+      ./protocol
       ./build.zig
       ./build.zig.zon
     ];
@@ -52,7 +53,8 @@ pkgs.stdenv.mkDerivation {
 
   buildPhase = ''
     export XDG_CACHE_HOME="$TMPDIR/.cache"
-    export PKG_CONFIG_PATH="${libghostty-vt.dev}/share/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export GHOSTTY_VT_INCLUDE="${libghostty-vt.dev}/include"
+    export GHOSTTY_VT_LIB="${libghostty-vt.dev}/lib/libghostty-vt.a"
 
     zig build \
       --fork=${sources.snail} \
