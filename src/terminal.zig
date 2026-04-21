@@ -310,30 +310,33 @@ pub const Terminal = struct {
         var fg_rgb: c.GhosttyColorRgb = undefined;
         var bg_rgb: c.GhosttyColorRgb = undefined;
 
-        // Batch query: 4 fields in one C call instead of 4 separate calls
-        const keys = [4]c.GhosttyRenderStateRowCellsData{
+        // Query fields that always succeed first, then fg/bg separately.
+        // get_multi stops at first GHOSTTY_INVALID_VALUE, so a missing fg
+        // would prevent bg from being queried.
+        const base_keys = [2]c.GhosttyRenderStateRowCellsData{
             c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
             c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
-            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
-            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
         };
-        var values = [4]?*anyopaque{
+        var base_values = [2]?*anyopaque{
             @ptrCast(&graphemes_len),
             @ptrCast(&style),
-            @ptrCast(&fg_rgb),
-            @ptrCast(&bg_rgb),
         };
-        var written: usize = 0;
         _ = c.ghostty_render_state_row_cells_get_multi(
-            self.row_cells, 4, &keys, &values, &written,
+            self.row_cells, 2, &base_keys, &base_values, null,
         );
+        const has_fg = c.ghostty_render_state_row_cells_get(
+            self.row_cells, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, @ptrCast(&fg_rgb),
+        ) == c.GHOSTTY_SUCCESS;
+        const has_bg = c.ghostty_render_state_row_cells_get(
+            self.row_cells, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, @ptrCast(&bg_rgb),
+        ) == c.GHOSTTY_SUCCESS;
 
         var info: CellInfo = .{
             .codepoint = 0,
             .has_text = graphemes_len > 0,
             .graphemes_len = graphemes_len,
-            .fg = if (written >= 3) fromGhosttyRgb(fg_rgb) else null,
-            .bg = if (written >= 4) fromGhosttyRgb(bg_rgb) else null,
+            .fg = if (has_fg) fromGhosttyRgb(fg_rgb) else null,
+            .bg = if (has_bg) fromGhosttyRgb(bg_rgb) else null,
             .style = style,
             .raw = 0,
         };
