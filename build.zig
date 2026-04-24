@@ -1,5 +1,26 @@
 const std = @import("std");
 
+fn addScannedWaylandProtocol(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    scanner: []const u8,
+    xml_path: []const u8,
+    header_name: []const u8,
+    code_name: []const u8,
+) void {
+    const header_step = b.addSystemCommand(&.{ scanner, "client-header" });
+    header_step.addFileArg(.{ .cwd_relative = xml_path });
+    const header = header_step.addOutputFileArg(header_name);
+
+    const code_step = b.addSystemCommand(&.{ scanner, "private-code" });
+    code_step.step.dependOn(&header_step.step);
+    code_step.addFileArg(.{ .cwd_relative = xml_path });
+    const code = code_step.addOutputFileArg(code_name);
+
+    root_module.addIncludePath(header.dirname());
+    root_module.addCSourceFile(.{ .file = code });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -15,10 +36,10 @@ pub fn build(b: *std.Build) void {
     // Built separately with its own zig version; consumed as a C library.
     // In the nix shell, GHOSTTY_VT_INCLUDE and GHOSTTY_VT_LIB are set automatically.
     // Non-nix users can pass -Dghostty-vt-include=... -Dghostty-vt-static-lib=...
-    const vt_include = b.option([]const u8, "ghostty-vt-include", "Path to libghostty-vt headers")
-        orelse b.graph.environ_map.get("GHOSTTY_VT_INCLUDE");
-    const vt_static_lib = b.option([]const u8, "ghostty-vt-static-lib", "Full path to libghostty-vt.a")
-        orelse b.graph.environ_map.get("GHOSTTY_VT_LIB");
+    const vt_include = b.option([]const u8, "ghostty-vt-include", "Path to libghostty-vt headers") orelse b.graph.environ_map.get("GHOSTTY_VT_INCLUDE");
+    const vt_static_lib = b.option([]const u8, "ghostty-vt-static-lib", "Full path to libghostty-vt.a") orelse b.graph.environ_map.get("GHOSTTY_VT_LIB");
+    const wayland_protocols_dir = b.option([]const u8, "wayland-protocols-dir", "Path to wayland-protocols pkgdatadir") orelse b.graph.environ_map.get("WAYLAND_PROTOCOLS_DIR") orelse @panic("WAYLAND_PROTOCOLS_DIR or -Dwayland-protocols-dir is required");
+    const wayland_scanner = b.option([]const u8, "wayland-scanner", "Path to wayland-scanner binary") orelse b.graph.environ_map.get("WAYLAND_SCANNER") orelse @panic("WAYLAND_SCANNER or -Dwayland-scanner is required");
 
     if (vt_include) |inc| root_module.addIncludePath(.{ .cwd_relative = inc });
     if (vt_static_lib) |lib_path| root_module.addObjectFile(.{ .cwd_relative = lib_path });
@@ -63,12 +84,38 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("egl", .{});
     root_module.linkSystemLibrary("xkbcommon", .{});
     root_module.linkSystemLibrary("OpenGL", .{});
+    root_module.linkSystemLibrary("gbm", .{});
+    root_module.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
     root_module.linkSystemLibrary("fontconfig", .{});
 
     // Wayland protocol implementations
     root_module.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });
     root_module.addCSourceFile(.{ .file = b.path("protocol/xdg-decoration-protocol.c") });
     root_module.addIncludePath(b.path("protocol"));
+    addScannedWaylandProtocol(
+        b,
+        root_module,
+        wayland_scanner,
+        b.pathJoin(&.{ wayland_protocols_dir, "stable/viewporter/viewporter.xml" }),
+        "viewporter-client-protocol.h",
+        "viewporter-protocol.c",
+    );
+    addScannedWaylandProtocol(
+        b,
+        root_module,
+        wayland_scanner,
+        b.pathJoin(&.{ wayland_protocols_dir, "staging/single-pixel-buffer/single-pixel-buffer-v1.xml" }),
+        "single-pixel-buffer-v1-client-protocol.h",
+        "single-pixel-buffer-v1-protocol.c",
+    );
+    addScannedWaylandProtocol(
+        b,
+        root_module,
+        wayland_scanner,
+        b.pathJoin(&.{ wayland_protocols_dir, "unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml" }),
+        "linux-dmabuf-unstable-v1-client-protocol.h",
+        "linux-dmabuf-unstable-v1-protocol.c",
+    );
 
     const exe = b.addExecutable(.{
         .name = "mollusk",

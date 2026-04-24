@@ -16,8 +16,16 @@ pkgs.mkShell {
   packages = with pkgs; [
     zigpkgs."0.16.0"
     pkg-config
+    hyperfine
+    foot
+    alacritty
+    kitty
+    wezterm
     libGL
     libglvnd # EGL
+    mesa
+    libgbm
+    libdrm
     stdenv.cc.cc.lib
     wayland
     wayland-protocols
@@ -34,6 +42,9 @@ pkgs.mkShell {
   LD_LIBRARY_PATH = with pkgs; pkgs.lib.makeLibraryPath [
     libGL
     libglvnd
+    mesa
+    libgbm
+    libdrm
     stdenv.cc.cc.lib
     wayland
     libxkbcommon
@@ -46,4 +57,9 @@ pkgs.mkShell {
   # For zig build to find the static library directly
   GHOSTTY_VT_INCLUDE = "${libghostty-vt.dev}/include";
   GHOSTTY_VT_LIB = "${libghostty-vt.dev}/lib/libghostty-vt.a";
+
+  shellHook = ''
+    export WAYLAND_PROTOCOLS_DIR="$(pkg-config --variable=pkgdatadir wayland-protocols)"
+    export WAYLAND_SCANNER="$(pkg-config --variable=wayland_scanner wayland-scanner)"
+  '';
 }

@@ -17,13 +17,16 @@ let
   runtimeLibs = with pkgs; [
     libGL
     libglvnd # EGL
+    mesa
+    libgbm
+    libdrm
     stdenv.cc.cc.lib
     wayland
     libxkbcommon
     fontconfig
   ];
 
-  allBuildInputs = runtimeLibs ++ (with pkgs; [ wayland-protocols ]) ++ [
+  allBuildInputs = runtimeLibs ++ [
     libghostty-vt.dev
   ];
 
@@ -46,6 +49,8 @@ pkgs.stdenv.mkDerivation {
   nativeBuildInputs = with pkgs; [
     zig
     pkg-config
+    wayland-protocols
+    wayland-scanner
     autoPatchelfHook
   ];
 
@@ -55,6 +60,8 @@ pkgs.stdenv.mkDerivation {
     export XDG_CACHE_HOME="$TMPDIR/.cache"
     export GHOSTTY_VT_INCLUDE="${libghostty-vt.dev}/include"
     export GHOSTTY_VT_LIB="${libghostty-vt.dev}/lib/libghostty-vt.a"
+    export WAYLAND_PROTOCOLS_DIR="$(pkg-config --variable=pkgdatadir wayland-protocols)"
+    export WAYLAND_SCANNER="$(pkg-config --variable=wayland_scanner wayland-scanner)"
 
     zig build \
       --fork=${sources.snail} \
