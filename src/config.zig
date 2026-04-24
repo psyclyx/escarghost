@@ -33,6 +33,11 @@ pub const Config = struct {
     // Scroll
     scroll_lines: u32 = 3, // lines per scroll event
 
+    // GPU renderer restart policy
+    gpu_restart_initial_delay_ms: u32 = 250,
+    gpu_restart_max_delay_ms: u32 = 5000,
+    gpu_restart_jitter_percent: u32 = 20,
+
     // Track ownership of heap-allocated strings
     owns_font_path: bool = false,
     owns_shell: bool = false,
@@ -241,6 +246,18 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
 
     if (obj.get("generate_256_from_base16")) |v| {
         if (v == .bool) cfg.generate_256 = v.bool;
+    }
+
+    if (obj.get("gpu_restart_initial_delay_ms")) |v| {
+        if (v == .integer and v.integer >= 0) cfg.gpu_restart_initial_delay_ms = @intCast(v.integer);
+    }
+
+    if (obj.get("gpu_restart_max_delay_ms")) |v| {
+        if (v == .integer and v.integer >= 0) cfg.gpu_restart_max_delay_ms = @intCast(v.integer);
+    }
+
+    if (obj.get("gpu_restart_jitter_percent")) |v| {
+        if (v == .integer and v.integer >= 0) cfg.gpu_restart_jitter_percent = @intCast(v.integer);
     }
 
     if (obj.get("colors")) |colors_val| {

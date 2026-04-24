@@ -5,7 +5,11 @@
 const std = @import("std");
 const snail = @import("snail");
 const cpu_renderer = @import("cpu_renderer");
+const atlas_owner = @import("atlas_owner.zig");
+const glyph_misses = @import("glyph_misses.zig");
 const terminal_mod = @import("terminal.zig");
+const render_snapshot = @import("render_snapshot.zig");
+const render_common = @import("render_common.zig");
 const color = @import("color.zig");
 const Rgb = color.Rgb;
 
@@ -53,7 +57,11 @@ pub const ShmFrame = struct {
         };
 
         const buffer = wl.wl_shm_pool_create_buffer(
-            pool, 0, @intCast(w), @intCast(h), @intCast(stride),
+            pool,
+            0,
+            @intCast(w),
+            @intCast(h),
+            @intCast(stride),
             wl.WL_SHM_FORMAT_ARGB8888,
         ) orelse {
             wl.wl_shm_pool_destroy(pool);
@@ -100,26 +108,44 @@ pub const ShmFrame = struct {
         cell_height: f32,
         default_fg: Rgb,
         default_bg: Rgb,
-    ) void {
-        self.renderer.clear(default_bg.r, default_bg.g, default_bg.b, 255);
+    ) glyph_misses.Set {
+        var misses: glyph_misses.Set = .{};
+        term.updateRenderState() catch return .{};
+        const colors = term.getColors();
+        const cursor = term.getCursor();
+        const effective_default_fg = colors.foreground;
+        const effective_default_bg = colors.background;
+        _ = default_fg;
+        _ = default_bg;
 
-        term.updateRenderState() catch return;
+        self.renderer.clear(effective_default_bg.r, effective_default_bg.g, effective_default_bg.b, 255);
+
+        var cursor_cell: ?render_common.CursorCell = null;
 
         term.beginRowIteration();
         var row_idx: u16 = 0;
         while (term.nextRow()) : (row_idx += 1) {
             term.beginCellIteration();
             var col_idx: u16 = 0;
-            while (term.nextCell()) : (col_idx += 1) {
-                const cell = term.getCellInfo();
-
-                var fg = cell.fg orelse default_fg;
-                var cell_bg = cell.bg;
-                if (cell.style.inverse != false) {
-                    const tmp = fg;
-                    fg = cell_bg orelse default_bg;
-                    cell_bg = tmp;
-                }
+        while (term.nextCell()) : (col_idx += 1) {
+            const cell = term.getCellInfo();
+            const glyph_id: u16 = if (cell.has_text and render_common.isRenderableCodepoint(cell.codepoint))
+                (font.glyphIndex(cell.codepoint) catch 0)
+            else
+                0;
+            const resolved = render_common.resolveCellColors(
+                effective_default_fg,
+                effective_default_bg,
+                    cell.fg,
+                    cell.bg,
+                    cell.style.inverse != false,
+                cell.style.faint != false,
+            );
+            const fg = resolved.fg;
+            const cell_bg = resolved.bg;
+            if (cursor.visible and cursor.in_viewport and row_idx == cursor.y and col_idx == cursor.x) {
+                cursor_cell = render_common.captureCursorCell(effective_default_bg, cell.codepoint, glyph_id, cell.has_text, resolved);
+            }
 
                 // Background
                 if (cell_bg) |cbg| {
@@ -128,32 +154,272 @@ pub const ShmFrame = struct {
                         @intFromFloat(@as(f32, @floatFromInt(row_idx)) * cell_height),
                         @intFromFloat(cell_width),
                         @intFromFloat(cell_height),
-                        cbg.r, cbg.g, cbg.b, 255,
+                        cbg.r,
+                        cbg.g,
+                        cbg.b,
+                        255,
                     );
                 }
 
                 // Text
-                if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
+                if (cell.has_text and glyph_id != 0) {
                     const x = @as(f32, @floatFromInt(col_idx)) * cell_width;
                     const y = @as(f32, @floatFromInt(row_idx)) * cell_height + cell_height * 0.8;
+                    if (atlas.getGlyph(glyph_id) == null) {
+                        misses.add(cell.codepoint);
+                    }
                     self.renderer.drawGlyph(
-                        atlas, font, cell.codepoint,
-                        x, y, font_size,
-                        fg.toFloat4(1.0),
+                        atlas,
+                        font,
+                        cell.codepoint,
+                        x,
+                        y,
+                        font_size,
+                        fg.toLinearFloat4(1.0),
+                    );
+                }
+
+                if (cell.style.underline != 0) {
+                    self.renderer.fillRect(
+                        @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
+                        @intFromFloat(@as(f32, @floatFromInt(row_idx)) * cell_height + cell_height - 1),
+                        @intFromFloat(cell_width),
+                        1,
+                        fg.r,
+                        fg.g,
+                        fg.b,
+                        255,
+                    );
+                }
+                if (cell.style.strikethrough != false) {
+                    self.renderer.fillRect(
+                        @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
+                        @intFromFloat(@as(f32, @floatFromInt(row_idx)) * cell_height + cell_height * 0.45),
+                        @intFromFloat(cell_width),
+                        1,
+                        fg.r,
+                        fg.g,
+                        fg.b,
+                        255,
                     );
                 }
             }
         }
 
+        if (cursor.visible and cursor.in_viewport) {
+            const cx: i32 = @intFromFloat(@as(f32, @floatFromInt(cursor.x)) * cell_width);
+            const cy: i32 = @intFromFloat(@as(f32, @floatFromInt(cursor.y)) * cell_height);
+            const cc = colors.cursor orelse colors.foreground;
+            const cursor_w: u32 = @intFromFloat(cell_width);
+            const cursor_h: u32 = @intFromFloat(cell_height);
+            switch (cursor.style) {
+                .block => self.renderer.fillRect(cx, cy, cursor_w, cursor_h, cc.r, cc.g, cc.b, 255),
+                .bar => self.renderer.fillRect(cx, cy, 2, cursor_h, cc.r, cc.g, cc.b, 255),
+                .underline => self.renderer.fillRect(cx, cy + @as(i32, @intCast(cursor_h -| 2)), cursor_w, 2, cc.r, cc.g, cc.b, 255),
+                .block_hollow => {
+                    self.renderer.fillRect(cx, cy, cursor_w, 2, cc.r, cc.g, cc.b, 255);
+                    self.renderer.fillRect(cx, cy + @as(i32, @intCast(cursor_h -| 2)), cursor_w, 2, cc.r, cc.g, cc.b, 255);
+                    self.renderer.fillRect(cx, cy, 2, cursor_h, cc.r, cc.g, cc.b, 255);
+                    self.renderer.fillRect(cx + @as(i32, @intCast(cursor_w -| 2)), cy, 2, cursor_h, cc.r, cc.g, cc.b, 255);
+                },
+            }
+
+            if (cursor.style == .block) {
+                if (cursor_cell) |cell| {
+                    if (cell.has_text and cell.glyph_id != 0) {
+                        if (atlas.getGlyph(cell.glyph_id) == null) {
+                            misses.add(cell.codepoint);
+                        }
+                        self.renderer.drawGlyph(
+                            atlas,
+                            font,
+                            cell.codepoint,
+                            @as(f32, @floatFromInt(cursor.x)) * cell_width,
+                            @as(f32, @floatFromInt(cursor.y)) * cell_height + cell_height * 0.8,
+                            font_size,
+                            cell.bg.toLinearFloat4(1.0),
+                        );
+                    }
+                }
+            }
+        }
+
         term.resetDirty();
+        return misses;
     }
 
     pub fn commit(self: *ShmFrame, surface_opaque: *anyopaque, display_opaque: *anyopaque) void {
         const surface: *wl.wl_surface = @ptrCast(surface_opaque);
         const display: *wl.wl_display = @ptrCast(display_opaque);
+        wl.wl_surface_set_buffer_transform(surface, wl.WL_OUTPUT_TRANSFORM_NORMAL);
         wl.wl_surface_attach(surface, self.wl_buffer, 0, 0);
         wl.wl_surface_damage_buffer(surface, 0, 0, @intCast(self.width), @intCast(self.height));
         wl.wl_surface_commit(surface);
         _ = wl.wl_display_flush(display);
     }
 };
+
+fn renderSnapshotWithCpuRenderer(
+    renderer: *cpu_renderer.CpuRenderer,
+    snapshot: *const render_snapshot.SharedSnapshot,
+    atlas: *const snail.Atlas,
+    font: *const snail.Font,
+    font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+) glyph_misses.Set {
+    var misses: glyph_misses.Set = .{};
+    const header = snapshot.header;
+    const default_fg = header.default_fg;
+    const default_bg = header.default_bg;
+    const cursor_color = if (header.cursor_has_color != 0) header.cursor_color else null;
+
+    renderer.clear(default_bg.r, default_bg.g, default_bg.b, 255);
+
+    var cursor_cell: ?render_common.CursorCell = null;
+    const rows = @min(header.rows, render_snapshot.MaxRows);
+    const cols = @min(header.cols, render_snapshot.MaxCols);
+
+    var cell_index: usize = 0;
+    var row_idx: u16 = 0;
+    while (row_idx < rows) : (row_idx += 1) {
+        var col_idx: u16 = 0;
+        while (col_idx < cols and cell_index < header.cell_count) : ({
+            col_idx += 1;
+            cell_index += 1;
+        }) {
+            const cell = snapshot.cells[cell_index];
+            const flags: render_snapshot.CellFlags = @bitCast(cell.flags);
+            const resolved = render_common.resolveCellColors(
+                default_fg,
+                default_bg,
+                if (flags.has_fg) cell.fg else null,
+                if (flags.has_bg) cell.bg else null,
+                flags.inverse,
+                flags.faint,
+            );
+            const fg = resolved.fg;
+            const cell_bg = resolved.bg;
+
+            if (header.cursor_visible != 0 and header.cursor_in_viewport != 0 and
+                row_idx == header.cursor_y and col_idx == header.cursor_x)
+            {
+                cursor_cell = render_common.captureCursorCell(default_bg, cell.codepoint, cell.glyph_id, flags.has_text, resolved);
+            }
+
+            if (cell_bg) |cbg| {
+                renderer.fillRect(
+                    @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
+                    @intFromFloat(@as(f32, @floatFromInt(row_idx)) * cell_height),
+                    @intFromFloat(cell_width),
+                    @intFromFloat(cell_height),
+                    cbg.r,
+                    cbg.g,
+                    cbg.b,
+                    255,
+                );
+            }
+
+            if (flags.has_text and cell.glyph_id != 0) {
+                if (atlas.getGlyph(cell.glyph_id) == null) {
+                    misses.add(cell.codepoint);
+                }
+                if (atlas.getGlyph(cell.glyph_id)) |_| {
+                    renderer.drawGlyph(
+                        atlas,
+                        font,
+                        cell.codepoint,
+                        @as(f32, @floatFromInt(col_idx)) * cell_width,
+                        @as(f32, @floatFromInt(row_idx)) * cell_height + cell_height * 0.8,
+                        font_size,
+                        fg.toLinearFloat4(1.0),
+                    );
+                }
+            }
+
+            if (flags.underline) {
+                renderer.fillRect(
+                    @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
+                    @intFromFloat(@as(f32, @floatFromInt(row_idx)) * cell_height + cell_height - 1),
+                    @intFromFloat(cell_width),
+                    1,
+                    fg.r,
+                    fg.g,
+                    fg.b,
+                    255,
+                );
+            }
+            if (flags.strikethrough) {
+                renderer.fillRect(
+                    @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
+                    @intFromFloat(@as(f32, @floatFromInt(row_idx)) * cell_height + cell_height * 0.45),
+                    @intFromFloat(cell_width),
+                    1,
+                    fg.r,
+                    fg.g,
+                    fg.b,
+                    255,
+                );
+            }
+        }
+    }
+
+    if (header.cursor_visible != 0 and header.cursor_in_viewport != 0) {
+        const cx: i32 = @intFromFloat(@as(f32, @floatFromInt(header.cursor_x)) * cell_width);
+        const cy: i32 = @intFromFloat(@as(f32, @floatFromInt(header.cursor_y)) * cell_height);
+        const cc = cursor_color orelse default_fg;
+        const cursor_w: u32 = @intFromFloat(cell_width);
+        const cursor_h: u32 = @intFromFloat(cell_height);
+        switch (header.cursor_style) {
+            .block => renderer.fillRect(cx, cy, cursor_w, cursor_h, cc.r, cc.g, cc.b, 255),
+            .bar => renderer.fillRect(cx, cy, 2, cursor_h, cc.r, cc.g, cc.b, 255),
+            .underline => renderer.fillRect(cx, cy + @as(i32, @intCast(cursor_h -| 2)), cursor_w, 2, cc.r, cc.g, cc.b, 255),
+            .block_hollow => {
+                renderer.fillRect(cx, cy, cursor_w, 2, cc.r, cc.g, cc.b, 255);
+                renderer.fillRect(cx, cy + @as(i32, @intCast(cursor_h -| 2)), cursor_w, 2, cc.r, cc.g, cc.b, 255);
+                renderer.fillRect(cx, cy, 2, cursor_h, cc.r, cc.g, cc.b, 255);
+                renderer.fillRect(cx + @as(i32, @intCast(cursor_w -| 2)), cy, 2, cursor_h, cc.r, cc.g, cc.b, 255);
+            },
+        }
+
+        if (header.cursor_style == .block) {
+            if (cursor_cell) |cell| {
+                if (cell.has_text and cell.glyph_id != 0) {
+                    if (atlas.getGlyph(cell.glyph_id) == null) {
+                        misses.add(cell.codepoint);
+                    }
+                    if (atlas.getGlyph(cell.glyph_id)) |_| {
+                        renderer.drawGlyph(
+                            atlas,
+                            font,
+                            cell.codepoint,
+                            @as(f32, @floatFromInt(header.cursor_x)) * cell_width,
+                            @as(f32, @floatFromInt(header.cursor_y)) * cell_height + cell_height * 0.8,
+                            font_size,
+                            cell.bg.toLinearFloat4(1.0),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    return misses;
+}
+
+pub fn renderSnapshotToMemory(
+    atlas_thread: ?*atlas_owner.Frontend,
+    map_ptr: *anyopaque,
+    width: u32,
+    height: u32,
+    stride: u32,
+    snapshot: *const render_snapshot.SharedSnapshot,
+    atlas: *const snail.Atlas,
+    font: *const snail.Font,
+    font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+) void {
+    var renderer = cpu_renderer.CpuRenderer.init(@ptrCast(map_ptr), width, height, stride);
+    const misses = renderSnapshotWithCpuRenderer(&renderer, snapshot, atlas, font, font_size, cell_width, cell_height);
+    if (atlas_thread) |thread| thread.requestMany(&misses);
+}

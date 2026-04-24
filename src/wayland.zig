@@ -1,10 +1,14 @@
 const std = @import("std");
+const render_env = @import("render_env.zig");
 
 const wl = @cImport({
     @cInclude("wayland-client.h");
     @cInclude("wayland-egl.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("xdg-decoration-client-protocol.h");
+    @cInclude("viewporter-client-protocol.h");
+    @cInclude("single-pixel-buffer-v1-client-protocol.h");
+    @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
 });
 
 const egl = @cImport({
@@ -14,6 +18,14 @@ const egl = @cImport({
 const xkb = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
 });
+
+fn rendererLogEnabled() bool {
+    if (std.c.getenv("MOLLUSK_LOG")) |value| {
+        const options = render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
+        return options.startup or options.renderers;
+    }
+    return false;
+}
 
 const time_c = @cImport(@cInclude("time.h"));
 
@@ -55,9 +67,14 @@ pub const Wayland = struct {
     keyboard: ?*wl.wl_keyboard = null,
     pointer: ?*wl.wl_pointer = null,
     decoration_manager: ?*wl.zxdg_decoration_manager_v1 = null,
+    viewporter: ?*wl.wp_viewporter = null,
+    single_pixel_buffer_manager: ?*wl.wp_single_pixel_buffer_manager_v1 = null,
+    linux_dmabuf: ?*wl.zwp_linux_dmabuf_v1 = null,
 
     shm: ?*wl.wl_shm = null,
     surface: ?*wl.wl_surface = null,
+    viewport: ?*wl.wp_viewport = null,
+    solid_background_buffer: ?*wl.wl_buffer = null,
     xdg_surface: ?*wl.xdg_surface = null,
     xdg_toplevel: ?*wl.xdg_toplevel = null,
     decoration: ?*wl.zxdg_toplevel_decoration_v1 = null,
@@ -100,9 +117,14 @@ pub const Wayland = struct {
         self.keyboard = null;
         self.pointer = null;
         self.decoration_manager = null;
+        self.viewporter = null;
+        self.single_pixel_buffer_manager = null;
+        self.linux_dmabuf = null;
         self.decoration = null;
         self.frame_callback = null;
         self.surface = null;
+        self.viewport = null;
+        self.solid_background_buffer = null;
         self.xdg_surface = null;
         self.xdg_toplevel = null;
         self.egl_display = egl.EGL_NO_DISPLAY;
@@ -117,6 +139,10 @@ pub const Wayland = struct {
         self.closed = false;
         self.frame_pending = false;
         self.focused = false;
+        self.repeat_rate = 25;
+        self.repeat_delay = 600;
+        self.repeat_key = null;
+        self.repeat_deadline_ns = 0;
         self.on_key = null;
         self.on_mouse = null;
         self.on_resize = null;
@@ -171,9 +197,8 @@ pub const Wayland = struct {
         }
     }
 
-    /// EGL Phase 1: display + context. Can run on a background thread —
-    /// mesa's Wayland EGL platform creates its own internal wl_event_queue
-    /// so it doesn't race with the main thread's default queue dispatch.
+    /// EGL Phase 1: display + context. Kept separate from initEglSurface()
+    /// so startup can show a first frame before paying the EGL setup cost.
     pub fn initEglContext(self: *Wayland) !void {
         const eglGetPlatformDisplay_ = @as(
             ?*const fn (u32, ?*anyopaque, ?[*]const egl.EGLAttrib) callconv(.c) egl.EGLDisplay,
@@ -194,11 +219,14 @@ pub const Wayland = struct {
 
         const base = [_]egl.EGLint{
             egl.EGL_SURFACE_TYPE,    egl.EGL_WINDOW_BIT,
-            egl.EGL_RED_SIZE, 8, egl.EGL_GREEN_SIZE, 8, egl.EGL_BLUE_SIZE, 8, egl.EGL_ALPHA_SIZE, 8,
+            egl.EGL_RED_SIZE,        8,
+            egl.EGL_GREEN_SIZE,      8,
+            egl.EGL_BLUE_SIZE,       8,
+            egl.EGL_ALPHA_SIZE,      8,
             egl.EGL_RENDERABLE_TYPE, egl.EGL_OPENGL_BIT,
         };
         const msaa = base ++ [_]egl.EGLint{ egl.EGL_SAMPLE_BUFFERS, 1, egl.EGL_SAMPLES, 4, egl.EGL_NONE };
-        const plain = base ++ [_]egl.EGLint{ egl.EGL_NONE };
+        const plain = base ++ [_]egl.EGLint{egl.EGL_NONE};
 
         var num: egl.EGLint = 0;
         _ = egl.eglChooseConfig(self.egl_display, &msaa, &self.egl_config, 1, &num);
@@ -231,7 +259,6 @@ pub const Wayland = struct {
         _ = egl.eglSwapInterval(self.egl_display, 0);
     }
 
-
     pub fn deinit(self: *Wayland) void {
         if (self.xkb_state) |s| xkb.xkb_state_unref(s);
         if (self.xkb_keymap) |k| xkb.xkb_keymap_unref(k);
@@ -246,10 +273,15 @@ pub const Wayland = struct {
         if (self.egl_window) |w| wl.wl_egl_window_destroy(w);
 
         if (self.frame_callback) |cb| wl.wl_callback_destroy(cb);
+        if (self.solid_background_buffer) |buffer| wl.wl_buffer_destroy(buffer);
+        if (self.viewport) |vp| wl.wp_viewport_destroy(vp);
         if (self.decoration) |d| wl.zxdg_toplevel_decoration_v1_destroy(d);
         if (self.xdg_toplevel) |tl| wl.xdg_toplevel_destroy(tl);
         if (self.xdg_surface) |xs| wl.xdg_surface_destroy(xs);
         if (self.surface) |s| wl.wl_surface_destroy(s);
+        if (self.single_pixel_buffer_manager) |mgr| wl.wp_single_pixel_buffer_manager_v1_destroy(mgr);
+        if (self.linux_dmabuf) |linux_dmabuf| wl.zwp_linux_dmabuf_v1_destroy(linux_dmabuf);
+        if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
         if (self.pointer) |p| wl.wl_pointer_destroy(p);
         if (self.keyboard) |k| wl.wl_keyboard_destroy(k);
 
@@ -264,8 +296,78 @@ pub const Wayland = struct {
         if (wl.wl_display_dispatch(self.display) < 0) return error.DispatchFailed;
     }
 
+    pub fn dispatchPending(self: *Wayland) !void {
+        if (wl.wl_display_dispatch_pending(self.display) < 0) return error.DispatchFailed;
+    }
+
+    pub fn prepareRead(self: *Wayland) bool {
+        return wl.wl_display_prepare_read(self.display) == 0;
+    }
+
+    pub fn cancelRead(self: *Wayland) void {
+        wl.wl_display_cancel_read(self.display);
+    }
+
+    pub fn readEvents(self: *Wayland) !void {
+        if (wl.wl_display_read_events(self.display) < 0) return error.DispatchFailed;
+    }
+
     pub fn flush(self: *Wayland) void {
         _ = wl.wl_display_flush(self.display);
+    }
+
+    fn ensureViewport(self: *Wayland) ?*wl.wp_viewport {
+        if (self.viewport) |viewport| return viewport;
+        const viewporter = self.viewporter orelse return null;
+        const surface = self.surface orelse return null;
+        self.viewport = wl.wp_viewporter_get_viewport(viewporter, surface);
+        return self.viewport;
+    }
+
+    fn expand8ToU32(value: u8) u32 {
+        return @as(u32, value) * 0x01010101;
+    }
+
+    pub fn commitSolidBackground(self: *Wayland, r: u8, g: u8, b: u8, a: u8) bool {
+        const manager = self.single_pixel_buffer_manager orelse return false;
+        const surface = self.surface orelse return false;
+        const viewport = self.ensureViewport() orelse return false;
+        if (self.solid_background_buffer != null) return false;
+        const buffer = wl.wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+            manager,
+            expand8ToU32(r),
+            expand8ToU32(g),
+            expand8ToU32(b),
+            expand8ToU32(a),
+        ) orelse return false;
+        _ = wl.wl_buffer_add_listener(buffer, &solid_background_buffer_listener, @ptrCast(self));
+        self.solid_background_buffer = buffer;
+
+        wl.wp_viewport_set_destination(viewport, @intCast(self.width), @intCast(self.height));
+        wl.wl_surface_set_buffer_transform(surface, wl.WL_OUTPUT_TRANSFORM_NORMAL);
+        wl.wl_surface_attach(surface, buffer, 0, 0);
+        wl.wl_surface_damage_buffer(surface, 0, 0, 1, 1);
+        wl.wl_surface_commit(surface);
+        _ = wl.wl_display_flush(self.display);
+        return true;
+    }
+
+    pub fn clearSurfaceScaling(self: *Wayland) void {
+        if (self.viewport) |viewport| {
+            wl.wp_viewport_set_destination(viewport, -1, -1);
+        }
+    }
+
+    const solid_background_buffer_listener = wl.wl_buffer_listener{
+        .release = solidBackgroundBufferRelease,
+    };
+
+    fn solidBackgroundBufferRelease(data: ?*anyopaque, buffer: ?*wl.wl_buffer) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        if (self.solid_background_buffer == buffer) {
+            wl.wl_buffer_destroy(buffer);
+            self.solid_background_buffer = null;
+        }
     }
 
     pub fn swapBuffers(self: *Wayland) void {
@@ -348,6 +450,12 @@ pub const Wayland = struct {
             self.shm = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wl_shm_interface, 1));
         } else if (std.mem.eql(u8, iface, "zxdg_decoration_manager_v1")) {
             self.decoration_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zxdg_decoration_manager_v1_interface, 1));
+        } else if (std.mem.eql(u8, iface, "wp_viewporter")) {
+            self.viewporter = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_viewporter_interface, 1));
+        } else if (std.mem.eql(u8, iface, "wp_single_pixel_buffer_manager_v1")) {
+            self.single_pixel_buffer_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_single_pixel_buffer_manager_v1_interface, 1));
+        } else if (std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
+            self.linux_dmabuf = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_linux_dmabuf_v1_interface, @min(version, 3)));
         }
     }
 
@@ -389,20 +497,20 @@ pub const Wayland = struct {
         if (width > 0 and height > 0) {
             const w: u32 = @intCast(width);
             const h: u32 = @intCast(height);
-            // Store new dimensions; only do EGL resize if EGL is initialized
             if (w != self.width or h != self.height) {
                 self.width = w;
                 self.height = h;
-                if (self.egl_window != null) {
-                    self.resizeEgl(w, h);
-                    if (self.on_resize) |cb| cb(w, h);
-                }
+                if (self.egl_window != null) self.resizeEgl(w, h);
+                if (self.on_resize) |cb| cb(w, h);
             }
         }
     }
 
     fn xdgToplevelClose(data: ?*anyopaque, _: ?*wl.xdg_toplevel) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
+        if (rendererLogEnabled()) {
+            std.debug.print("mollusk: received xdg_toplevel.close\n", .{});
+        }
         self.closed = true;
     }
 
