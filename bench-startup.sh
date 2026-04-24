@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Benchmark terminal emulator startup times on Wayland.
 #
-# Usage: nix-shell -p foot kitty wezterm hyperfine --run ./bench-startup.sh
+# Usage: nix-shell --run ./bench-startup.sh
 
 set -euo pipefail
 
@@ -9,19 +9,37 @@ MOLLUSK="$(nix-build --no-out-link)/bin/mollusk"
 RUNS=20
 WARMUP=3
 
+if ! command -v hyperfine >/dev/null 2>&1; then
+  echo "hyperfine not found; run this from the project nix-shell" >&2
+  exit 1
+fi
+
+declare -a HYPERFINE_ARGS=(
+  --runs "$RUNS"
+  --warmup "$WARMUP"
+  --ignore-failure
+  --export-markdown /dev/stdout
+  --command-name mollusk   "$MOLLUSK -e /bin/true"
+)
+
+add_bench() {
+  local bin="$1"
+  local name="$2"
+  local cmd="$3"
+  if command -v "$bin" >/dev/null 2>&1; then
+    HYPERFINE_ARGS+=(--command-name "$name" "$cmd")
+  fi
+}
+
+add_bench foot foot "foot /bin/true"
+add_bench alacritty alacritty "alacritty -e /bin/true"
+add_bench kitty kitty "kitty -e /bin/true"
+add_bench wezterm wezterm "wezterm start -- /bin/true"
+add_bench ghostty ghostty "ghostty -e /bin/true"
+
 echo "=== Terminal Startup Benchmark ==="
 echo "Runs: $RUNS  Warmup: $WARMUP"
 echo "mollusk: $MOLLUSK"
 echo ""
 
-hyperfine \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --ignore-failure \
-  --export-markdown /dev/stdout \
-  --command-name mollusk   "$MOLLUSK -e /bin/true" \
-  --command-name foot      "foot /bin/true" \
-  --command-name alacritty "alacritty -e /bin/true" \
-  --command-name kitty     "kitty -e /bin/true" \
-  --command-name wezterm   "wezterm start -- /bin/true" \
-  --command-name ghostty   "ghostty -e /bin/true"
+hyperfine "${HYPERFINE_ARGS[@]}"
