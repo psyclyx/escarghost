@@ -1,4 +1,5 @@
 const std = @import("std");
+const snail = @import("snail");
 const config_mod = @import("config.zig");
 const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
@@ -9,9 +10,10 @@ const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const shared_dmabuf = @import("shared_dmabuf.zig");
+const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
-const gpu_renderer_proc = @import("gpu_helper.zig");
+const gpu_renderer = @import("gpu_renderer.zig");
 const perf = @import("perf.zig");
 
 const c = @cImport({
@@ -24,7 +26,6 @@ const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("sys/socket.h");
     @cInclude("sys/wait.h");
-    @cInclude("pthread.h");
     @cInclude("fcntl.h");
     @cInclude("signal.h");
     @cInclude("unistd.h");
@@ -97,9 +98,18 @@ fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const 
     return try allocator.dupe(u8, std.mem.sliceTo(file_ptr, 0));
 }
 
+const CellMetrics = struct { cell_width: f32, cell_height: f32 };
+
 /// Font discovery + parse + atlas build (all CPU, no GL).
-fn prepRenderer(renderer: *renderer_mod.Renderer, font_path_out: *[]const u8, cfg_font_path: []const u8, font_size: f32) !void {
-    const allocator = std.heap.smp_allocator;
+/// Returns the font path string (caller must free).
+fn prepRenderer(
+    allocator: std.mem.Allocator,
+    font_out: **snail.Font,
+    atlas_ref_out: **atlas_ref_mod.AtlasRef,
+    cell_metrics_out: *CellMetrics,
+    cfg_font_path: []const u8,
+    font_size: f32,
+) ![]const u8 {
     const timer = perf.Timer.now();
     const path = try findFontPath(allocator, cfg_font_path);
     if (debugStartupEnabled()) {
@@ -110,26 +120,64 @@ fn prepRenderer(renderer: *renderer_mod.Renderer, font_path_out: *[]const u8, cf
     if (debugStartupEnabled()) {
         std.debug.print("mollusk: prep font mmap ({d:.1}ms)\n", .{timer.elapsedMs()});
     }
-    try renderer.initCpu(allocator, data, font_size);
+
+    // Create font on heap
+    const font = try allocator.create(snail.Font);
+    errdefer allocator.destroy(font);
+    font.* = try snail.Font.init(data);
     if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep renderer cpu init ({d:.1}ms)\n", .{timer.elapsedMs()});
+        std.debug.print("mollusk: prep font init ({d:.1}ms)\n", .{timer.elapsedMs()});
     }
-    font_path_out.* = path;
+
+    // Build initial atlas with printable ASCII
+    const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    const initial_atlas = try snail.Atlas.initAscii(allocator, font, ascii);
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: prep atlas init ({d:.1}ms)\n", .{timer.elapsedMs()});
+    }
+
+    // Create AtlasRef on heap
+    const atlas_ref = try allocator.create(atlas_ref_mod.AtlasRef);
+    errdefer allocator.destroy(atlas_ref);
+    atlas_ref.* = try atlas_ref_mod.AtlasRef.init(allocator, initial_atlas);
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: prep atlas ref ({d:.1}ms)\n", .{timer.elapsedMs()});
+    }
+
+    // Compute cell metrics
+    const atlas = atlas_ref.load();
+    const metrics = renderer_mod.computeCellMetrics(font, atlas, font_size);
+    cell_metrics_out.* = .{ .cell_width = metrics.cell_width, .cell_height = metrics.cell_height };
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: prep cell metrics w={d:.1} h={d:.1} ({d:.1}ms)\n", .{
+            cell_metrics_out.cell_width,
+            cell_metrics_out.cell_height,
+            timer.elapsedMs(),
+        });
+    }
+
+    font_out.* = font;
+    atlas_ref_out.* = atlas_ref;
+    return path;
 }
 
 // Shared state for callbacks
 var g_term: *terminal_mod.Terminal = undefined;
 var g_pty: *pty_mod.Pty = undefined;
-var g_renderer: *renderer_mod.Renderer = undefined;
-var g_renderer_mutex: c.pthread_mutex_t = undefined;
+var g_font: *const snail.Font = undefined;
+var g_atlas_ref: *atlas_ref_mod.AtlasRef = undefined;
+var g_font_size: f32 = 14.0;
+var g_cell_width: f32 = 0;
+var g_cell_height: f32 = 0;
+var g_viewport_w: u32 = 0;
+var g_viewport_h: u32 = 0;
 
 var g_scroll_lines: u32 = 3;
 var g_needs_redraw: bool = false;
-var g_gpu_renderer_snapshot_dirty: bool = false;
-var g_gpu_renderer_reconfigure_requested: bool = false;
+var g_gpu_snapshot_dirty: bool = false;
+var g_gpu_reconfigure_requested: bool = false;
 var g_render_serial: u32 = 0;
 
-const GpuRendererBufferCount = shared_dmabuf.MaxBuffers;
 const RenderPath = enum {
     cpu,
     gpu,
@@ -163,38 +211,10 @@ fn markRenderDirty() void {
     g_render_serial +%= 1;
     if (g_render_serial == 0) g_render_serial = 1;
     g_needs_redraw = true;
-    g_gpu_renderer_snapshot_dirty = true;
+    g_gpu_snapshot_dirty = true;
 }
 
-fn lockRenderer() void {
-    _ = c.pthread_mutex_lock(&g_renderer_mutex);
-}
-
-fn unlockRenderer() void {
-    _ = c.pthread_mutex_unlock(&g_renderer_mutex);
-}
-
-const RendererMetrics = struct {
-    width: u32,
-    height: u32,
-    font_size: f32,
-    cell_width: f32,
-    cell_height: f32,
-};
-
-fn copyRendererMetrics(renderer: *renderer_mod.Renderer) RendererMetrics {
-    lockRenderer();
-    defer unlockRenderer();
-    return .{
-        .width = @intFromFloat(renderer.viewport_w),
-        .height = @intFromFloat(renderer.viewport_h),
-        .font_size = renderer.font_size,
-        .cell_width = renderer.cell_width,
-        .cell_height = renderer.cell_height,
-    };
-}
-
-const GpuRendererRestartBackoff = struct {
+const GpuRestartBackoff = struct {
     initial_delay_ms: u32,
     max_delay_ms: u32,
     jitter_percent: u32,
@@ -206,7 +226,7 @@ const GpuRendererRestartBackoff = struct {
         initial_delay_ms: u32,
         max_delay_ms: u32,
         jitter_percent: u32,
-    ) GpuRendererRestartBackoff {
+    ) GpuRestartBackoff {
         return .{
             .initial_delay_ms = initial_delay_ms,
             .max_delay_ms = @max(initial_delay_ms, max_delay_ms),
@@ -215,16 +235,16 @@ const GpuRendererRestartBackoff = struct {
         };
     }
 
-    fn clear(self: *GpuRendererRestartBackoff) void {
+    fn clear(self: *GpuRestartBackoff) void {
         self.deadline_ns = null;
         self.attempts = 0;
     }
 
-    fn scheduleImmediate(self: *GpuRendererRestartBackoff) void {
+    fn scheduleImmediate(self: *GpuRestartBackoff) void {
         self.deadline_ns = monotonicNowNs();
     }
 
-    fn scheduleRetry(self: *GpuRendererRestartBackoff) void {
+    fn scheduleRetry(self: *GpuRestartBackoff) void {
         const shift = @min(self.attempts, 31);
         const scaled = (@as(u64, self.initial_delay_ms) << @intCast(shift));
         const capped = @min(scaled, @as(u64, self.max_delay_ms));
@@ -242,12 +262,12 @@ const GpuRendererRestartBackoff = struct {
         self.attempts +|= 1;
     }
 
-    fn due(self: *const GpuRendererRestartBackoff) bool {
+    fn due(self: *const GpuRestartBackoff) bool {
         const deadline_ns = self.deadline_ns orelse return false;
         return monotonicNowNs() >= deadline_ns;
     }
 
-    fn timeoutMs(self: *const GpuRendererRestartBackoff) ?c_int {
+    fn timeoutMs(self: *const GpuRestartBackoff) ?c_int {
         const deadline_ns = self.deadline_ns orelse return null;
         const now_ns = monotonicNowNs();
         if (deadline_ns <= now_ns) return 0;
@@ -256,158 +276,6 @@ const GpuRendererRestartBackoff = struct {
         return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
     }
 };
-
-const GpuRendererFrontend = struct {
-    snapshot_fd: c_int = -1,
-    snapshot_map: ?*anyopaque = null,
-    snapshot: ?*render_snapshot.SharedSnapshot = null,
-
-    control_fd: c_int = -1,
-    child_pid: c_int = -1,
-    active: bool = false,
-    ready: bool = false,
-    render_in_flight: bool = false,
-    first_frame_presented: bool = false,
-
-    buffers: [GpuRendererBufferCount]shared_dmabuf.FrontendBuffer = undefined,
-    buffer_count: usize = 0,
-
-    fn ensureSnapshot(self: *GpuRendererFrontend) !void {
-        if (self.snapshot != null) return;
-
-        const size = @sizeOf(render_snapshot.SharedSnapshot);
-        const fd = c.memfd_create("mollusk-gpu-snapshot", @as(c_uint, 0));
-        if (fd < 0) return error.MemfdCreateFailed;
-        errdefer _ = c.close(fd);
-        setCloseOnExec(fd);
-
-        if (c.ftruncate(fd, @intCast(size)) < 0) return error.TruncateFailed;
-
-        const map = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, 0);
-        if (map == c.MAP_FAILED) return error.MmapFailed;
-
-        self.snapshot_fd = fd;
-        self.snapshot_map = map;
-        self.snapshot = @ptrCast(@alignCast(map));
-        self.snapshot.?.* = .{};
-    }
-
-    fn stopChild(self: *GpuRendererFrontend) void {
-        if (self.child_pid > 0) {
-            _ = c.kill(self.child_pid, c.SIGTERM);
-            var status: c_int = 0;
-            _ = c.waitpid(self.child_pid, &status, 0);
-        }
-        if (self.control_fd >= 0) _ = c.close(self.control_fd);
-
-        self.control_fd = -1;
-        self.child_pid = -1;
-        self.active = false;
-        self.ready = false;
-        self.render_in_flight = false;
-        self.first_frame_presented = false;
-    }
-
-    fn destroyBuffers(self: *GpuRendererFrontend) void {
-        for (self.buffers[0..self.buffer_count]) |*buffer| {
-            buffer.destroy();
-        }
-        self.buffer_count = 0;
-    }
-
-    fn start(self: *GpuRendererFrontend, renderer: *renderer_mod.Renderer, pty_fd: c_int) !void {
-        try self.ensureSnapshot();
-
-        self.stopChild();
-
-        var pair: [2]c_int = undefined;
-        if (c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, &pair) != 0) return error.SocketpairFailed;
-        errdefer {
-            _ = c.close(pair[0]);
-            _ = c.close(pair[1]);
-        }
-        setCloseOnExec(pair[0]);
-        setCloseOnExec(pair[1]);
-
-        const pid = c.fork();
-        if (pid < 0) return error.ForkFailed;
-
-        if (pid == 0) {
-            _ = c.close(pair[0]);
-            if (pty_fd >= 0) _ = c.close(pty_fd);
-                gpu_renderer_proc.run(
-                    pair[1],
-                    renderer,
-                    self.snapshot.?,
-                    GpuRendererBufferCount,
-                );
-        }
-
-        _ = c.close(pair[1]);
-        self.control_fd = pair[0];
-        self.child_pid = pid;
-        self.active = true;
-        self.ready = false;
-        self.render_in_flight = false;
-        self.first_frame_presented = false;
-    }
-
-    fn requestReconfigure(self: *GpuRendererFrontend, renderer: *renderer_mod.Renderer) !void {
-        if (!self.active) return error.HelperInactive;
-        self.ready = false;
-        self.render_in_flight = false;
-        try gpu_renderer_proc.writeRequest(self.control_fd, .{
-            .tag = .configure,
-            .width = @intFromFloat(renderer.viewport_w),
-            .height = @intFromFloat(renderer.viewport_h),
-            .font_size = renderer.font_size,
-            .cell_width = renderer.cell_width,
-            .cell_height = renderer.cell_height,
-        });
-    }
-
-    fn installBuffers(
-        self: *GpuRendererFrontend,
-        dmabuf_opaque: *anyopaque,
-        ready: gpu_renderer_proc.ReadyPacket,
-    ) !void {
-        self.destroyBuffers();
-        errdefer self.destroyBuffers();
-        errdefer closeReadyFds(ready);
-
-        const count = @min(@as(usize, ready.message.buffer_count), GpuRendererBufferCount);
-        for (0..count) |i| {
-            self.buffers[i] = try shared_dmabuf.FrontendBuffer.create(
-                dmabuf_opaque,
-                ready.fds[i],
-                ready.message.buffers[i],
-            );
-            self.buffers[i].attachListener();
-            self.buffer_count += 1;
-        }
-    }
-
-    fn deinit(self: *GpuRendererFrontend) void {
-        self.stopChild();
-        self.destroyBuffers();
-        if (self.snapshot_map) |map| _ = c.munmap(map, @sizeOf(render_snapshot.SharedSnapshot));
-        if (self.snapshot_fd >= 0) _ = c.close(self.snapshot_fd);
-    }
-
-    fn freeBufferIndex(self: *GpuRendererFrontend) ?u8 {
-        for (0..self.buffer_count) |i| {
-            if (self.buffers[i].released) return @intCast(i);
-        }
-        return null;
-    }
-};
-
-fn closeReadyFds(ready: gpu_renderer_proc.ReadyPacket) void {
-    const count = @min(@as(usize, ready.message.buffer_count), GpuRendererBufferCount);
-    for (ready.fds[0..count]) |fd| {
-        if (fd >= 0) _ = c.close(fd);
-    }
-}
 
 fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
@@ -517,120 +385,65 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
 var g_base_font_size: f32 = 14.0;
 
 fn zoomIn() void {
-    lockRenderer();
-    defer unlockRenderer();
-    g_renderer.font_size = @min(g_renderer.font_size + 1.0, 72.0);
-    applyZoomLocked();
+    g_font_size = @min(g_font_size + 1.0, 72.0);
+    applyZoom();
 }
 
 fn zoomOut() void {
-    lockRenderer();
-    defer unlockRenderer();
-    g_renderer.font_size = @max(g_renderer.font_size - 1.0, 6.0);
-    applyZoomLocked();
+    g_font_size = @max(g_font_size - 1.0, 6.0);
+    applyZoom();
 }
 
 fn zoomReset() void {
-    lockRenderer();
-    defer unlockRenderer();
-    g_renderer.font_size = g_base_font_size;
-    applyZoomLocked();
+    g_font_size = g_base_font_size;
+    applyZoom();
 }
 
-fn applyZoomLocked() void {
+fn applyZoom() void {
     // Recompute cell metrics for new font size
-    const units_per_em: f32 = @floatFromInt(g_renderer.font.unitsPerEm());
-    const scale = g_renderer.font_size / units_per_em;
-    const m_gid = g_renderer.font.glyphIndex('M') catch 0;
-    const m_info = g_renderer.atlas.getGlyph(m_gid);
-    g_renderer.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(g_renderer.font_size * 0.6);
-    g_renderer.cell_height = @ceil(g_renderer.font_size * 1.2);
+    const units_per_em: f32 = @floatFromInt(g_font.unitsPerEm());
+    const scale = g_font_size / units_per_em;
+    const m_gid = g_font.glyphIndex('M') catch 0;
+    const m_info = g_atlas_ref.load().getGlyph(m_gid);
+    g_cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(g_font_size * 0.6);
+    g_cell_height = @ceil(g_font_size * 1.2);
 
     // Resize terminal grid
-    const grid = g_renderer.computeGridSize(@intFromFloat(g_renderer.viewport_w), @intFromFloat(g_renderer.viewport_h));
+    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, g_viewport_w, g_viewport_h);
     if (grid.cols > 0 and grid.rows > 0) {
-        g_term.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.cell_width), @intFromFloat(g_renderer.cell_height)) catch {};
-        g_pty.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.viewport_w), @intFromFloat(g_renderer.viewport_h));
+        g_term.resize(grid.cols, grid.rows, @intFromFloat(g_cell_width), @intFromFloat(g_cell_height)) catch {};
+        g_pty.resize(grid.cols, grid.rows, g_viewport_w, g_viewport_h);
     }
 
-    // Invalidate vertex cache (cell positions changed)
-    g_renderer.generation += 1;
-    g_renderer.has_prev_frame = false;
-    g_renderer.clearCache();
     markRenderDirty();
-    g_gpu_renderer_reconfigure_requested = true;
+    g_gpu_reconfigure_requested = true;
 }
 
 fn onResize(w: u32, h: u32) void {
-    lockRenderer();
-    defer unlockRenderer();
-    const grid = g_renderer.computeGridSize(w, h);
+    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, w, h);
     if (grid.cols == 0 or grid.rows == 0) return;
-    g_renderer.setViewport(w, h);
-    g_term.resize(grid.cols, grid.rows, @intFromFloat(g_renderer.cell_width), @intFromFloat(g_renderer.cell_height)) catch {};
+    g_viewport_w = w;
+    g_viewport_h = h;
+    g_term.resize(grid.cols, grid.rows, @intFromFloat(g_cell_width), @intFromFloat(g_cell_height)) catch {};
     g_pty.resize(grid.cols, grid.rows, w, h);
     markRenderDirty();
-    g_gpu_renderer_reconfigure_requested = true;
+    g_gpu_reconfigure_requested = true;
 }
 
 fn onFocus(focused: bool) void {
     _ = focused;
 }
 
-fn renderCpuFrame(
-    wl: *wayland_mod.Wayland,
-    term: *terminal_mod.Terminal,
-    renderer: *renderer_mod.Renderer,
-    cfg: *const config_mod.Config,
-    atlas_thread: *atlas_owner.Frontend,
-) void {
-    const shm = wl.shm orelse return;
-    renderer.maybeResetAtlasForDebug() catch return;
-    var frame_opt = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
-    if (frame_opt) |*frame| {
-        defer frame.destroy();
-        lockRenderer();
-        const misses = frame.renderTerminal(
-            term,
-            &renderer.atlas,
-            &renderer.font,
-            renderer.font_size,
-            renderer.cell_width,
-            renderer.cell_height,
-            cfg.foreground,
-            cfg.background,
-        );
-        unlockRenderer();
-        atlas_thread.requestMany(&misses);
-        frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-        if (!wl.frame_pending) wl.requestFrame();
-    }
-}
-
-fn maybeQueueGpuRendererFrame(gpu: *GpuRendererFrontend, term: *terminal_mod.Terminal, renderer: *renderer_mod.Renderer) void {
-    if (!gpu.active or !gpu.ready or gpu.render_in_flight or !g_gpu_renderer_snapshot_dirty) return;
-    const buffer_index = gpu.freeBufferIndex() orelse return;
-
-    render_snapshot.capture(gpu.snapshot.?, term, &renderer.font) catch return;
-    if (debugRenderersEnabled()) {
-        std.debug.print("mollusk: queue gpu renderer frame buffer={} cells={} {}x{}\n", .{
-            buffer_index,
-            gpu.snapshot.?.header.cell_count,
-            gpu.snapshot.?.header.cols,
-            gpu.snapshot.?.header.rows,
-        });
-    }
-    gpu_renderer_proc.writeRequest(gpu.control_fd, .{
-        .tag = .render,
-        .buffer_index = buffer_index,
-        .serial = g_render_serial,
-    }) catch {
-        gpu.stopChild();
-        return;
+fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, term: *terminal_mod.Terminal) void {
+    if (!gpu.active or !gpu.ready or gpu.render_in_flight or !g_gpu_snapshot_dirty) return;
+    gpu.queueRender(term, g_render_serial) catch |err| switch (err) {
+        error.NotReady, error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot => return,
+        else => return,
     };
-
-    gpu.render_in_flight = true;
-    g_gpu_renderer_snapshot_dirty = false;
+    if (debugRenderersEnabled()) {
+        std.debug.print("mollusk: queued gpu renderer frame serial={}\n", .{g_render_serial});
+    }
+    g_gpu_snapshot_dirty = false;
 }
 
 fn combineTimeout(a: c_int, b_opt: ?c_int) c_int {
@@ -641,13 +454,10 @@ fn combineTimeout(a: c_int, b_opt: ?c_int) c_int {
 
 fn renderActivePath(
     active_path: RenderPath,
-    gpu: *const GpuRendererFrontend,
+    gpu: *const gpu_renderer.Frontend,
     cpu: *cpu_renderer_worker.Frontend,
-    atlas_thread: *atlas_owner.Frontend,
     wl: *wayland_mod.Wayland,
     term: *terminal_mod.Terminal,
-    renderer: *renderer_mod.Renderer,
-    cfg: *const config_mod.Config,
 ) void {
     if (active_path != .cpu or !g_needs_redraw) return;
     if (gpu.active and gpu.ready) return;
@@ -657,9 +467,8 @@ fn renderActivePath(
             error.Busy => return,
             else => return,
         };
-        const metrics = copyRendererMetrics(renderer);
-        cpu.queueRender(term, metrics.width, metrics.height, metrics.font_size, metrics.cell_width, metrics.cell_height, g_render_serial) catch |err| switch (err) {
-            error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot => return,
+        cpu.queueRender(term, g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height, g_render_serial) catch |err| switch (err) {
+            error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,
         };
         g_needs_redraw = false;
@@ -669,18 +478,14 @@ fn renderActivePath(
         return;
     }
     g_needs_redraw = false;
-    if (debugFramesEnabled()) {
-        std.debug.print("mollusk: rendering cpu renderer frame {}x{}\n", .{ wl.width, wl.height });
-    }
-    renderCpuFrame(wl, term, renderer, cfg, atlas_thread);
 }
 
 fn noteGpuUnavailable(
-    gpu: *GpuRendererFrontend,
+    gpu: *gpu_renderer.Frontend,
     active_path: *RenderPath,
-    restart: *GpuRendererRestartBackoff,
+    restart: *GpuRestartBackoff,
 ) void {
-    gpu.stopChild();
+    gpu.stop();
     if (debugRenderersEnabled()) {
         std.debug.print("mollusk: gpu renderer unavailable, switching to cpu renderer and scheduling restart\n", .{});
     }
@@ -691,31 +496,10 @@ fn noteGpuUnavailable(
     restart.scheduleRetry();
 }
 
-fn spawnGpuRenderer(
-    gpu: *GpuRendererFrontend,
-    renderer: *renderer_mod.Renderer,
-    pty_fd: c_int,
-    startup_timer: perf.Timer,
-    restart: *GpuRendererRestartBackoff,
-    label: []const u8,
-) void {
-    if (debugRenderersEnabled() or debugStartupEnabled()) {
-        std.debug.print("mollusk: {s} ({d:.1}ms)\n", .{ label, startup_timer.elapsedMs() });
-    }
-    gpu.start(renderer, pty_fd) catch |err| {
-        std.debug.print("mollusk: gpu renderer spawn failed: {}\n", .{err});
-        restart.scheduleRetry();
-        return;
-    };
-    restart.deadline_ns = null;
-}
-
 pub fn main(init: std.process.Init) !void {
     const startup_timer = perf.Timer.now();
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
-    _ = c.pthread_mutex_init(&g_renderer_mutex, null);
-    defer _ = c.pthread_mutex_destroy(&g_renderer_mutex);
 
     // Mesa hints — don't override if already set (0 = no overwrite)
     _ = c.setenv("MESA_NO_ERROR", "1", 0); // skip GL error checking
@@ -760,7 +544,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // ── Phase 1: config (fast, ~1ms) ──
+    // ── Phase 0: config + spawn GPU thread ──
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
     g_renderer_debug = rendererDebugOptions();
@@ -778,7 +562,31 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("mollusk: requested renderer mode={s}\n", .{@tagName(requested_render_path)});
     }
 
-    // ── Phase 2: Wayland connect + renderer prep ──
+    const gpu_allowed = requested_render_path != .cpu;
+    if (debugStartupEnabled() and !gpu_allowed) {
+        std.debug.print("mollusk: gpu renderer disabled by MOLLUSK_RENDERER=cpu\n", .{});
+    }
+
+    var gpu: gpu_renderer.Frontend = .{};
+    defer gpu.stop();
+    var gpu_restart = GpuRestartBackoff.init(
+        cfg.gpu_restart_initial_delay_ms,
+        cfg.gpu_restart_max_delay_ms,
+        cfg.gpu_restart_jitter_percent,
+    );
+
+    // Start GPU thread early — it begins EGL init immediately, no deps needed
+    if (gpu_allowed) {
+        gpu.start() catch |err| {
+            std.debug.print("mollusk: gpu renderer thread start failed: {}\n", .{err});
+            gpu_restart.scheduleRetry();
+        };
+        if (debugStartupEnabled()) {
+            std.debug.print("mollusk: gpu renderer thread started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        }
+    }
+
+    // ── Phase 1: Wayland connect + 1px background ──
     var wl: wayland_mod.Wayland = undefined;
     try wl.init(800, 600, "mollusk");
     defer wl.deinit();
@@ -799,45 +607,57 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var renderer: renderer_mod.Renderer = undefined;
-    defer renderer.deinit();
-    var font_path: []const u8 = "";
-    try prepRenderer(&renderer, &font_path, cfg.font_path, cfg.font_size);
-    renderer.setDebugLogs(g_renderer_debug);
-    renderer.setDebugResetAtlas(runtime_flags.reset_atlas_each_frame);
-    defer allocator.free(font_path);
-
-    var gpu: GpuRendererFrontend = .{};
-    defer gpu.deinit();
-    var gpu_restart = GpuRendererRestartBackoff.init(
-        cfg.gpu_restart_initial_delay_ms,
-        cfg.gpu_restart_max_delay_ms,
-        cfg.gpu_restart_jitter_percent,
-    );
-    const gpu_allowed = requested_render_path != .cpu;
-    if (debugStartupEnabled() and !gpu_allowed) {
-        std.debug.print("mollusk: gpu renderer disabled by MOLLUSK_RENDERER=cpu\n", .{});
-    }
     if (requested_render_path == .gpu and wl.linux_dmabuf == null) {
         std.debug.print("mollusk: GPU renderer requested but linux-dmabuf is unavailable; falling back to CPU\n", .{});
     }
-    if (gpu_allowed and wl.linux_dmabuf != null) {
-        spawnGpuRenderer(&gpu, &renderer, -1, startup_timer, &gpu_restart, "spawning gpu renderer");
+
+    // ── Phase 2: font + atlas init ──
+    var font_ptr: *snail.Font = undefined;
+    var atlas_ref_ptr: *atlas_ref_mod.AtlasRef = undefined;
+    var cell_metrics: CellMetrics = undefined;
+    const font_path = try prepRenderer(allocator, &font_ptr, &atlas_ref_ptr, &cell_metrics, cfg.font_path, cfg.font_size);
+    defer allocator.free(font_path);
+
+    g_font = font_ptr;
+    g_atlas_ref = atlas_ref_ptr;
+    g_font_size = cfg.font_size;
+    g_cell_width = cell_metrics.cell_width;
+    g_cell_height = cell_metrics.cell_height;
+
+    // ── Phase 3: spawn atlas + CPU threads, fork PTY ──
+    var atlas_thread: atlas_owner.Frontend = .{};
+    defer atlas_thread.stop();
+    atlas_thread.start(atlas_ref_ptr) catch |err| {
+        std.debug.print("mollusk: atlas owner start failed: {}\n", .{err});
+    };
+
+    var cpu: cpu_renderer_worker.Frontend = .{};
+    defer cpu.stop();
+    if (wl.shm) |shm| {
+        cpu.start(@ptrCast(shm), atlas_ref_ptr, font_ptr, &atlas_thread, wl.width, wl.height) catch |err| {
+            std.debug.print("mollusk: cpu renderer start failed: {}\n", .{err});
+        };
     }
 
-    // ── Phase 3: fork PTY ──
-    const grid = renderer.computeGridSize(wl.width, wl.height);
-    renderer.setViewport(wl.width, wl.height);
-    if (gpu.active) {
-        lockRenderer();
-        gpu.requestReconfigure(&renderer) catch |err| {
-            unlockRenderer();
+    // If GPU context is ready, send configure with shared state
+    if (gpu.active and gpu.context_ready) {
+        gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+        gpu.requestConfigure(wl.width, wl.height, g_font_size, g_cell_width, g_cell_height) catch |err| {
             std.debug.print("mollusk: gpu renderer initial configure failed: {}\n", .{err});
-            gpu.stopChild();
+            gpu.stop();
             gpu_restart.scheduleRetry();
         };
-        if (gpu.active) unlockRenderer();
+        if (debugStartupEnabled()) {
+            std.debug.print("mollusk: gpu renderer configured ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        }
+    } else if (gpu.active) {
+        // Context not ready yet — will configure when context_ready arrives
+        gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
     }
+
+    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, wl.width, wl.height);
+    g_viewport_w = wl.width;
+    g_viewport_h = wl.height;
 
     var term: terminal_mod.Terminal = undefined;
     try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
@@ -853,7 +673,6 @@ pub fn main(init: std.process.Init) !void {
 
     g_term = &term;
     g_pty = &pty;
-    g_renderer = &renderer;
     wl.on_key = onKey;
     wl.on_mouse = onMouse;
     wl.on_resize = onResize;
@@ -861,28 +680,16 @@ pub fn main(init: std.process.Init) !void {
     g_scroll_lines = cfg.scroll_lines;
     g_base_font_size = cfg.font_size;
     g_needs_redraw = false;
-    g_gpu_renderer_snapshot_dirty = false;
-    g_gpu_renderer_reconfigure_requested = false;
+    g_gpu_snapshot_dirty = false;
+    g_gpu_reconfigure_requested = false;
     g_render_serial = 0;
 
     if (debugStartupEnabled()) {
         std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
     }
 
-    // ── Phase 4: renderer startup + SHM first frame + event loop ──
-    var cpu: cpu_renderer_worker.Frontend = .{};
-    defer cpu.stop();
-    var atlas_thread: atlas_owner.Frontend = .{};
-    defer atlas_thread.stop();
+    // ── Phase 4: early PTY drain + event loop ──
     var active_render_path: RenderPath = .cpu;
-    atlas_thread.start(&renderer, @ptrCast(&g_renderer_mutex)) catch |err| {
-        std.debug.print("mollusk: atlas owner start failed: {}\n", .{err});
-    };
-    if (wl.shm) |shm| {
-        cpu.start(@ptrCast(shm), &renderer, @ptrCast(&g_renderer_mutex), &atlas_thread, wl.width, wl.height) catch |err| {
-            std.debug.print("mollusk: cpu renderer start failed: {}\n", .{err});
-        };
-    }
 
     // Drain early PTY output
     var have_early_output = false;
@@ -905,32 +712,26 @@ pub fn main(init: std.process.Init) !void {
 
     if (have_early_output) {
         markRenderDirty();
-        if (cpu.active) {
-            renderActivePath(active_render_path, &gpu, &cpu, &atlas_thread, &wl, &term, &renderer, &cfg);
-        } else {
-            renderCpuFrame(&wl, &term, &renderer, &cfg, &atlas_thread);
-            std.debug.print("mollusk: SHM paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
-        }
+        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
     }
-    g_gpu_renderer_snapshot_dirty = have_early_output;
+    g_gpu_snapshot_dirty = have_early_output;
 
-    // ── Event loop (frontend Wayland + PTY, gpu renderer process) ──
+    // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
 
     main_loop: while (!wl.closed and !child_exited) {
         if (!gpu.active and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
-            cpu.stop();
-            atlas_thread.stop();
-            spawnGpuRenderer(&gpu, &renderer, pty.master_fd, startup_timer, &gpu_restart, "restarting gpu renderer");
-            atlas_thread.start(&renderer, @ptrCast(&g_renderer_mutex)) catch |err| {
-                std.debug.print("mollusk: atlas owner restart failed: {}\n", .{err});
+            gpu.start() catch |err| {
+                std.debug.print("mollusk: gpu renderer restart failed: {}\n", .{err});
+                gpu_restart.scheduleRetry();
+                continue;
             };
-            if (wl.shm) |shm| {
-                cpu.start(@ptrCast(shm), &renderer, @ptrCast(&g_renderer_mutex), &atlas_thread, wl.width, wl.height) catch |err| {
-                    std.debug.print("mollusk: cpu renderer restart failed: {}\n", .{err});
-                };
+            gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+            if (debugRenderersEnabled() or debugStartupEnabled()) {
+                std.debug.print("mollusk: restarting gpu renderer ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
+            gpu_restart.deadline_ns = null;
         }
 
         while (!wl.prepareRead()) {
@@ -940,24 +741,21 @@ pub fn main(init: std.process.Init) !void {
             };
         }
 
-        if (g_gpu_renderer_reconfigure_requested) {
-            g_gpu_renderer_reconfigure_requested = false;
-            if (gpu.active) {
-                lockRenderer();
-                gpu.requestReconfigure(&renderer) catch |err| {
-                    unlockRenderer();
+        if (g_gpu_reconfigure_requested) {
+            g_gpu_reconfigure_requested = false;
+            if (gpu.active and gpu.context_ready) {
+                gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
                     std.debug.print("mollusk: gpu renderer reconfigure failed: {}\n", .{err});
                     noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                     continue;
                 };
-                unlockRenderer();
             } else if (gpu_allowed and wl.linux_dmabuf != null) {
                 gpu_restart.scheduleImmediate();
             }
         }
 
-        maybeQueueGpuRendererFrame(&gpu, &term, &renderer);
-        renderActivePath(active_render_path, &gpu, &cpu, &atlas_thread, &wl, &term, &renderer, &cfg);
+        maybeQueueGpuRendererFrame(&gpu, &term);
+        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
         wl.flush();
 
         // Key repeat timeout — wake up in time for next repeat event
@@ -971,7 +769,7 @@ pub fn main(init: std.process.Init) !void {
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },
             .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = if (gpu.active) gpu.control_fd else -1, .events = if (gpu.active) c.POLLIN else 0, .revents = 0 },
+            .{ .fd = if (gpu.active) gpu.responseFd() else -1, .events = if (gpu.active) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (cpu.active) cpu.responseFd() else -1, .events = if (cpu.active) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (atlas_thread.active) atlas_thread.responseFd() else -1, .events = if (atlas_thread.active) c.POLLIN else 0, .revents = 0 },
         };
@@ -998,79 +796,74 @@ pub fn main(init: std.process.Init) !void {
         };
 
         if (pollfds[2].fd >= 0 and pollfds[2].revents & c.POLLIN != 0) {
-            const resp_opt = gpu_renderer_proc.readResponse(gpu.control_fd) catch null;
+            const resp_opt = gpu.readResponse() catch null;
             if (resp_opt) |resp| {
-                switch (resp) {
-                    .ready => |ready| {
+                switch (resp.tag) {
+                    .context_ready => {
+                        if (debugRenderersEnabled() or debugStartupEnabled()) {
+                            std.debug.print("mollusk: gpu renderer context ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                        }
+                        // Now we can configure
+                        if (gpu.font == null) {
+                            gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+                        }
+                        gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
+                            std.debug.print("mollusk: gpu renderer configure after context_ready failed: {}\n", .{err});
+                            noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                            continue;
+                        };
+                    },
+                    .ready => {
                         if (wl.linux_dmabuf) |linux_dmabuf| {
-                            gpu.installBuffers(@ptrCast(linux_dmabuf), ready) catch |err| {
-                                closeReadyFds(ready);
+                            gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |err| {
                                 std.debug.print("mollusk: GPU dmabuf import failed: {}\n", .{err});
                                 noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                                 continue;
                             };
-                            gpu.ready = true;
-                            gpu.render_in_flight = false;
-                            g_gpu_renderer_snapshot_dirty = true;
+                            g_gpu_snapshot_dirty = true;
                             gpu_restart.clear();
                             if (debugRenderersEnabled() or debugStartupEnabled()) {
                                 std.debug.print("mollusk: gpu renderer ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                             }
                         } else {
-                            closeReadyFds(ready);
                             noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                         }
                     },
-                    .simple => |simple| switch (simple.tag) {
-                        .frame => {
-                            if (simple.serial != g_render_serial) {
-                                gpu.render_in_flight = false;
-                            } else {
-                                if (debugRenderersEnabled()) {
-                                    std.debug.print("mollusk: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
-                                        simple.buffer_index,
-                                        startup_timer.elapsedMs(),
-                                    });
-                                }
-                                if (simple.buffer_index < gpu.buffer_count) {
-                                    gpu.buffers[simple.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                                    if (!wl.frame_pending) wl.requestFrame();
-                                    if (active_render_path != .gpu) {
-                                        if (debugFramesEnabled()) {
-                                            std.debug.print("mollusk: switching render path cpu->gpu\n", .{});
-                                        }
-                                        active_render_path = .gpu;
+                    .frame => {
+                        if (resp.serial != g_render_serial) {
+                            // Stale frame, ignore
+                        } else {
+                            if (debugRenderersEnabled()) {
+                                std.debug.print("mollusk: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
+                                    resp.buffer_index,
+                                    startup_timer.elapsedMs(),
+                                });
+                            }
+                            if (resp.buffer_index < gpu.frontend_buffer_count) {
+                                gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                                if (!wl.frame_pending) wl.requestFrame();
+                                if (active_render_path != .gpu) {
+                                    if (debugFramesEnabled()) {
+                                        std.debug.print("mollusk: switching render path cpu->gpu\n", .{});
                                     }
-                                    if (!gpu.first_frame_presented) {
-                                        if (debugFramesEnabled() or debugRenderersEnabled() or debugStartupEnabled()) {
-                                            std.debug.print("mollusk: first gpu renderer paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
-                                        }
-                                        gpu.first_frame_presented = true;
-                                    }
+                                    active_render_path = .gpu;
                                 }
-                                if (!g_gpu_renderer_snapshot_dirty) {
-                                    g_needs_redraw = false;
-                                    term.resetDirty();
+                                if (!gpu.first_frame_presented) {
+                                    if (debugFramesEnabled() or debugRenderersEnabled() or debugStartupEnabled()) {
+                                        std.debug.print("mollusk: first gpu renderer paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                                    }
+                                    gpu.first_frame_presented = true;
                                 }
                             }
-                            gpu.render_in_flight = false;
-                        },
-                        .failed => {
-                            std.debug.print("mollusk: gpu renderer initialization failed\n", .{});
-                            noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
-                        },
-                        .ready => {},
-                        .atlas_missing => {},
-                    },
-                    .atlas_missing => |missing| {
-                        atlas_thread.requestMany(&missing.misses);
-                        gpu.render_in_flight = false;
-                        if (active_render_path == .gpu) {
-                            active_render_path = .cpu;
-                            g_needs_redraw = true;
+                            if (!g_gpu_snapshot_dirty) {
+                                g_needs_redraw = false;
+                                term.resetDirty();
+                            }
                         }
-                        gpu.stopChild();
-                        gpu_restart.scheduleImmediate();
+                    },
+                    .failed => {
+                        std.debug.print("mollusk: gpu renderer failed\n", .{});
+                        noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                     },
                 }
             } else {
@@ -1115,11 +908,6 @@ pub fn main(init: std.process.Init) !void {
                             });
                         }
                         markRenderDirty();
-                        if (gpu.active) {
-                            if (active_render_path == .gpu) active_render_path = .cpu;
-                            gpu.stopChild();
-                            gpu_restart.scheduleImmediate();
-                        }
                     },
                     .failed => {
                         std.debug.print("mollusk: atlas owner update failed for {} codepoints\n", .{resp.requested_count});
@@ -1131,8 +919,8 @@ pub fn main(init: std.process.Init) !void {
         // After zoom/resize, draw before reading PTY so the reflowed
         // content is presented before the shell's SIGWINCH response
         // can clear the prompt line.
-        maybeQueueGpuRendererFrame(&gpu, &term, &renderer);
-        renderActivePath(active_render_path, &gpu, &cpu, &atlas_thread, &wl, &term, &renderer, &cfg);
+        maybeQueueGpuRendererFrame(&gpu, &term);
+        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
 
         if (pollfds[1].revents & c.POLLIN != 0) {
             while (true) {
@@ -1162,10 +950,10 @@ pub fn main(init: std.process.Init) !void {
             child_exited = true;
         }
 
-        maybeQueueGpuRendererFrame(&gpu, &term, &renderer);
-        renderActivePath(active_render_path, &gpu, &cpu, &atlas_thread, &wl, &term, &renderer, &cfg);
+        maybeQueueGpuRendererFrame(&gpu, &term);
+        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
 
-        maybeQueueGpuRendererFrame(&gpu, &term, &renderer);
+        maybeQueueGpuRendererFrame(&gpu, &term);
     }
 
     renderer_mod.Renderer.frame_stats.log("frame");

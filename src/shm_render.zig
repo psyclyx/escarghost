@@ -5,7 +5,6 @@
 const std = @import("std");
 const snail = @import("snail");
 const cpu_renderer = @import("cpu_renderer");
-const atlas_owner = @import("atlas_owner.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const terminal_mod = @import("terminal.zig");
 const render_snapshot = @import("render_snapshot.zig");
@@ -407,7 +406,6 @@ fn renderSnapshotWithCpuRenderer(
 }
 
 pub fn renderSnapshotToMemory(
-    atlas_thread: ?*atlas_owner.Frontend,
     map_ptr: *anyopaque,
     width: u32,
     height: u32,
@@ -418,8 +416,7 @@ pub fn renderSnapshotToMemory(
     font_size: f32,
     cell_width: f32,
     cell_height: f32,
-) void {
+) glyph_misses.Set {
     var renderer = cpu_renderer.CpuRenderer.init(@ptrCast(map_ptr), width, height, stride);
-    const misses = renderSnapshotWithCpuRenderer(&renderer, snapshot, atlas, font, font_size, cell_width, cell_height);
-    if (atlas_thread) |thread| thread.requestMany(&misses);
+    return renderSnapshotWithCpuRenderer(&renderer, snapshot, atlas, font, font_size, cell_width, cell_height);
 }

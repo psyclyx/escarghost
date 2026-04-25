@@ -1,6 +1,6 @@
 const std = @import("std");
 const snail = @import("snail");
-const renderer_mod = @import("renderer.zig");
+const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const perf = @import("perf.zig");
@@ -40,8 +40,7 @@ fn atlasDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const Frontend = struct {
-    renderer: *renderer_mod.Renderer = undefined,
-    renderer_mutex: *anyopaque = undefined,
+    atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
@@ -55,12 +54,11 @@ pub const Frontend = struct {
         return self.response_fds[0];
     }
 
-    pub fn start(self: *Frontend, renderer: *renderer_mod.Renderer, renderer_mutex: *anyopaque) !void {
+    pub fn start(self: *Frontend, ref: *atlas_ref_mod.AtlasRef) !void {
         if (self.active) return;
         const timer = perf.Timer.now();
         self.* = .{
-            .renderer = renderer,
-            .renderer_mutex = renderer_mutex,
+            .atlas_ref = ref,
         };
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
@@ -128,6 +126,8 @@ pub const Frontend = struct {
         if (atlasDebugEnabled()) {
             std.debug.print("mollusk[atlas-owner] thread running\n", .{});
         }
+        const allocator = self.atlas_ref.allocator;
+
         while (true) {
             var local_pending: glyph_misses.Set = .{};
             {
@@ -146,12 +146,12 @@ pub const Frontend = struct {
             }
 
             const timer = perf.Timer.now();
-            const renderer_mutex: *c.pthread_mutex_t = @ptrCast(@alignCast(self.renderer_mutex));
-            _ = c.pthread_mutex_lock(renderer_mutex);
-            defer _ = c.pthread_mutex_unlock(renderer_mutex);
 
-            const before_pages = self.renderer.atlas.pageCount();
-            const next = self.renderer.atlas.extendCodepoints(local_pending.slice()) catch {
+            // Read current atlas (lock-free).
+            const current = self.atlas_ref.load();
+            const before_pages = current.pageCount();
+
+            const maybe_next = current.extendCodepoints(local_pending.slice()) catch {
                 atlasDebug(timer, "extend failed for {} codepoints", .{local_pending.count});
                 writeResponse(self.response_fds[1], .{
                     .tag = .failed,
@@ -160,20 +160,23 @@ pub const Frontend = struct {
                 continue;
             };
 
-            if (next) |atlas_next| {
-                _ = snail.replaceAtlas(&self.renderer.atlas, atlas_next);
-                if (self.renderer.gpu_initialized) {
-                    self.renderer.atlas_view = self.renderer.snail_renderer.uploadAtlas(&self.renderer.atlas);
-                } else {
-                    self.renderer.atlas_view = .{ .atlas = &self.renderer.atlas, .layer_base = 0 };
-                }
-                self.renderer.generation += 1;
-                self.renderer.has_prev_frame = false;
-                self.renderer.prev_cursor_visible = false;
-                self.renderer.prev_cursor_in_viewport = false;
-                self.renderer.clearCache();
+            if (maybe_next) |next_atlas| {
+                // Move the new atlas to the heap and publish atomically.
+                const heap_atlas = allocator.create(snail.Atlas) catch {
+                    atlasDebug(timer, "alloc failed for atlas", .{});
+                    var discard = next_atlas;
+                    discard.deinit();
+                    writeResponse(self.response_fds[1], .{
+                        .tag = .failed,
+                        .requested_count = local_pending.count,
+                    });
+                    continue;
+                };
+                heap_atlas.* = next_atlas;
 
-                const after_pages = self.renderer.atlas.pageCount();
+                const after_pages = heap_atlas.pageCount();
+                self.atlas_ref.publish(heap_atlas);
+
                 atlasDebug(timer, "extended {} codepoints pages {}->{}", .{
                     local_pending.count,
                     before_pages,

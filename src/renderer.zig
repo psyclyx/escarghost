@@ -1,6 +1,7 @@
 const std = @import("std");
 const snail = @import("snail");
 const terminal_mod = @import("terminal.zig");
+const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
@@ -17,7 +18,6 @@ const gl = @cImport({
     @cInclude("GL/glext.h");
 });
 const fc = @cImport(@cInclude("fontconfig/fontconfig.h"));
-const libc = @cImport(@cInclude("stdlib.h"));
 
 fn detectSubpixelOrder() snail.SubpixelOrder {
     const pattern = fc.FcNameParse(":") orelse return .rgb;
@@ -93,22 +93,37 @@ fn patchVecY(data: []f32, delta: f32) void {
     }
 }
 
-fn startupDebugEnabledFromEnv() bool {
-    if (libc.getenv("MOLLUSK_LOG")) |value|
-        return render_env.parseRendererDebug(std.mem.sliceTo(value, 0)).startup;
-    return false;
+/// Compute font cell metrics from a font and atlas.
+pub fn computeCellMetrics(font: *const snail.Font, atlas: *const snail.Atlas, font_size: f32) struct { cell_width: f32, cell_height: f32 } {
+    const units_per_em: f32 = @floatFromInt(font.unitsPerEm());
+    const scale = font_size / units_per_em;
+    const m_gid = font.glyphIndex('M') catch 0;
+    const m_info = atlas.getGlyph(m_gid);
+    return .{
+        .cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6),
+        .cell_height = @ceil(font_size * 1.2),
+    };
 }
 
-fn startupDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
-    if (!startupDebugEnabledFromEnv()) return;
-    std.debug.print("mollusk: " ++ fmt ++ " ({d:.1}ms)\n", args ++ .{timer.elapsedMs()});
+/// Compute grid dimensions from cell metrics and pixel size.
+pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h: u32) struct { cols: u16, rows: u16 } {
+    return .{
+        .cols = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_w)) / cell_width))),
+        .rows = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_h)) / cell_height))),
+    };
 }
 
+/// GPU renderer state. Owned exclusively by the GPU renderer thread.
+/// Reads the shared font (immutable) and atlas (via AtlasRef, lock-free).
 pub const Renderer = struct {
-    font: snail.Font,
-    atlas: snail.Atlas,
-    atlas_view: snail.AtlasView,
+    // Shared references (not owned)
+    font: *const snail.Font,
+    atlas_ref: *atlas_ref_mod.AtlasRef,
+
+    // GPU-private state
     snail_renderer: snail.Renderer,
+    atlas_view: snail.AtlasView = .{ .atlas = undefined, .layer_base = 0 },
+    atlas_generation: u64 = 0,
 
     row_cache: std.AutoHashMap(u64, CacheEntry),
     generation: u64 = 0,
@@ -130,7 +145,6 @@ pub const Renderer = struct {
     allocator: std.mem.Allocator,
     max_cols: u16,
     draw_buffers_ready: bool = false,
-    gpu_initialized: bool = false,
     framebuffer_srgb: bool = true,
     debug_log_renderers: bool = false,
     debug_log_frames: bool = false,
@@ -145,56 +159,61 @@ pub const Renderer = struct {
 
     pub var frame_stats: perf.FrameStats = .{};
 
-    pub fn initCpu(self: *Renderer, allocator: std.mem.Allocator, font_data: []const u8, font_size: f32) !void {
-        const timer = perf.Timer.now();
-        self.allocator = allocator;
-        self.font_size = font_size;
-        self.viewport_w = 0;
-        self.viewport_h = 0;
-        self.has_prev_frame = false;
-        self.generation = 0;
-        self.color_hash = 0;
-        self.cache_bytes = 0;
-        self.prev_cursor_x = 0;
-        self.prev_cursor_y = 0;
-        self.prev_cursor_in_viewport = false;
-        self.draw_buffers_ready = false;
-        self.gpu_initialized = false;
-        self.framebuffer_srgb = true;
+    /// Initialize the GPU renderer. Requires an active EGL/GL context.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        font: *const snail.Font,
+        atlas_ref: *atlas_ref_mod.AtlasRef,
+        font_size: f32,
+        cell_width: f32,
+        cell_height: f32,
+    ) !Renderer {
+        var snail_renderer = try snail.Renderer.init();
+        errdefer snail_renderer.deinit();
 
-        self.font = try snail.Font.init(font_data);
-        startupDebug(timer, "renderer font init", .{});
-        errdefer self.font.deinit();
-        self.atlas = try snail.Atlas.initAscii(allocator, &self.font, &snail.ASCII_PRINTABLE);
-        startupDebug(timer, "renderer ascii atlas init", .{});
-        errdefer self.atlas.deinit();
-        self.atlas_view = .{ .atlas = &self.atlas, .layer_base = 0 };
+        const atlas = atlas_ref.load();
+        const atlas_view = snail_renderer.uploadAtlas(atlas);
+        snail_renderer.setSubpixelOrder(detectSubpixelOrder());
+        snail_renderer.setFillRule(.non_zero);
 
-        const units_per_em: f32 = @floatFromInt(self.font.unitsPerEm());
-        const scale = font_size / units_per_em;
-        const m_gid = self.font.glyphIndex('M') catch 0;
-        const m_info = self.atlas.getGlyph(m_gid);
-        self.cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6);
-        self.cell_height = @ceil(font_size * 1.2);
-
-        self.max_cols = 400;
-        self.row_cache = std.AutoHashMap(u64, CacheEntry).init(allocator);
-        self.draw_text = empty_f32_slice;
-        self.draw_vec = empty_f32_slice;
-        self.scratch_text = empty_f32_slice;
-        self.scratch_vec = empty_f32_slice;
-        startupDebug(timer, "renderer cpu bootstrap ready", .{});
+        return .{
+            .font = font,
+            .atlas_ref = atlas_ref,
+            .snail_renderer = snail_renderer,
+            .atlas_view = atlas_view,
+            .atlas_generation = atlas_ref.loadGeneration(),
+            .row_cache = std.AutoHashMap(u64, CacheEntry).init(allocator),
+            .draw_text = empty_f32_slice,
+            .draw_vec = empty_f32_slice,
+            .scratch_text = empty_f32_slice,
+            .scratch_vec = empty_f32_slice,
+            .cell_width = cell_width,
+            .cell_height = cell_height,
+            .font_size = font_size,
+            .viewport_w = 0,
+            .viewport_h = 0,
+            .allocator = allocator,
+            .max_cols = 400,
+        };
     }
 
-    pub fn initGpu(self: *Renderer) !void {
-        self.snail_renderer = try snail.Renderer.init();
-        self.atlas_view = self.snail_renderer.uploadAtlas(&self.atlas);
-        self.snail_renderer.setSubpixelOrder(detectSubpixelOrder());
-        self.snail_renderer.setFillRule(.non_zero);
-        self.gpu_initialized = true;
-        if (self.debug_log_renderers) {
-            std.debug.print("mollusk[gpu-renderer]: backend {s}\n", .{self.snail_renderer.backendName()});
+    /// Load the current atlas from AtlasRef. Re-upload to GPU if generation changed.
+    fn refreshAtlas(self: *Renderer) *const snail.Atlas {
+        const gen = self.atlas_ref.loadGeneration();
+        const atlas = self.atlas_ref.load();
+        if (gen != self.atlas_generation) {
+            self.atlas_view = self.snail_renderer.uploadAtlas(atlas);
+            self.atlas_generation = gen;
+            self.generation += 1;
+            self.has_prev_frame = false;
+            self.prev_cursor_visible = false;
+            self.prev_cursor_in_viewport = false;
+            self.clearCache();
+            if (self.debug_log_atlas) {
+                std.debug.print("mollusk[gpu-renderer]: atlas re-uploaded gen={}\n", .{gen});
+            }
         }
+        return atlas;
     }
 
     fn color4(self: *const Renderer, rgb: Rgb, alpha: f32) [4]f32 {
@@ -213,14 +232,11 @@ pub const Renderer = struct {
             self.allocator.free(self.draw_vec);
             self.allocator.free(self.draw_text);
         }
-        if (self.gpu_initialized) self.snail_renderer.deinit();
-        self.atlas.deinit();
-        self.font.deinit();
+        self.snail_renderer.deinit();
     }
 
     pub fn ensureDrawBuffers(self: *Renderer) !void {
         if (self.draw_buffers_ready) return;
-        const timer = perf.Timer.now();
         const max_cells: usize = 400 * 200;
         self.draw_text = try self.allocator.alloc(f32, max_cells * snail.FLOATS_PER_GLYPH);
         errdefer self.allocator.free(self.draw_text);
@@ -230,7 +246,6 @@ pub const Renderer = struct {
         errdefer self.allocator.free(self.scratch_text);
         self.scratch_vec = try self.allocator.alloc(f32, @as(usize, self.max_cols) * @as(usize, snail.VECTOR_FLOATS_PER_PRIMITIVE) * 3);
         self.draw_buffers_ready = true;
-        startupDebug(timer, "renderer draw buffers ready", .{});
     }
 
     pub fn clearCache(self: *Renderer) void {
@@ -243,21 +258,6 @@ pub const Renderer = struct {
         self.cache_bytes = 0;
     }
 
-    pub fn computeGridSize(self: *const Renderer, pixel_w: u32, pixel_h: u32) struct { cols: u16, rows: u16 } {
-        return .{
-            .cols = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_w)) / self.cell_width))),
-            .rows = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_h)) / self.cell_height))),
-        };
-    }
-
-    pub fn setViewport(self: *Renderer, w: u32, h: u32) void {
-        self.viewport_w = @floatFromInt(w);
-        self.viewport_h = @floatFromInt(h);
-        self.has_prev_frame = false;
-        self.generation += 1;
-        self.clearCache();
-    }
-
     pub fn setDebugResetAtlas(self: *Renderer, enabled: bool) void {
         self.debug_reset_atlas_each_frame = enabled;
     }
@@ -266,30 +266,6 @@ pub const Renderer = struct {
         self.debug_log_renderers = options.renderers;
         self.debug_log_frames = options.frames;
         self.debug_log_atlas = options.atlas;
-    }
-
-    fn resetAtlasToAscii(self: *Renderer) !void {
-        var next = try snail.Atlas.initAscii(self.allocator, &self.font, &snail.ASCII_PRINTABLE);
-        errdefer next.deinit();
-        self.atlas.deinit();
-        self.atlas = next;
-        self.atlas_view = if (self.gpu_initialized)
-            self.snail_renderer.uploadAtlas(&self.atlas)
-        else
-            .{ .atlas = &self.atlas, .layer_base = 0 };
-        self.generation += 1;
-        self.has_prev_frame = false;
-        self.prev_cursor_visible = false;
-        self.prev_cursor_in_viewport = false;
-        self.clearCache();
-        if (self.debug_log_atlas) {
-            std.debug.print("mollusk: atlas reset to ASCII base for debug\n", .{});
-        }
-    }
-
-    pub fn maybeResetAtlasForDebug(self: *Renderer) !void {
-        if (!self.debug_reset_atlas_each_frame) return;
-        try self.resetAtlasToAscii();
     }
 
     pub fn reconfigure(
@@ -323,6 +299,7 @@ pub const Renderer = struct {
 
     fn appendCursorOverlay(
         self: *Renderer,
+        atlas: *const snail.Atlas,
         draw_text_len: *usize,
         draw_vec_len: *usize,
         x: u16,
@@ -356,7 +333,7 @@ pub const Renderer = struct {
         if (style != .block) return;
         const cell = cursor_cell orelse return;
         if (!cell.has_text or cell.glyph_id == 0) return;
-        const info = self.atlas.getGlyph(cell.glyph_id) orelse return;
+        const info = atlas.getGlyph(cell.glyph_id) orelse return;
         const cursor_text_y = self.viewport_h - @as(f32, @floatFromInt(y + 1)) * self.cell_height + self.cell_height * 0.2;
         var inv_buf: [snail.FLOATS_PER_GLYPH]f32 = undefined;
         var inv_batch = snail.Batch.init(&inv_buf);
@@ -378,17 +355,18 @@ pub const Renderer = struct {
     /// NO cursor baked in — cursor is drawn as overlay.
     fn buildRow(
         self: *Renderer,
+        atlas: *const snail.Atlas,
         term: *Terminal,
         default_fg: Rgb,
         default_bg: Rgb,
-    ) !struct { text_len: usize, vec_len: usize, atlas_changed: bool } {
+        misses: *glyph_misses.Set,
+    ) struct { text_len: usize, vec_len: usize } {
         // Y=0 origin for both pipelines. Actual Y applied via patchTextY/patchVecY.
         const cell_y_tl: f32 = 0;
         const cell_y_bl: f32 = 0; // text baseline offset added below
 
         var text_batch = snail.Batch.init(self.scratch_text);
         var vec_batch = snail.VectorBatch.init(self.scratch_vec);
-        var atlas_changed = false;
 
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
@@ -442,7 +420,7 @@ pub const Renderer = struct {
 
             if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
                 const gid = self.font.glyphIndex(cell.codepoint) catch 0;
-                if (self.atlas.getGlyph(gid)) |info| {
+                if (atlas.getGlyph(gid)) |info| {
                     _ = text_batch.addGlyph(
                         @as(f32, @floatFromInt(col_idx)) * self.cell_width,
                         cell_y_bl + self.cell_height * 0.2,
@@ -453,30 +431,7 @@ pub const Renderer = struct {
                         self.atlas_view.glyphLayer(info.page_index),
                     );
                 } else {
-                    const cps = [1]u32{cell.codepoint};
-                    if (try self.atlas.extendCodepoints(&cps)) |next| {
-                        if (self.debug_log_atlas) {
-                            std.debug.print("mollusk: atlas extend codepoint=U+{X:0>4} pages {}->{}\n", .{
-                                cell.codepoint,
-                                self.atlas.pageCount(),
-                                next.pageCount(),
-                            });
-                        }
-                        _ = snail.replaceAtlas(&self.atlas, next);
-                        self.atlas_view = self.snail_renderer.uploadAtlas(&self.atlas);
-                        atlas_changed = true;
-                    }
-                    const gid2 = self.font.glyphIndex(cell.codepoint) catch 0;
-                    if (self.atlas.getGlyph(gid2)) |info|
-                        _ = text_batch.addGlyph(
-                            @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                            cell_y_bl + self.cell_height * 0.2,
-                            self.font_size,
-                            info.bbox,
-                            info.band_entry,
-                            self.color4(fg, 1.0),
-                            self.atlas_view.glyphLayer(info.page_index),
-                        );
+                    misses.add(cell.codepoint);
                 }
                 if (cell.style.underline != 0)
                     _ = vec_batch.addRect(.{
@@ -508,7 +463,6 @@ pub const Renderer = struct {
         return .{
             .text_len = text_batch.glyphCount() * snail.FLOATS_PER_GLYPH,
             .vec_len = vec_batch.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE,
-            .atlas_changed = atlas_changed,
         };
     }
 
@@ -537,9 +491,6 @@ pub const Renderer = struct {
         };
         self.cache_bytes += byte_size;
 
-        // Lazy eviction when over budget — remove oldest entries
-        // (HashMap iteration order is arbitrary, which approximates random eviction.
-        // Good enough; a proper LRU is a future refinement.)
         while (self.cache_bytes > self.cache_budget) {
             var evict_it = self.row_cache.iterator();
             if (evict_it.next()) |entry| {
@@ -572,9 +523,13 @@ pub const Renderer = struct {
         }
     }
 
-    fn drawFrameInner(self: *Renderer, term: *Terminal, allow_debug_atlas_reset: bool) !bool {
+    pub fn drawFrame(self: *Renderer, term: *Terminal) !bool {
+        return try self.drawFrameInner(term);
+    }
+
+    fn drawFrameInner(self: *Renderer, term: *Terminal) !bool {
         const frame_timer = perf.Timer.now();
-        if (allow_debug_atlas_reset) try self.maybeResetAtlasForDebug();
+        const atlas = self.refreshAtlas();
         try self.ensureDrawBuffers();
 
         try term.updateRenderState();
@@ -582,14 +537,12 @@ pub const Renderer = struct {
         const cursor = term.getCursor();
         const colors = term.getColors();
 
-        // Cursor changes need a redraw even if ghostty says cells aren't dirty
         const cursor_changed = cursor.x != self.prev_cursor_x or
             cursor.y != self.prev_cursor_y or
             @intFromEnum(cursor.style) != @intFromEnum(self.prev_cursor_style) or
             cursor.visible != self.prev_cursor_visible or
             cursor.in_viewport != self.prev_cursor_in_viewport;
 
-        // Check for generation bump
         const new_hash = hashColors(colors);
         const colors_changed = new_hash != self.color_hash;
         if (dirty == .false_ and !cursor_changed and !colors_changed) return false;
@@ -605,6 +558,7 @@ pub const Renderer = struct {
         var draw_text_len: usize = 0;
         var draw_vec_len: usize = 0;
         var cursor_cell: ?CursorCell = null;
+        var misses: glyph_misses.Set = .{};
 
         term.beginRowIteration();
         var row_idx: u16 = 0;
@@ -612,11 +566,9 @@ pub const Renderer = struct {
             if (row_idx >= 200) break;
             const row_id = term.getRowId();
 
-            // Y offsets for this row position
             const vec_y = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
             const text_y = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
 
-            // Check for cache hit with valid generation
             const needs_rebuild = dirty == .full or !self.has_prev_frame or
                 term.isRowDirty();
 
@@ -642,24 +594,13 @@ pub const Renderer = struct {
                                 cursor_cell = render_common.captureCursorCell(default_bg, cell.codepoint, glyph_id, cell.has_text, resolved);
                             }
                         }
-                        // Cache hit — copy + Y-patch
                         self.appendCached(entry, text_y, vec_y, &draw_text_len, &draw_vec_len);
                         continue;
                     }
                 }
             }
 
-            // Cache miss or dirty — rebuild at Y=0, cache, then copy + Y-patch
-            const lens = try self.buildRow(term, default_fg, default_bg);
-
-            // Atlas grew mid-frame — earlier rows have stale UVs.
-            // Invalidate cache and restart the entire frame.
-            if (lens.atlas_changed) {
-                self.generation += 1;
-                self.clearCache();
-                self.has_prev_frame = false;
-                return try self.drawFrameInner(term, false);
-            }
+            const lens = self.buildRow(atlas, term, default_fg, default_bg, &misses);
 
             self.cacheRow(row_id, lens.text_len, lens.vec_len);
 
@@ -702,6 +643,7 @@ pub const Renderer = struct {
         self.prev_cursor_visible = cursor.visible;
         self.prev_cursor_in_viewport = cursor.in_viewport;
         self.appendCursorOverlay(
+            atlas,
             &draw_text_len,
             &draw_vec_len,
             cursor.x,
@@ -716,7 +658,6 @@ pub const Renderer = struct {
         );
 
         if (draw_text_len == 0 and draw_vec_len == 0) {
-            // No content to draw — skip frame to avoid blank flash
             if (self.debug_log_frames) {
                 std.debug.print("mollusk: skipped blank frame (rows={}, dirty={}, has_prev={})\n", .{ row_idx, @intFromEnum(dirty), self.has_prev_frame });
             }
@@ -742,12 +683,8 @@ pub const Renderer = struct {
         return true;
     }
 
-    pub fn drawFrame(self: *Renderer, term: *Terminal) !bool {
-        return try self.drawFrameInner(term, true);
-    }
-
     pub fn drawSnapshot(self: *Renderer, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
-        try self.maybeResetAtlasForDebug();
+        const atlas = self.refreshAtlas();
         try self.ensureDrawBuffers();
         const header = snapshot.header;
         const default_fg = header.default_fg;
@@ -825,7 +762,7 @@ pub const Renderer = struct {
                 }
 
                 if (flags.has_text and cell.glyph_id != 0) {
-                    if (self.atlas.getGlyph(cell.glyph_id)) |info| {
+                    if (atlas.getGlyph(cell.glyph_id)) |info| {
                         _ = text_batch.addGlyph(
                             @as(f32, @floatFromInt(col_idx)) * self.cell_width,
                             cell_y_bl + self.cell_height * 0.2,
@@ -874,6 +811,7 @@ pub const Renderer = struct {
         }
 
         self.appendCursorOverlay(
+            atlas,
             &draw_text_len,
             &draw_vec_len,
             header.cursor_x,

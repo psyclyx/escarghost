@@ -1,0 +1,730 @@
+//! GPU renderer thread.
+//!
+//! Lifecycle:
+//!   Phase 1 — EGL + snail.Renderer init (no deps, starts at T+0)
+//!   Phase 2 — configure(width, height, metrics, font, atlas_ref)
+//!             → allocate dmabufs, upload atlas, signal ready
+//!   Phase 3 — render loop: snapshot → FBO → signal frame
+
+const std = @import("std");
+const snail = @import("snail");
+const renderer_mod = @import("renderer.zig");
+const atlas_ref_mod = @import("atlas_ref.zig");
+const atlas_owner = @import("atlas_owner.zig");
+const render_env = @import("render_env.zig");
+const render_snapshot = @import("render_snapshot.zig");
+const glyph_misses = @import("glyph_misses.zig");
+const shared_dmabuf = @import("shared_dmabuf.zig");
+const perf = @import("perf.zig");
+
+const c = @cImport({
+    @cInclude("pthread.h");
+    @cInclude("unistd.h");
+    @cInclude("stdlib.h");
+    @cInclude("fcntl.h");
+    @cInclude("gbm.h");
+    @cInclude("drm/drm_fourcc.h");
+    @cInclude("EGL/egl.h");
+    @cInclude("EGL/eglext.h");
+    @cDefine("GL_GLEXT_PROTOTYPES", "1");
+    @cInclude("GL/gl.h");
+    @cInclude("GL/glext.h");
+});
+
+fn rendererDebugOptions() render_env.RendererDebug {
+    if (c.getenv("MOLLUSK_LOG")) |value|
+        return render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
+    return .{};
+}
+
+fn gpuDebugEnabled() bool {
+    return rendererDebugOptions().renderers;
+}
+
+fn gpuDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
+    if (!gpuDebugEnabled()) return;
+    std.debug.print("mollusk[gpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
+}
+
+pub const MaxBuffers = shared_dmabuf.MaxBuffers;
+const SnapshotSlotCount = 2;
+
+pub const ResponseTag = enum(u8) {
+    context_ready = 1,
+    ready = 2,
+    frame = 3,
+    failed = 4,
+};
+
+pub const Response = extern struct {
+    tag: ResponseTag,
+    buffer_index: u8 = 0,
+    snapshot_slot: u8 = 0,
+    reserved: [1]u8 = [_]u8{0} ** 1,
+    serial: u32 = 0,
+};
+
+const RequestTag = enum {
+    configure,
+    render,
+    quit,
+};
+
+const Request = struct {
+    tag: RequestTag,
+    buffer_index: u8 = 0,
+    snapshot_slot: u8 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    font_size: f32 = 0,
+    cell_width: f32 = 0,
+    cell_height: f32 = 0,
+    serial: u32 = 0,
+};
+
+// ── Offscreen EGL (surfaceless) ──
+
+const OffscreenEgl = struct {
+    display: c.EGLDisplay = c.EGL_NO_DISPLAY,
+    context: c.EGLContext = c.EGL_NO_CONTEXT,
+    surface: c.EGLSurface = c.EGL_NO_SURFACE,
+    config: c.EGLConfig = null,
+    create_image: ?*const fn (c.EGLDisplay, c.EGLContext, c.EGLenum, c.EGLClientBuffer, ?[*]const c.EGLint) callconv(.c) c.EGLImage = null,
+    destroy_image: ?*const fn (c.EGLDisplay, c.EGLImage) callconv(.c) c.EGLBoolean = null,
+    image_target_texture: ?*const fn (c.GLenum, c.GLeglImageOES) callconv(.c) void = null,
+
+    pub fn init() !OffscreenEgl {
+        const timer = perf.Timer.now();
+        var self: OffscreenEgl = .{};
+        gpuDebug(timer, "egl init start", .{});
+
+        _ = c.setenv("EGL_PLATFORM", "surfaceless", 0);
+
+        const get_platform_display = @as(
+            ?*const fn (c.EGLenum, ?*anyopaque, ?[*]const c.EGLAttrib) callconv(.c) c.EGLDisplay,
+            @ptrCast(c.eglGetProcAddress("eglGetPlatformDisplay")),
+        ) orelse return error.SurfacelessUnsupported;
+        self.display = get_platform_display(c.EGL_PLATFORM_SURFACELESS_MESA, null, null);
+        if (self.display == c.EGL_NO_DISPLAY) return error.EglDisplayFailed;
+        errdefer self.deinit();
+
+        var major: c.EGLint = 0;
+        var minor: c.EGLint = 0;
+        if (c.eglInitialize(self.display, &major, &minor) == c.EGL_FALSE)
+            return error.EglInitFailed;
+        gpuDebug(timer, "egl initialized {}.{}", .{ major, minor });
+        _ = c.eglBindAPI(c.EGL_OPENGL_API);
+
+        const attrs = [_]c.EGLint{
+            c.EGL_SURFACE_TYPE,    c.EGL_PBUFFER_BIT,
+            c.EGL_RED_SIZE,        8,
+            c.EGL_GREEN_SIZE,      8,
+            c.EGL_BLUE_SIZE,       8,
+            c.EGL_ALPHA_SIZE,      8,
+            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_BIT,
+            c.EGL_NONE,
+        };
+
+        var num: c.EGLint = 0;
+        if (c.eglChooseConfig(self.display, &attrs, &self.config, 1, &num) == c.EGL_FALSE or num == 0)
+            return error.EglConfigFailed;
+
+        const gl44 = [_]c.EGLint{
+            c.EGL_CONTEXT_MAJOR_VERSION,       4,
+            c.EGL_CONTEXT_MINOR_VERSION,       4,
+            c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            c.EGL_NONE,
+        };
+        const gl33 = [_]c.EGLint{
+            c.EGL_CONTEXT_MAJOR_VERSION,       3,
+            c.EGL_CONTEXT_MINOR_VERSION,       3,
+            c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            c.EGL_NONE,
+        };
+
+        self.context = c.eglCreateContext(self.display, self.config, c.EGL_NO_CONTEXT, &gl44);
+        if (self.context == c.EGL_NO_CONTEXT)
+            self.context = c.eglCreateContext(self.display, self.config, c.EGL_NO_CONTEXT, &gl33);
+        if (self.context == c.EGL_NO_CONTEXT) return error.EglContextFailed;
+
+        const pbuffer_attrs = [_]c.EGLint{ c.EGL_WIDTH, 1, c.EGL_HEIGHT, 1, c.EGL_NONE };
+        self.surface = c.eglCreatePbufferSurface(self.display, self.config, &pbuffer_attrs);
+        if (self.surface == c.EGL_NO_SURFACE) return error.EglSurfaceFailed;
+
+        if (c.eglMakeCurrent(self.display, self.surface, self.surface, self.context) == c.EGL_FALSE)
+            return error.EglMakeCurrentFailed;
+        gpuDebug(timer, "egl current", .{});
+
+        self.create_image = @ptrCast(c.eglGetProcAddress("eglCreateImageKHR"));
+        self.destroy_image = @ptrCast(c.eglGetProcAddress("eglDestroyImageKHR"));
+        self.image_target_texture = @ptrCast(c.eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+        if (self.create_image == null or self.destroy_image == null or self.image_target_texture == null)
+            return error.EglImageUnsupported;
+
+        _ = c.eglSwapInterval(self.display, 0);
+        return self;
+    }
+
+    pub fn deinit(self: *OffscreenEgl) void {
+        if (self.display != c.EGL_NO_DISPLAY) {
+            _ = c.eglMakeCurrent(self.display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
+            if (self.surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display, self.surface);
+            if (self.context != c.EGL_NO_CONTEXT) _ = c.eglDestroyContext(self.display, self.context);
+            _ = c.eglTerminate(self.display);
+        }
+    }
+};
+
+// ── DMA-BUF allocation ──
+
+const drm_format_mod_invalid: u64 = (1 << 56) - 1;
+
+const DmabufTarget = struct {
+    desc: shared_dmabuf.BufferDesc = .{},
+    bo: ?*c.struct_gbm_bo = null,
+    import_fd: c_int = -1,
+    export_fd: c_int = -1,
+    image: c.EGLImage = c.EGL_NO_IMAGE,
+    texture: c.GLuint = 0,
+    framebuffer: c.GLuint = 0,
+
+    const AllocationCandidate = struct {
+        format: u32,
+        usage: u32,
+        name: []const u8,
+    };
+
+    fn init(egl: *const OffscreenEgl, gbm: *c.struct_gbm_device, width: u32, height: u32) !DmabufTarget {
+        var self: DmabufTarget = .{};
+        errdefer self.deinit(egl);
+
+        const candidates = [_]AllocationCandidate{
+            .{ .format = c.DRM_FORMAT_ABGR8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "ABGR8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_ABGR8888, .usage = c.GBM_BO_USE_RENDERING, .name = "ABGR8888 render" },
+            .{ .format = c.DRM_FORMAT_XBGR8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "XBGR8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_XBGR8888, .usage = c.GBM_BO_USE_RENDERING, .name = "XBGR8888 render" },
+            .{ .format = c.DRM_FORMAT_ARGB8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "ARGB8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_ARGB8888, .usage = c.GBM_BO_USE_RENDERING, .name = "ARGB8888 render" },
+            .{ .format = c.DRM_FORMAT_XRGB8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "XRGB8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_XRGB8888, .usage = c.GBM_BO_USE_RENDERING, .name = "XRGB8888 render" },
+        };
+
+        for (candidates) |candidate| {
+            self.bo = c.gbm_bo_create(gbm, width, height, candidate.format, candidate.usage);
+            if (self.bo != null) break;
+        }
+        if (self.bo == null) return error.GbmCreateFailed;
+
+        const modifier = c.gbm_bo_get_modifier(self.bo);
+        self.desc = .{
+            .width = width,
+            .height = height,
+            .stride = c.gbm_bo_get_stride(self.bo),
+            .offset = 0,
+            .format = c.gbm_bo_get_format(self.bo),
+            .modifier_hi = @truncate(modifier >> 32),
+            .modifier_lo = @truncate(modifier),
+        };
+
+        self.export_fd = c.gbm_bo_get_fd(self.bo);
+        if (self.export_fd < 0) return error.GbmExportFailed;
+        self.import_fd = c.gbm_bo_get_fd(self.bo);
+        if (self.import_fd < 0) return error.GbmImportDupFailed;
+
+        const use_modifiers = modifier != drm_format_mod_invalid;
+        const attrs_with_modifiers = [_]c.EGLint{
+            c.EGL_WIDTH,                          @intCast(width),
+            c.EGL_HEIGHT,                         @intCast(height),
+            c.EGL_LINUX_DRM_FOURCC_EXT,           @intCast(self.desc.format),
+            c.EGL_DMA_BUF_PLANE0_FD_EXT,          self.import_fd,
+            c.EGL_DMA_BUF_PLANE0_OFFSET_EXT,      @intCast(self.desc.offset),
+            c.EGL_DMA_BUF_PLANE0_PITCH_EXT,       @intCast(self.desc.stride),
+            c.EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, @intCast(self.desc.modifier_lo),
+            c.EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, @intCast(self.desc.modifier_hi),
+            c.EGL_NONE,
+        };
+        const attrs_without_modifiers = [_]c.EGLint{
+            c.EGL_WIDTH,                     @intCast(width),
+            c.EGL_HEIGHT,                    @intCast(height),
+            c.EGL_LINUX_DRM_FOURCC_EXT,      @intCast(self.desc.format),
+            c.EGL_DMA_BUF_PLANE0_FD_EXT,     self.import_fd,
+            c.EGL_DMA_BUF_PLANE0_OFFSET_EXT, @intCast(self.desc.offset),
+            c.EGL_DMA_BUF_PLANE0_PITCH_EXT,  @intCast(self.desc.stride),
+            c.EGL_NONE,
+        };
+        const egl_attrs: []const c.EGLint = if (use_modifiers)
+            attrs_with_modifiers[0..]
+        else
+            attrs_without_modifiers[0..];
+        self.image = egl.create_image.?(egl.display, c.EGL_NO_CONTEXT, c.EGL_LINUX_DMA_BUF_EXT, null, egl_attrs.ptr);
+        if (self.image == c.EGL_NO_IMAGE) return error.EglImageCreateFailed;
+
+        c.glGenTextures(1, &self.texture);
+        c.glBindTexture(c.GL_TEXTURE_2D, self.texture);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+        egl.image_target_texture.?(c.GL_TEXTURE_2D, @ptrCast(self.image));
+
+        c.glGenFramebuffers(1, &self.framebuffer);
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.framebuffer);
+        c.glFramebufferTexture2D(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_TEXTURE_2D, self.texture, 0);
+        if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE)
+            return error.FramebufferIncomplete;
+
+        return self;
+    }
+
+    fn deinit(self: *DmabufTarget, egl: *const OffscreenEgl) void {
+        if (self.framebuffer != 0) c.glDeleteFramebuffers(1, &self.framebuffer);
+        if (self.texture != 0) c.glDeleteTextures(1, &self.texture);
+        if (self.image != c.EGL_NO_IMAGE and egl.destroy_image != null)
+            _ = egl.destroy_image.?(egl.display, self.image);
+        if (self.import_fd >= 0) _ = c.close(self.import_fd);
+        if (self.export_fd >= 0) _ = c.close(self.export_fd);
+        if (self.bo) |bo| c.gbm_bo_destroy(bo);
+    }
+};
+
+const DmabufAllocator = struct {
+    render_fd: c_int = -1,
+    gbm: ?*c.struct_gbm_device = null,
+    targets: [MaxBuffers]DmabufTarget = [_]DmabufTarget{.{}} ** MaxBuffers,
+    count: usize = 0,
+
+    fn init(egl: *const OffscreenEgl, width: u32, height: u32, buffer_count: usize) !DmabufAllocator {
+        var self: DmabufAllocator = .{};
+        errdefer self.deinit(egl);
+
+        self.render_fd = try openRenderNodeForEgl(egl);
+        self.gbm = c.gbm_create_device(self.render_fd) orelse return error.GbmDeviceFailed;
+
+        const clamped_count = @min(buffer_count, MaxBuffers);
+        for (0..clamped_count) |i| {
+            self.targets[i] = try DmabufTarget.init(egl, self.gbm.?, width, height);
+            self.count += 1;
+        }
+        return self;
+    }
+
+    fn deinit(self: *DmabufAllocator, egl: *const OffscreenEgl) void {
+        for (self.targets[0..self.count]) |*target| target.deinit(egl);
+        if (self.gbm) |gbm| c.gbm_device_destroy(gbm);
+        if (self.render_fd >= 0) _ = c.close(self.render_fd);
+    }
+};
+
+// ── Frontend (main thread side) ──
+
+pub const Frontend = struct {
+    thread: ?std.Thread = null,
+    mutex: c.pthread_mutex_t = undefined,
+    cond: c.pthread_cond_t = undefined,
+    response_fds: [2]c_int = [_]c_int{-1} ** 2,
+
+    // Set by main before spawning thread
+    font: ?*const snail.Font = null,
+    atlas_ref: ?*atlas_ref_mod.AtlasRef = null,
+    atlas_thread: ?*atlas_owner.Frontend = null,
+
+    // Request state (protected by mutex)
+    request_pending: bool = false,
+    request: Request = .{ .tag = .quit },
+    stop_requested: bool = false,
+
+    // Snapshot slots
+    snapshots: [SnapshotSlotCount]render_snapshot.SharedSnapshot = [_]render_snapshot.SharedSnapshot{.{}} ** SnapshotSlotCount,
+    snapshot_busy: [SnapshotSlotCount]bool = [_]bool{false} ** SnapshotSlotCount,
+
+    // Buffer descriptors populated by worker, read by main after "ready"
+    buffer_descs: [MaxBuffers]shared_dmabuf.BufferDesc = [_]shared_dmabuf.BufferDesc{.{}} ** MaxBuffers,
+    buffer_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
+    buffer_count: u8 = 0,
+
+    // Frontend-side state
+    buffers: [MaxBuffers]shared_dmabuf.FrontendBuffer = undefined,
+    frontend_buffer_count: usize = 0,
+
+    active: bool = false,
+    context_ready: bool = false,
+    ready: bool = false,
+    render_in_flight: bool = false,
+    first_frame_presented: bool = false,
+
+    pub fn responseFd(self: *const Frontend) c_int {
+        return self.response_fds[0];
+    }
+
+    /// Start the GPU renderer thread. It immediately begins EGL init (no deps).
+    pub fn start(self: *Frontend) !void {
+        if (self.active) return;
+        self.* = .{};
+        if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
+        errdefer _ = c.pthread_mutex_destroy(&self.mutex);
+        if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
+        errdefer _ = c.pthread_cond_destroy(&self.cond);
+
+        var pipe_fds: [2]c_int = undefined;
+        if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+        self.response_fds = pipe_fds;
+        errdefer {
+            _ = c.close(self.response_fds[0]);
+            _ = c.close(self.response_fds[1]);
+            self.response_fds = [_]c_int{-1} ** 2;
+        }
+
+        self.active = true;
+        self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
+    }
+
+    /// Provide the font and atlas ref after they are initialized.
+    /// Must be called before requestConfigure.
+    pub fn setSharedState(
+        self: *Frontend,
+        font: *const snail.Font,
+        atlas_ref: *atlas_ref_mod.AtlasRef,
+        atlas_thread: *atlas_owner.Frontend,
+    ) void {
+        self.font = font;
+        self.atlas_ref = atlas_ref;
+        self.atlas_thread = atlas_thread;
+    }
+
+    pub fn requestConfigure(self: *Frontend, w: u32, h: u32, font_size: f32, cell_width: f32, cell_height: f32) !void {
+        if (!self.active or !self.context_ready) return error.NotReady;
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+        self.request = .{
+            .tag = .configure,
+            .width = w,
+            .height = h,
+            .font_size = font_size,
+            .cell_width = cell_width,
+            .cell_height = cell_height,
+        };
+        self.request_pending = true;
+        self.ready = false;
+        self.render_in_flight = false;
+        _ = c.pthread_cond_signal(&self.cond);
+    }
+
+    pub fn freeBufferIndex(self: *Frontend) ?u8 {
+        for (0..self.frontend_buffer_count) |i| {
+            if (self.buffers[i].released) return @intCast(i);
+        }
+        return null;
+    }
+
+    fn freeSnapshotSlot(self: *Frontend) ?u8 {
+        for (0..SnapshotSlotCount) |i| {
+            if (!self.snapshot_busy[i]) return @intCast(i);
+        }
+        return null;
+    }
+
+    pub fn queueRender(self: *Frontend, term: anytype, serial: u32) !void {
+        if (!self.active or !self.ready) return error.NotReady;
+        if (self.render_in_flight or self.request_pending) return error.Busy;
+        const font = self.font orelse return error.NotReady;
+        const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
+        const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
+
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, font);
+        self.snapshot_busy[snapshot_slot] = true;
+
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+        self.request = .{
+            .tag = .render,
+            .buffer_index = buffer_index,
+            .snapshot_slot = snapshot_slot,
+            .serial = serial,
+        };
+        self.request_pending = true;
+        self.render_in_flight = true;
+        _ = c.pthread_cond_signal(&self.cond);
+    }
+
+    pub fn readResponse(self: *Frontend) !?Response {
+        var response: Response = undefined;
+        const rc = c.read(self.response_fds[0], &response, @sizeOf(Response));
+        if (rc == 0) return null;
+        if (rc < 0) return error.ReadFailed;
+        if (@as(usize, @intCast(rc)) < @sizeOf(Response)) return error.ShortRead;
+
+        switch (response.tag) {
+            .context_ready => {
+                self.context_ready = true;
+            },
+            .ready => {
+                self.ready = true;
+                self.render_in_flight = false;
+            },
+            .frame => {
+                if (response.snapshot_slot < SnapshotSlotCount) {
+                    self.snapshot_busy[response.snapshot_slot] = false;
+                }
+                self.render_in_flight = false;
+            },
+            .failed => {
+                if (response.snapshot_slot < SnapshotSlotCount) {
+                    self.snapshot_busy[response.snapshot_slot] = false;
+                }
+                self.render_in_flight = false;
+            },
+        }
+        return response;
+    }
+
+    /// Import dmabuf fds as wayland buffers. Call after receiving "ready" response.
+    pub fn installBuffers(self: *Frontend, dmabuf_opaque: *anyopaque) !void {
+        self.destroyFrontendBuffers();
+        const count = @min(@as(usize, self.buffer_count), MaxBuffers);
+        for (0..count) |i| {
+            self.buffers[i] = try shared_dmabuf.FrontendBuffer.create(
+                dmabuf_opaque,
+                self.buffer_export_fds[i],
+                self.buffer_descs[i],
+            );
+            self.buffer_export_fds[i] = -1; // create() took ownership of the fd
+            self.frontend_buffer_count += 1;
+        }
+    }
+
+    fn destroyFrontendBuffers(self: *Frontend) void {
+        for (self.buffers[0..self.frontend_buffer_count]) |*buffer| buffer.destroy();
+        self.frontend_buffer_count = 0;
+    }
+
+    pub fn stop(self: *Frontend) void {
+        if (!self.active) return;
+        {
+            _ = c.pthread_mutex_lock(&self.mutex);
+            defer _ = c.pthread_mutex_unlock(&self.mutex);
+            self.stop_requested = true;
+            _ = c.pthread_cond_signal(&self.cond);
+        }
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.destroyFrontendBuffers();
+        // Close any unclaimed export fds
+        for (&self.buffer_export_fds) |*fd| {
+            if (fd.* >= 0) { _ = c.close(fd.*); fd.* = -1; }
+        }
+        if (self.response_fds[0] >= 0) _ = c.close(self.response_fds[0]);
+        if (self.response_fds[1] >= 0) _ = c.close(self.response_fds[1]);
+        self.response_fds = [_]c_int{-1} ** 2;
+        _ = c.pthread_cond_destroy(&self.cond);
+        _ = c.pthread_mutex_destroy(&self.mutex);
+        self.active = false;
+        self.context_ready = false;
+        self.ready = false;
+        self.render_in_flight = false;
+        self.first_frame_presented = false;
+    }
+
+    // ── Worker thread ──
+
+    fn workerMain(self: *Frontend) void {
+        const timer = perf.Timer.now();
+        gpuDebug(timer, "thread start", .{});
+
+        // Phase 1: EGL + snail.Renderer init (no deps needed)
+        var egl = OffscreenEgl.init() catch |err| {
+            gpuDebug(timer, "egl init failed: {}", .{err});
+            writeResponse(self.response_fds[1], .{ .tag = .failed });
+            return;
+        };
+        defer egl.deinit();
+        gpuDebug(timer, "offscreen egl ready", .{});
+
+        // Signal context ready — main can now send configure
+        writeResponse(self.response_fds[1], .{ .tag = .context_ready });
+
+        // Disable sRGB for FBO rendering
+        c.glDisable(c.GL_FRAMEBUFFER_SRGB);
+
+        var allocator_state: ?DmabufAllocator = null;
+        defer if (allocator_state) |*existing| existing.deinit(&egl);
+        var renderer: ?renderer_mod.Renderer = null;
+        defer if (renderer) |*r| r.deinit();
+        var current_width: u32 = 0;
+        var current_height: u32 = 0;
+
+        // Phase 2+3: request loop
+        while (true) {
+            _ = c.pthread_mutex_lock(&self.mutex);
+            while (!self.request_pending and !self.stop_requested) {
+                _ = c.pthread_cond_wait(&self.cond, &self.mutex);
+            }
+            if (self.stop_requested) {
+                _ = c.pthread_mutex_unlock(&self.mutex);
+                return;
+            }
+            const request = self.request;
+            self.request_pending = false;
+            _ = c.pthread_mutex_unlock(&self.mutex);
+
+            switch (request.tag) {
+                .quit => return,
+                .configure => {
+                    const reconfigure_timer = perf.Timer.now();
+                    gpuDebug(timer, "configure {}x{} font={d:.1}", .{ request.width, request.height, request.font_size });
+
+                    const font = self.font orelse {
+                        gpuDebug(timer, "configure failed: no font set", .{});
+                        writeResponse(self.response_fds[1], .{ .tag = .failed });
+                        continue;
+                    };
+                    const atlas_ref = self.atlas_ref orelse {
+                        gpuDebug(timer, "configure failed: no atlas_ref set", .{});
+                        writeResponse(self.response_fds[1], .{ .tag = .failed });
+                        continue;
+                    };
+
+                    // Allocate dmabufs
+                    const next_allocator = DmabufAllocator.init(&egl, request.width, request.height, MaxBuffers) catch |err| {
+                        gpuDebug(timer, "dmabuf alloc failed: {}", .{err});
+                        writeResponse(self.response_fds[1], .{ .tag = .failed });
+                        continue;
+                    };
+                    if (allocator_state) |*existing| existing.deinit(&egl);
+                    allocator_state = next_allocator;
+                    current_width = request.width;
+                    current_height = request.height;
+
+                    // Init or reconfigure renderer
+                    if (renderer) |*r| {
+                        r.reconfigure(request.width, request.height, request.font_size, request.cell_width, request.cell_height);
+                    } else {
+                        renderer = renderer_mod.Renderer.init(
+                            std.heap.smp_allocator,
+                            font,
+                            atlas_ref,
+                            request.font_size,
+                            request.cell_width,
+                            request.cell_height,
+                        ) catch |err| {
+                            gpuDebug(timer, "renderer init failed: {}", .{err});
+                            writeResponse(self.response_fds[1], .{ .tag = .failed });
+                            continue;
+                        };
+                        renderer.?.framebuffer_srgb = false;
+                        const debug_opts = rendererDebugOptions();
+                        renderer.?.setDebugLogs(debug_opts);
+                        const runtime_flags = render_env.parseRuntimeFlags(
+                            if (c.getenv("MOLLUSK_FLAGS")) |value| std.mem.sliceTo(value, 0) else null,
+                        );
+                        renderer.?.setDebugResetAtlas(runtime_flags.reset_atlas_each_frame);
+                        renderer.?.reconfigure(request.width, request.height, request.font_size, request.cell_width, request.cell_height);
+                        if (renderer.?.debug_log_renderers) {
+                            std.debug.print("mollusk[gpu-renderer]: backend {s}\n", .{renderer.?.snail_renderer.backendName()});
+                        }
+                    }
+
+                    // Publish buffer descriptors for main thread
+                    const active_allocator = &allocator_state.?;
+                    self.buffer_count = @intCast(active_allocator.count);
+                    for (0..active_allocator.count) |i| {
+                        self.buffer_descs[i] = active_allocator.targets[i].desc;
+                        self.buffer_export_fds[i] = active_allocator.targets[i].export_fd;
+                        active_allocator.targets[i].export_fd = -1; // Transfer ownership to main
+                    }
+
+                    gpuDebug(timer, "configure ready in {d:.1}ms", .{reconfigure_timer.elapsedMs()});
+                    writeResponse(self.response_fds[1], .{ .tag = .ready });
+                },
+                .render => {
+                    if (allocator_state == null or renderer == null) continue;
+                    const active_allocator = &allocator_state.?;
+                    const r = &renderer.?;
+                    if (request.buffer_index >= active_allocator.count) continue;
+                    if (request.snapshot_slot >= SnapshotSlotCount) continue;
+
+                    const render_timer = perf.Timer.now();
+                    const target = &active_allocator.targets[request.buffer_index];
+                    c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
+                    c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
+
+                    var misses: glyph_misses.Set = .{};
+                    r.drawSnapshot(&self.snapshots[request.snapshot_slot], &misses) catch {
+                        writeResponse(self.response_fds[1], .{
+                            .tag = .failed,
+                            .buffer_index = request.buffer_index,
+                            .snapshot_slot = request.snapshot_slot,
+                            .serial = request.serial,
+                        });
+                        continue;
+                    };
+
+                    if (!misses.isEmpty()) {
+                        // Request atlas extension, report frame as failed (will retry)
+                        if (self.atlas_thread) |at| at.requestMany(&misses);
+                        writeResponse(self.response_fds[1], .{
+                            .tag = .failed,
+                            .buffer_index = request.buffer_index,
+                            .snapshot_slot = request.snapshot_slot,
+                            .serial = request.serial,
+                        });
+                        continue;
+                    }
+
+                    gpuDebug(timer, "render complete buffer={} in {d:.1}ms", .{
+                        request.buffer_index,
+                        render_timer.elapsedMs(),
+                    });
+                    writeResponse(self.response_fds[1], .{
+                        .tag = .frame,
+                        .buffer_index = request.buffer_index,
+                        .snapshot_slot = request.snapshot_slot,
+                        .serial = request.serial,
+                    });
+                },
+            }
+        }
+    }
+};
+
+fn writeResponse(fd: c_int, response: Response) void {
+    _ = c.write(fd, &response, @sizeOf(Response));
+}
+
+// ── Render node discovery ──
+
+fn openRenderNode() !c_int {
+    var path_buf: [32]u8 = undefined;
+    var node: u32 = 128;
+    while (node < 192) : (node += 1) {
+        const path = std.fmt.bufPrintZ(&path_buf, "/dev/dri/renderD{}", .{node}) catch continue;
+        const fd = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
+        if (fd >= 0) return fd;
+    }
+    return error.NoRenderNode;
+}
+
+fn openRenderNodeForEgl(egl: *const OffscreenEgl) !c_int {
+    const query_display_attrib = @as(
+        ?*const fn (c.EGLDisplay, c.EGLint, *c.EGLAttrib) callconv(.c) c.EGLBoolean,
+        @ptrCast(c.eglGetProcAddress("eglQueryDisplayAttribEXT")),
+    );
+    const query_device_string = @as(
+        ?*const fn (c.EGLDeviceEXT, c.EGLint) callconv(.c) [*c]const u8,
+        @ptrCast(c.eglGetProcAddress("eglQueryDeviceStringEXT")),
+    );
+
+    if (query_display_attrib) |query_attrib| {
+        if (query_device_string) |query_string| {
+            var device_attr: c.EGLAttrib = 0;
+            if (query_attrib(egl.display, c.EGL_DEVICE_EXT, &device_attr) != c.EGL_FALSE and device_attr != 0) {
+                const device: c.EGLDeviceEXT = @ptrFromInt(@as(usize, @intCast(device_attr)));
+                const render_node = query_string(device, c.EGL_DRM_RENDER_NODE_FILE_EXT);
+                if (render_node != null) {
+                    const fd = c.open(render_node, c.O_RDWR | c.O_CLOEXEC);
+                    if (fd >= 0) return fd;
+                }
+            }
+        }
+    }
+    return openRenderNode();
+}

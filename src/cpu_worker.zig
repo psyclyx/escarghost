@@ -1,6 +1,7 @@
 const std = @import("std");
+const snail = @import("snail");
+const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_owner = @import("atlas_owner.zig");
-const renderer_mod = @import("renderer.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const shared_shm = @import("shared_shm.zig");
@@ -62,9 +63,9 @@ const Request = struct {
 };
 
 pub const Frontend = struct {
-    renderer: *renderer_mod.Renderer = undefined,
-    renderer_mutex: *anyopaque = undefined,
+    atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     atlas_thread: ?*atlas_owner.Frontend = null,
+    font: *const snail.Font = undefined,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
@@ -88,8 +89,8 @@ pub const Frontend = struct {
     pub fn start(
         self: *Frontend,
         shm_opaque: *anyopaque,
-        renderer: *renderer_mod.Renderer,
-        renderer_mutex: *anyopaque,
+        atlas_ref: *atlas_ref_mod.AtlasRef,
+        font: *const snail.Font,
         atlas_thread: *atlas_owner.Frontend,
         width: u32,
         height: u32,
@@ -97,9 +98,9 @@ pub const Frontend = struct {
         if (self.active) return;
         const timer = perf.Timer.now();
         self.* = .{
-            .renderer = renderer,
-            .renderer_mutex = renderer_mutex,
+            .atlas_ref = atlas_ref,
             .atlas_thread = atlas_thread,
+            .font = font,
         };
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
@@ -194,7 +195,7 @@ pub const Frontend = struct {
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, &self.renderer.font);
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, self.font);
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);
@@ -296,23 +297,24 @@ pub const Frontend = struct {
                         continue;
                     };
 
-                    const renderer_mutex: *c.pthread_mutex_t = @ptrCast(@alignCast(self.renderer_mutex));
-                    _ = c.pthread_mutex_lock(renderer_mutex);
-                    defer _ = c.pthread_mutex_unlock(renderer_mutex);
-                    self.renderer.maybeResetAtlasForDebug() catch {};
-                    shm_render.renderSnapshotToMemory(
-                        self.atlas_thread,
+                    // Load current atlas atomically — no lock needed.
+                    const atlas = self.atlas_ref.load();
+
+                    const misses = shm_render.renderSnapshotToMemory(
                         map_ptr,
                         buffer.desc.width,
                         buffer.desc.height,
                         buffer.desc.stride,
                         &self.snapshots[snapshot_slot],
-                        &self.renderer.atlas,
-                        &self.renderer.font,
+                        atlas,
+                        self.font,
                         request.font_size,
                         request.cell_width,
                         request.cell_height,
                     );
+                    if (!misses.isEmpty()) {
+                        if (self.atlas_thread) |thread| thread.requestMany(&misses);
+                    }
                     cpuRendererDebug(timer, "frame complete buffer={} snapshot={} serial={} in {d:.1}ms", .{
                         buffer_index,
                         snapshot_slot,
