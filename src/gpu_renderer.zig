@@ -398,6 +398,14 @@ pub const Frontend = struct {
         if (!self.active or !self.context_ready) return error.NotReady;
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
+        // If a render was queued but not yet picked up by the worker, we're
+        // about to drop it on the floor. Free its snapshot slot — without
+        // this, rapid resizes can leak both slots and queueRender starts
+        // returning NoFreeSnapshot forever.
+        if (self.request_pending and self.request.tag == .render) {
+            const slot = self.request.snapshot_slot;
+            if (slot < SnapshotSlotCount) self.snapshot_busy[slot] = false;
+        }
         self.request = .{
             .tag = .configure,
             .width = w,
