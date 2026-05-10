@@ -467,7 +467,7 @@ pub const SnapshotRenderer = struct {
                         @as(f32, @floatFromInt(run_start)) * cell_width,
                         cell_y + baseline,
                         font_size,
-                        run_fg.?.toLinearFloat4(1.0),
+                        run_fg.?.toFloat4(1.0),
                     );
                     if (result.missing) misses.addRun(self.run_buf[0..run_len]);
                     run_len = 0;
@@ -520,7 +520,7 @@ pub const SnapshotRenderer = struct {
                 @as(f32, @floatFromInt(run_start)) * cell_width,
                 cell_y + baseline,
                 font_size,
-                run_fg.?.toLinearFloat4(1.0),
+                run_fg.?.toFloat4(1.0),
             );
             if (result.missing) misses.addRun(self.run_buf[0..run_len]);
         }
@@ -573,7 +573,7 @@ pub const SnapshotRenderer = struct {
             cx,
             cy + baseline,
             font_size,
-            cell.bg.toLinearFloat4(1.0),
+            cell.bg.toFloat4(1.0),
         );
         if (result.missing) {
             misses.addRun(tmp[0..n]);

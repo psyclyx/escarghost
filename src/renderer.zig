@@ -216,11 +216,21 @@ pub const Renderer = struct {
         self.clearCache();
     }
 
+    /// Color for gl_rect / glClearColor: linear when the framebuffer is
+    /// sRGB-format (GL gamma-encodes on write), raw sRGB otherwise.
     fn color4(self: *const Renderer, rgb: Rgb, alpha: f32) [4]f32 {
         return if (self.framebuffer_srgb)
             rgb.toLinearFloat4(alpha)
         else
             rgb.toFloat4(alpha);
+    }
+
+    /// Color for snail text input. snail's text fragment shader always
+    /// `srgbDecode`s its color attribute, so we always feed it sRGB-domain
+    /// values regardless of the framebuffer format.
+    fn textColor4(self: *const Renderer, rgb: Rgb, alpha: f32) [4]f32 {
+        _ = self;
+        return rgb.toFloat4(alpha);
     }
 
     fn baseline(self: *const Renderer) f32 {
@@ -294,7 +304,7 @@ pub const Renderer = struct {
         const x = @as(f32, @floatFromInt(start_col)) * self.cell_width;
         const y = self.baseline();
         const text = self.run_buf[0..run_byte_len];
-        const result = try self.builder.addText(.{}, text, x, y, self.font_size, self.color4(fg, 1.0));
+        const result = try self.builder.addText(.{}, text, x, y, self.font_size, self.textColor4(fg, 1.0));
         return .{ .missing = result.missing };
     }
 
@@ -567,7 +577,7 @@ pub const Renderer = struct {
             cx,
             cy + self.baseline(),
             self.font_size,
-            self.color4(cell.bg, 1.0),
+            self.textColor4(cell.bg, 1.0),
         ) catch return;
         if (result.missing) return;
         const blob = inv_builder.finish() catch return;
