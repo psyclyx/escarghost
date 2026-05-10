@@ -102,8 +102,6 @@ pub const Renderer = struct {
     // Per-frame ephemeral blob storage (cursor inversion, snapshot rebuilds).
     ephemeral_blobs: std.ArrayList(snail.TextBlob) = .empty,
 
-    run_buf: [2048]u8 = undefined,
-
     cell_width: f32,
     cell_height: f32,
     font_size: f32,
@@ -303,11 +301,17 @@ pub const Renderer = struct {
 
     const RunResult = struct { missing: bool };
 
-    fn flushTextRun(self: *Renderer, start_col: u16, run_byte_len: usize, fg: Rgb) !RunResult {
-        const x = @as(f32, @floatFromInt(start_col)) * self.cell_width;
+    /// Emit one cell's glyph at its cell-aligned x. Each call shapes the
+    /// codepoint in isolation so HB doesn't apply cross-cell contextual
+    /// alternates and so the rendered glyph lands exactly on the cell
+    /// grid (terminal cells are independent — natural HB advances would
+    /// drift over a long row).
+    fn emitCellGlyph(self: *Renderer, col_idx: u16, codepoint: u32, fg: Rgb) !RunResult {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return .{ .missing = false };
+        const x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
         const y = self.baseline();
-        const text = self.run_buf[0..run_byte_len];
-        const result = try self.builder.addText(.{}, text, x, y, self.font_size, self.textColor4(fg, 1.0));
+        const result = try self.builder.addText(.{}, buf[0..n], x, y, self.font_size, self.textColor4(fg, 1.0));
         return .{ .missing = result.missing };
     }
 
@@ -335,10 +339,6 @@ pub const Renderer = struct {
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
         var bg_span_len: u16 = 0;
-
-        var run_start: u16 = 0;
-        var run_fg: ?Rgb = null;
-        var run_len: usize = 0;
 
         var col_idx: u16 = 0;
         while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
@@ -390,28 +390,14 @@ pub const Renderer = struct {
             }
 
             const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
-            const fg_matches = if (run_fg) |rf| rf.r == fg.r and rf.g == fg.g and rf.b == fg.b else false;
-
-            if (!has_renderable_text or !fg_matches or flags.underline or flags.strikethrough) {
-                if (run_len > 0) {
-                    const result = try self.flushTextRun(run_start, run_len, run_fg.?);
-                    if (result.missing) {
-                        had_misses = true;
-                        misses.addRun(self.run_buf[0..run_len]);
-                    }
-                    run_len = 0;
-                    run_fg = null;
-                }
-            }
-
             if (has_renderable_text) {
-                if (run_fg == null) {
-                    run_start = col_idx;
-                    run_fg = fg;
-                    run_len = 0;
+                const result = try self.emitCellGlyph(col_idx, cell.codepoint, fg);
+                if (result.missing) {
+                    had_misses = true;
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &buf) catch 0;
+                    if (n > 0) misses.addRun(buf[0..n]);
                 }
-                const encoded = std.unicode.utf8Encode(@intCast(cell.codepoint), self.run_buf[run_len..]) catch 0;
-                if (encoded > 0) run_len += encoded;
             }
 
             if (flags.underline and rect_count < self.scratch_rects.len) {
@@ -433,14 +419,6 @@ pub const Renderer = struct {
                     .color = self.color4(fg, 1.0),
                 };
                 rect_count += 1;
-            }
-        }
-
-        if (run_len > 0) {
-            const result = try self.flushTextRun(run_start, run_len, run_fg.?);
-            if (result.missing) {
-                had_misses = true;
-                misses.addRun(self.run_buf[0..run_len]);
             }
         }
 

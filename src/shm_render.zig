@@ -173,7 +173,6 @@ pub const SnapshotRenderer = struct {
     seg_buf: std.ArrayList(snail.DrawSegment) = .empty,
     overrides: [render_snapshot.MaxRows + 4]snail.Override = undefined,
     resource_entries: [RESOURCE_ENTRY_CAP]snail.ResourceSet.Entry = undefined,
-    run_buf: [2048]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator) !SnapshotRenderer {
         // Buffer is reinit'd per frame with the SHM map.
@@ -402,10 +401,6 @@ pub const SnapshotRenderer = struct {
         var bg_span_color: ?Rgb = null;
         var bg_span_len: u16 = 0;
 
-        var run_start: u16 = 0;
-        var run_fg: ?Rgb = null;
-        var run_len: usize = 0;
-
         var col_idx: u16 = 0;
         while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
             col_idx += 1;
@@ -456,33 +451,24 @@ pub const SnapshotRenderer = struct {
                 }
             }
 
+            // Per-cell glyph emission. Each addText shapes one codepoint in
+            // isolation so the rendered glyph lands exactly at col*cell_width
+            // (HB's natural advance would drift over a long row).
             const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
-            const fg_matches = if (run_fg) |rf| rf.r == fg.r and rf.g == fg.g and rf.b == fg.b else false;
-
-            if (!has_renderable_text or !fg_matches or flags.underline or flags.strikethrough) {
-                if (run_len > 0) {
+            if (has_renderable_text) {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &buf) catch 0;
+                if (n > 0) {
                     const result = try self.builder.addText(
                         .{},
-                        self.run_buf[0..run_len],
-                        @as(f32, @floatFromInt(run_start)) * cell_width,
+                        buf[0..n],
+                        @as(f32, @floatFromInt(col_idx)) * cell_width,
                         cell_y + baseline,
                         font_size,
-                        run_fg.?.toFloat4(1.0),
+                        fg.toFloat4(1.0),
                     );
-                    if (result.missing) misses.addRun(self.run_buf[0..run_len]);
-                    run_len = 0;
-                    run_fg = null;
+                    if (result.missing) misses.addRun(buf[0..n]);
                 }
-            }
-
-            if (has_renderable_text) {
-                if (run_fg == null) {
-                    run_start = col_idx;
-                    run_fg = fg;
-                    run_len = 0;
-                }
-                const encoded = std.unicode.utf8Encode(@intCast(cell.codepoint), self.run_buf[run_len..]) catch 0;
-                if (encoded > 0) run_len += encoded;
             }
 
             if (flags.underline) {
@@ -511,18 +497,6 @@ pub const SnapshotRenderer = struct {
                     argbPixel(fg.r, fg.g, fg.b, 255),
                 );
             }
-        }
-
-        if (run_len > 0) {
-            const result = try self.builder.addText(
-                .{},
-                self.run_buf[0..run_len],
-                @as(f32, @floatFromInt(run_start)) * cell_width,
-                cell_y + baseline,
-                font_size,
-                run_fg.?.toFloat4(1.0),
-            );
-            if (result.missing) misses.addRun(self.run_buf[0..run_len]);
         }
 
         if (bg_span_len > 0) {
