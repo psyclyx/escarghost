@@ -43,7 +43,7 @@ let
 
 in
 pkgs.stdenv.mkDerivation {
-  pname = "mollusk";
+  pname = "scrgo";
   version = "0.0.1";
   src = filteredSrc;
 
@@ -71,6 +71,6 @@ pkgs.stdenv.mkDerivation {
 
   installPhase = ''
     mkdir -p $out/bin
-    cp zig-out/bin/mollusk $out/bin/
+    cp zig-out/bin/scrgo $out/bin/
   '';
 }

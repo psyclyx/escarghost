@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-MOLLUSK="$(nix-build --no-out-link)/bin/mollusk"
+SCRGO="$(nix-build --no-out-link)/bin/scrgo"
 RUNS=20
 WARMUP=3
 
@@ -19,7 +19,7 @@ declare -a HYPERFINE_ARGS=(
   --warmup "$WARMUP"
   --ignore-failure
   --export-markdown /dev/stdout
-  --command-name mollusk   "$MOLLUSK -e /bin/true"
+  --command-name scrgo   "$SCRGO -e /bin/true"
 )
 
 add_bench() {
@@ -39,7 +39,7 @@ add_bench ghostty ghostty "ghostty -e /bin/true"
 
 echo "=== Terminal Startup Benchmark ==="
 echo "Runs: $RUNS  Warmup: $WARMUP"
-echo "mollusk: $MOLLUSK"
+echo "scrgo: $SCRGO"
 echo ""
 
 hyperfine "${HYPERFINE_ARGS[@]}"

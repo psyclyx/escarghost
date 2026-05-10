@@ -197,10 +197,10 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn getConfigPath(allocator: std.mem.Allocator) !?[]const u8 {
     if (getenv("XDG_CONFIG_HOME")) |xdg| {
-        return try std.fmt.allocPrint(allocator, "{s}/mollusk/config.json", .{xdg});
+        return try std.fmt.allocPrint(allocator, "{s}/scrgo/config.json", .{xdg});
     }
     if (getenv("HOME")) |home| {
-        return try std.fmt.allocPrint(allocator, "{s}/.config/mollusk/config.json", .{home});
+        return try std.fmt.allocPrint(allocator, "{s}/.config/scrgo/config.json", .{home});
     }
     return null;
 }

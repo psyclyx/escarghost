@@ -32,7 +32,7 @@ const c = @cImport({
 });
 
 fn rendererDebugOptions() render_env.RendererDebug {
-    if (c.getenv("MOLLUSK_LOG")) |value|
+    if (c.getenv("SCRGO_LOG")) |value|
         return render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
     return .{};
 }
@@ -43,7 +43,7 @@ fn gpuDebugEnabled() bool {
 
 fn gpuDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
     if (!gpuDebugEnabled()) return;
-    std.debug.print("mollusk[gpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
+    std.debug.print("scrgo[gpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
 pub const MaxBuffers = shared_dmabuf.MaxBuffers;
@@ -616,7 +616,7 @@ pub const Frontend = struct {
                         const debug_opts = rendererDebugOptions();
                         renderer.?.setDebugLogs(debug_opts);
                         const runtime_flags = render_env.parseRuntimeFlags(
-                            if (c.getenv("MOLLUSK_FLAGS")) |value| std.mem.sliceTo(value, 0) else null,
+                            if (c.getenv("SCRGO_FLAGS")) |value| std.mem.sliceTo(value, 0) else null,
                         );
                         renderer.?.setDebugResetAtlas(runtime_flags.reset_atlas_each_frame);
                         renderer.?.reconfigure(request.width, request.height, request.font_size, request.cell_width, request.cell_height);

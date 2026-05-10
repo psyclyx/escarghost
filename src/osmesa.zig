@@ -36,7 +36,7 @@ pub const OsMesaContext = struct {
         const size: usize = @as(usize, stride) * height;
 
         // Create shared memory
-        const fd = shm_c.memfd_create("mollusk-osmesa", @as(c_uint, 0));
+        const fd = shm_c.memfd_create("scrgo-osmesa", @as(c_uint, 0));
         if (fd < 0) return error.MemfdFailed;
         errdefer _ = shm_c.close(fd);
 

@@ -20,7 +20,7 @@ const xkb = @cImport({
 });
 
 fn rendererLogEnabled() bool {
-    if (std.c.getenv("MOLLUSK_LOG")) |value| {
+    if (std.c.getenv("SCRGO_LOG")) |value| {
         const options = render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
         return options.startup or options.renderers;
     }
@@ -175,7 +175,7 @@ pub const Wayland = struct {
         _ = wl.xdg_toplevel_add_listener(self.xdg_toplevel.?, &xdg_toplevel_listener, @ptrCast(self));
 
         wl.xdg_toplevel_set_title(self.xdg_toplevel.?, title.ptr);
-        wl.xdg_toplevel_set_app_id(self.xdg_toplevel.?, "mollusk");
+        wl.xdg_toplevel_set_app_id(self.xdg_toplevel.?, "scrgo");
 
         // Request server-side decorations
         if (self.decoration_manager) |dm| {
@@ -509,7 +509,7 @@ pub const Wayland = struct {
     fn xdgToplevelClose(data: ?*anyopaque, _: ?*wl.xdg_toplevel) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
         if (rendererLogEnabled()) {
-            std.debug.print("mollusk: received xdg_toplevel.close\n", .{});
+            std.debug.print("scrgo: received xdg_toplevel.close\n", .{});
         }
         self.closed = true;
     }

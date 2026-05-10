@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const exe = b.addExecutable(.{
-        .name = "mollusk",
+        .name = "scrgo",
         .root_module = root_module,
     });
 
@@ -124,7 +124,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run mollusk");
+    const run_step = b.step("run", "Run scrgo");
     run_step.dependOn(&run_cmd.step);
 
     // Benchmark (no GL, CPU-side perf)
@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
         if (vt_static_lib) |lib_path| bench_module.addObjectFile(.{ .cwd_relative = lib_path });
         bench_module.linkSystemLibrary("fontconfig", .{});
 
-        const bench_exe = b.addExecutable(.{ .name = "mollusk-bench", .root_module = bench_module });
+        const bench_exe = b.addExecutable(.{ .name = "scrgo-bench", .root_module = bench_module });
         b.installArtifact(bench_exe);
         const bench_run = b.addRunArtifact(bench_exe);
         const bench_step = b.step("bench", "Run CPU benchmarks");
@@ -159,7 +159,7 @@ pub fn build(b: *std.Build) void {
         if (vt_static_lib) |lib_path| headless_module.addObjectFile(.{ .cwd_relative = lib_path });
 
         const headless_exe = b.addExecutable(.{
-            .name = "mollusk-headless-test",
+            .name = "scrgo-headless-test",
             .root_module = headless_module,
         });
         b.installArtifact(headless_exe);

@@ -15,7 +15,7 @@ const c = @cImport({
 });
 
 fn rendererDebugOptions() render_env.RendererDebug {
-    if (c.getenv("MOLLUSK_LOG")) |value|
+    if (c.getenv("SCRGO_LOG")) |value|
         return render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
     return .{};
 }
@@ -26,7 +26,7 @@ fn cpuRendererDebugEnabled() bool {
 
 fn cpuRendererDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
     if (!cpuRendererDebugEnabled()) return;
-    std.debug.print("mollusk[cpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
+    std.debug.print("scrgo[cpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
 pub const BufferCount = 2;
@@ -243,10 +243,10 @@ pub const Frontend = struct {
 
     fn workerMain(self: *Frontend) void {
         if (cpuRendererDebugEnabled()) {
-            std.debug.print("mollusk[cpu-renderer] thread running\n", .{});
+            std.debug.print("scrgo[cpu-renderer] thread running\n", .{});
         }
         var ctx = shm_render.SnapshotRenderer.init(std.heap.smp_allocator) catch |err| {
-            std.debug.print("mollusk[cpu-renderer]: init failed: {}\n", .{err});
+            std.debug.print("scrgo[cpu-renderer]: init failed: {}\n", .{err});
             return;
         };
         defer ctx.deinit();

@@ -36,7 +36,7 @@ pub const BootstrapConfig = struct {
 };
 
 fn debugOptions() render_env.RendererDebug {
-    if (c.getenv("MOLLUSK_LOG")) |value|
+    if (c.getenv("SCRGO_LOG")) |value|
         return render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
     return .{};
 }
@@ -48,7 +48,7 @@ fn atlasDebugEnabled() bool {
 
 fn atlasDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
     if (!atlasDebugEnabled()) return;
-    std.debug.print("mollusk[atlas-owner] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
+    std.debug.print("scrgo[atlas-owner] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
 pub const Frontend = struct {
@@ -166,7 +166,7 @@ pub const Frontend = struct {
 
     fn workerMain(self: *Frontend) void {
         if (atlasDebugEnabled()) {
-            std.debug.print("mollusk[atlas-owner] thread running\n", .{});
+            std.debug.print("scrgo[atlas-owner] thread running\n", .{});
         }
 
         if (self.bootstrap_config) |config| {

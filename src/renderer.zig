@@ -271,7 +271,7 @@ pub const Renderer = struct {
         }
         for (stale.items) |k| self.evictRow(k);
         if (self.debug_log_atlas) {
-            std.debug.print("mollusk[gpu-renderer]: atlas snapshot {} (rebound={}, evicted={})\n", .{ identity, rebound, stale.items.len });
+            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (rebound={}, evicted={})\n", .{ identity, rebound, stale.items.len });
         }
         return atlas;
     }

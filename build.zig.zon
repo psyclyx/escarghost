@@ -1,7 +1,7 @@
 .{
-    .name = .mollusk,
+    .name = .scrgo,
     .version = "0.0.1",
-    .fingerprint = 0x2fd5a57dd86e5c5c,
+    .fingerprint = 0xf1070878b3a5429f,
     .paths = .{""},
     .dependencies = .{
         .snail = .{

@@ -80,7 +80,7 @@ const RenderPath = enum {
 var g_renderer_debug: render_env.RendererDebug = .{};
 
 fn rendererDebugOptions() render_env.RendererDebug {
-    if (getenv("MOLLUSK_LOG")) |value|
+    if (getenv("SCRGO_LOG")) |value|
         return render_env.parseRendererDebug(value);
     return .{};
 }
@@ -174,10 +174,10 @@ const GpuRestartBackoff = struct {
 fn debugKillActiveRenderer() void {
     if (g_active_render_path.* == .gpu and g_gpu.active) {
         noteGpuUnavailable(g_gpu, g_active_render_path, g_gpu_restart);
-        std.debug.print("mollusk: debug: killed gpu renderer\n", .{});
+        std.debug.print("scrgo: debug: killed gpu renderer\n", .{});
     } else if (g_cpu.active) {
         g_cpu.stop();
-        std.debug.print("mollusk: debug: killed cpu renderer\n", .{});
+        std.debug.print("scrgo: debug: killed cpu renderer\n", .{});
     }
 }
 
@@ -186,11 +186,11 @@ fn debugSwapRenderer() void {
         g_target_render_path = .cpu;
         g_active_render_path.* = .cpu;
         g_needs_redraw = true;
-        std.debug.print("mollusk: debug: target renderer -> cpu\n", .{});
+        std.debug.print("scrgo: debug: target renderer -> cpu\n", .{});
     } else {
         g_target_render_path = .gpu;
         g_gpu_snapshot_dirty = true;
-        std.debug.print("mollusk: debug: target renderer -> gpu\n", .{});
+        std.debug.print("scrgo: debug: target renderer -> gpu\n", .{});
     }
 }
 
@@ -201,13 +201,13 @@ fn debugClearAtlas() void {
     // current atlas's font config bytes.
     _ = std.heap.smp_allocator;
     markRenderDirty();
-    std.debug.print("mollusk: debug: atlas clear (no-op in 0.4.x)\n", .{});
+    std.debug.print("scrgo: debug: atlas clear (no-op in 0.4.x)\n", .{});
 }
 
 fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
-    // Mollusk bindings (intercepted before sending to PTY)
+    // Scrgo bindings (intercepted before sending to PTY)
     if (ev.mods.ctrl and ev.mods.shift) {
         switch (ev.keysym) {
             // Zoom: Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0
@@ -368,7 +368,7 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, term: *terminal_mod.T
         else => return,
     };
     if (debugRenderersEnabled()) {
-        std.debug.print("mollusk: queued gpu renderer frame serial={}\n", .{g_render_serial});
+        std.debug.print("scrgo: queued gpu renderer frame serial={}\n", .{g_render_serial});
     }
     g_gpu_snapshot_dirty = false;
 }
@@ -400,7 +400,7 @@ fn renderActivePath(
         };
         g_needs_redraw = false;
         if (debugFramesEnabled()) {
-            std.debug.print("mollusk: queue cpu renderer frame {}x{}\n", .{ wl.width, wl.height });
+            std.debug.print("scrgo: queue cpu renderer frame {}x{}\n", .{ wl.width, wl.height });
         }
         return;
     }
@@ -414,7 +414,7 @@ fn noteGpuUnavailable(
 ) void {
     gpu.stop();
     if (debugRenderersEnabled()) {
-        std.debug.print("mollusk: gpu renderer unavailable, switching to cpu renderer and scheduling restart\n", .{});
+        std.debug.print("scrgo: gpu renderer unavailable, switching to cpu renderer and scheduling restart\n", .{});
     }
     if (active_path.* == .gpu) {
         active_path.* = .cpu;
@@ -475,10 +475,10 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
     g_renderer_debug = rendererDebugOptions();
-    const runtime_flags = render_env.parseRuntimeFlags(getenv("MOLLUSK_FLAGS"));
-    const requested_render_path = render_env.parseRequestedRenderPath(getenv("MOLLUSK_RENDERER"));
+    const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
+    const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
     if (debugStartupEnabled()) {
-        std.debug.print("mollusk: debug flags startup={} renderers={} frames={} atlas={} pty={} reset_atlas={}\n", .{
+        std.debug.print("scrgo: debug flags startup={} renderers={} frames={} atlas={} pty={} reset_atlas={}\n", .{
             g_renderer_debug.startup,
             g_renderer_debug.renderers,
             g_renderer_debug.frames,
@@ -486,12 +486,12 @@ pub fn main(init: std.process.Init) !void {
             g_renderer_debug.pty,
             runtime_flags.reset_atlas_each_frame,
         });
-        std.debug.print("mollusk: requested renderer mode={s}\n", .{@tagName(requested_render_path)});
+        std.debug.print("scrgo: requested renderer mode={s}\n", .{@tagName(requested_render_path)});
     }
 
     const gpu_allowed = requested_render_path != .cpu;
     if (debugStartupEnabled() and !gpu_allowed) {
-        std.debug.print("mollusk: gpu renderer disabled by MOLLUSK_RENDERER=cpu\n", .{});
+        std.debug.print("scrgo: gpu renderer disabled by SCRGO_RENDERER=cpu\n", .{});
     }
 
     var gpu: gpu_renderer.Frontend = .{};
@@ -504,11 +504,11 @@ pub fn main(init: std.process.Init) !void {
     // Start GPU thread early — it begins EGL init immediately, no deps needed
     if (gpu_allowed) {
         gpu.start() catch |err| {
-            std.debug.print("mollusk: gpu renderer thread start failed: {}\n", .{err});
+            std.debug.print("scrgo: gpu renderer thread start failed: {}\n", .{err});
             gpu_restart.scheduleRetry();
         };
         if (debugStartupEnabled()) {
-            std.debug.print("mollusk: gpu renderer thread started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            std.debug.print("scrgo: gpu renderer thread started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
     }
 
@@ -523,13 +523,13 @@ pub fn main(init: std.process.Init) !void {
 
     // ── Phase 1: Wayland connect + 1px background ──
     var wl: wayland_mod.Wayland = undefined;
-    try wl.init(800, 600, "mollusk");
+    try wl.init(800, 600, "scrgo");
     defer wl.deinit();
     defer gpu.stop(); // must run before wl.deinit() to destroy wayland buffers first
 
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
         if (debugStartupEnabled()) {
-            std.debug.print("mollusk: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            std.debug.print("scrgo: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
     } else if (wl.shm) |shm| {
         var bg_frame = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
@@ -537,14 +537,14 @@ pub fn main(init: std.process.Init) !void {
             frame.fillBackground(cfg.background);
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
             if (debugStartupEnabled()) {
-                std.debug.print("mollusk: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                std.debug.print("scrgo: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
             frame.destroy();
         }
     }
 
     if (requested_render_path == .gpu and wl.linux_dmabuf == null) {
-        std.debug.print("mollusk: GPU renderer requested but linux-dmabuf is unavailable; falling back to CPU\n", .{});
+        std.debug.print("scrgo: GPU renderer requested but linux-dmabuf is unavailable; falling back to CPU\n", .{});
     }
 
     // ── Phase 2: wait for font (overlapped with Wayland init) ──
@@ -557,7 +557,7 @@ pub fn main(init: std.process.Init) !void {
     const atlas_ref_ptr = atlas_thread.atlas_ref;
     g_atlas_ref = atlas_ref_ptr;
     if (debugStartupEnabled()) {
-        std.debug.print("mollusk: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        std.debug.print("scrgo: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
     const cell_metrics = try renderer_mod.computeCellMetrics(atlas_ref_ptr.load(), cfg.font_size);
@@ -577,7 +577,7 @@ pub fn main(init: std.process.Init) !void {
     defer pty.close();
 
     if (debugStartupEnabled()) {
-        std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+        std.debug.print("scrgo: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
     }
 
     var term: terminal_mod.Terminal = undefined;
@@ -591,26 +591,26 @@ pub fn main(init: std.process.Init) !void {
         return error.BootstrapFailed;
     }
     if (debugStartupEnabled()) {
-        std.debug.print("mollusk: atlas ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        std.debug.print("scrgo: atlas ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
     var cpu: cpu_renderer_worker.Frontend = .{};
     defer cpu.stop();
     if (wl.shm) |shm| {
         cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |err| {
-            std.debug.print("mollusk: cpu renderer start failed: {}\n", .{err});
+            std.debug.print("scrgo: cpu renderer start failed: {}\n", .{err});
         };
     }
 
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
         gpu.requestConfigure(wl.width, wl.height, g_font_size, g_cell_width, g_cell_height) catch |err| {
-            std.debug.print("mollusk: gpu renderer initial configure failed: {}\n", .{err});
+            std.debug.print("scrgo: gpu renderer initial configure failed: {}\n", .{err});
             gpu.stop();
             gpu_restart.scheduleRetry();
         };
         if (debugStartupEnabled()) {
-            std.debug.print("mollusk: gpu renderer configured ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            std.debug.print("scrgo: gpu renderer configured ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
     } else if (gpu.active) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
@@ -655,7 +655,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (debugStartupEnabled() or debugPtyEnabled()) {
-        std.debug.print("mollusk: early PTY output bytes={} have_output={}\n", .{ early_bytes, have_early_output });
+        std.debug.print("scrgo: early PTY output bytes={} have_output={}\n", .{ early_bytes, have_early_output });
     }
 
     if (have_early_output) {
@@ -671,20 +671,20 @@ pub fn main(init: std.process.Init) !void {
     main_loop: while (!wl.closed and !child_exited) {
         if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
             gpu.start() catch |err| {
-                std.debug.print("mollusk: gpu renderer restart failed: {}\n", .{err});
+                std.debug.print("scrgo: gpu renderer restart failed: {}\n", .{err});
                 gpu_restart.scheduleRetry();
                 continue;
             };
             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
             if (debugRenderersEnabled() or debugStartupEnabled()) {
-                std.debug.print("mollusk: restarting gpu renderer ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                std.debug.print("scrgo: restarting gpu renderer ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
             gpu_restart.deadline_ns = null;
         }
 
         while (!wl.prepareRead()) {
             wl.dispatchPending() catch {
-                std.debug.print("mollusk: wayland dispatchPending failed before poll, exiting\n", .{});
+                std.debug.print("scrgo: wayland dispatchPending failed before poll, exiting\n", .{});
                 break :main_loop;
             };
         }
@@ -693,7 +693,7 @@ pub fn main(init: std.process.Init) !void {
             g_gpu_reconfigure_requested = false;
             if (gpu.active and gpu.context_ready) {
                 gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
-                    std.debug.print("mollusk: gpu renderer reconfigure failed: {}\n", .{err});
+                    std.debug.print("scrgo: gpu renderer reconfigure failed: {}\n", .{err});
                     noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                     continue;
                 };
@@ -725,21 +725,21 @@ pub fn main(init: std.process.Init) !void {
         const poll_rc = c.poll(&pollfds, 5, poll_timeout);
         if (poll_rc < 0) {
             wl.cancelRead();
-            std.debug.print("mollusk: poll failed, exiting\n", .{});
+            std.debug.print("scrgo: poll failed, exiting\n", .{});
             break;
         }
 
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.readEvents() catch {
                 wl.cancelRead();
-                std.debug.print("mollusk: wayland readEvents failed, exiting\n", .{});
+                std.debug.print("scrgo: wayland readEvents failed, exiting\n", .{});
                 break;
             };
         } else {
             wl.cancelRead();
         }
         wl.dispatchPending() catch {
-            std.debug.print("mollusk: wayland dispatchPending failed, exiting\n", .{});
+            std.debug.print("scrgo: wayland dispatchPending failed, exiting\n", .{});
             break :main_loop;
         };
 
@@ -749,13 +749,13 @@ pub fn main(init: std.process.Init) !void {
                 switch (resp.tag) {
                     .context_ready => {
                         if (debugRenderersEnabled() or debugStartupEnabled()) {
-                            std.debug.print("mollusk: gpu renderer context ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                            std.debug.print("scrgo: gpu renderer context ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                         }
                         if (gpu.atlas_ref == null) {
                             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
                         }
                         gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
-                            std.debug.print("mollusk: gpu renderer configure after context_ready failed: {}\n", .{err});
+                            std.debug.print("scrgo: gpu renderer configure after context_ready failed: {}\n", .{err});
                             noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                             continue;
                         };
@@ -763,14 +763,14 @@ pub fn main(init: std.process.Init) !void {
                     .ready => {
                         if (wl.linux_dmabuf) |linux_dmabuf| {
                             gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |err| {
-                                std.debug.print("mollusk: GPU dmabuf import failed: {}\n", .{err});
+                                std.debug.print("scrgo: GPU dmabuf import failed: {}\n", .{err});
                                 noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                                 continue;
                             };
                             g_gpu_snapshot_dirty = true;
                             gpu_restart.clear();
                             if (debugRenderersEnabled() or debugStartupEnabled()) {
-                                std.debug.print("mollusk: gpu renderer ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                                std.debug.print("scrgo: gpu renderer ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                             }
                         } else {
                             noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
@@ -781,7 +781,7 @@ pub fn main(init: std.process.Init) !void {
                             // Stale frame or target changed, discard
                         } else {
                             if (debugRenderersEnabled()) {
-                                std.debug.print("mollusk: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
+                                std.debug.print("scrgo: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
                                     resp.buffer_index,
                                     startup_timer.elapsedMs(),
                                 });
@@ -791,13 +791,13 @@ pub fn main(init: std.process.Init) !void {
                                 if (!wl.frame_pending) wl.requestFrame();
                                 if (active_render_path != .gpu) {
                                     if (debugFramesEnabled()) {
-                                        std.debug.print("mollusk: switching render path cpu->gpu\n", .{});
+                                        std.debug.print("scrgo: switching render path cpu->gpu\n", .{});
                                     }
                                     active_render_path = .gpu;
                                 }
                                 if (!gpu.first_frame_presented) {
                                     if (debugFramesEnabled() or debugRenderersEnabled() or debugStartupEnabled()) {
-                                        std.debug.print("mollusk: first gpu renderer paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                                        std.debug.print("scrgo: first gpu renderer paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                                     }
                                     gpu.first_frame_presented = true;
                                 }
@@ -813,7 +813,7 @@ pub fn main(init: std.process.Init) !void {
                         g_gpu_snapshot_dirty = true;
                     },
                     .failed => {
-                        std.debug.print("mollusk: gpu renderer failed\n", .{});
+                        std.debug.print("scrgo: gpu renderer failed\n", .{});
                         noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                     },
                 }
@@ -853,7 +853,7 @@ pub fn main(init: std.process.Init) !void {
                 switch (resp.tag) {
                     .updated => {
                         if (debugRenderersEnabled() or g_renderer_debug.atlas) {
-                            std.debug.print("mollusk: atlas owner applied {} codepoints pages+={}\n", .{
+                            std.debug.print("scrgo: atlas owner applied {} codepoints pages+={}\n", .{
                                 resp.requested_count,
                                 resp.added_pages,
                             });
@@ -861,7 +861,7 @@ pub fn main(init: std.process.Init) !void {
                         markRenderDirty();
                     },
                     .failed => {
-                        std.debug.print("mollusk: atlas owner update failed for {} codepoints\n", .{resp.requested_count});
+                        std.debug.print("scrgo: atlas owner update failed for {} codepoints\n", .{resp.requested_count});
                     },
                     .font_ready, .bootstrap_ready => {},
                 }
@@ -879,18 +879,18 @@ pub fn main(init: std.process.Init) !void {
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => {
-                        std.debug.print("mollusk: PTY read failed: {}, exiting\n", .{err});
+                        std.debug.print("scrgo: PTY read failed: {}, exiting\n", .{err});
                         child_exited = true;
                         break;
                     },
                 };
                 if (n == 0) {
-                    std.debug.print("mollusk: PTY EOF/EIO, exiting\n", .{});
+                    std.debug.print("scrgo: PTY EOF/EIO, exiting\n", .{});
                     child_exited = true;
                     break;
                 }
                 if (debugPtyEnabled()) {
-                    std.debug.print("mollusk: PTY read {} bytes\n", .{n});
+                    std.debug.print("scrgo: PTY read {} bytes\n", .{n});
                 }
                 term.feedData(pty_buf[0..n]);
                 markRenderDirty();
@@ -898,7 +898,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (pty.checkChild()) |status| {
-            std.debug.print("mollusk: PTY child exited status={}, exiting\n", .{status});
+            std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
             child_exited = true;
         }
 
@@ -911,11 +911,11 @@ pub fn main(init: std.process.Init) !void {
     renderer_mod.Renderer.frame_stats.log("frame");
     if (g_renderer_debug.anyLogs()) {
         if (wl.closed) {
-            std.debug.print("mollusk: compositor requested close, exiting\n", .{});
+            std.debug.print("scrgo: compositor requested close, exiting\n", .{});
         } else if (child_exited) {
-            std.debug.print("mollusk: child exit path reached, exiting\n", .{});
+            std.debug.print("scrgo: child exit path reached, exiting\n", .{});
         }
-        std.debug.print("mollusk: exiting\n", .{});
+        std.debug.print("scrgo: exiting\n", .{});
     }
 }
 

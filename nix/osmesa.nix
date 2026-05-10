@@ -1,8 +1,8 @@
-# Minimal mesa: llvmpipe + OSMesa only. For mollusk's software GL first-frame.
+# Minimal mesa: llvmpipe + OSMesa only. For scrgo's software GL first-frame.
 { pkgs }:
 
 (pkgs.mesa.overrideAttrs (old: {
-  pname = "mollusk-osmesa";
+  pname = "scrgo-osmesa";
   outputs = [ "out" ];
   outputDev = "out";
 

@@ -86,7 +86,7 @@ pub const ShmFrame = struct {
         const stride = w * 4;
         const size: usize = @as(usize, stride) * h;
 
-        const fd = c.memfd_create("mollusk-shm", @as(c_uint, 0));
+        const fd = c.memfd_create("scrgo-shm", @as(c_uint, 0));
         if (fd < 0) return null;
 
         if (c.ftruncate(fd, @intCast(size)) < 0) {
