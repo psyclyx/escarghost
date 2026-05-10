@@ -225,12 +225,15 @@ pub const Renderer = struct {
             rgb.toFloat4(alpha);
     }
 
-    /// Color for snail text input. snail's text fragment shader always
-    /// `srgbDecode`s its color attribute, so we always feed it sRGB-domain
-    /// values regardless of the framebuffer format.
+    /// Color for snail text input. snail's text fragment shader does
+    /// `srgbDecode(v_color)` and outputs linear values, expecting a
+    /// sRGB-format target. mesa refuses to import dmabufs as sRGB-format,
+    /// so we keep the FBO linear and pre-encode our colors with the
+    /// linear→sRGB curve; snail's decode then yields sRGB-domain output
+    /// that writes correctly to the linear-format target.
     fn textColor4(self: *const Renderer, rgb: Rgb, alpha: f32) [4]f32 {
         _ = self;
-        return rgb.toFloat4(alpha);
+        return rgb.toPreEncodedFloat4(alpha);
     }
 
     fn baseline(self: *const Renderer) f32 {

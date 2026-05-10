@@ -40,6 +40,29 @@ pub const Rgb = struct {
         if (v <= 0.04045) return v / 12.92;
         return std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
     }
+
+    /// Treats `v` as a linear value in [0,1] and returns its sRGB encoding.
+    /// Used for the GPU "double-encode" that compensates for snail's
+    /// fragment shader doing srgbDecode on its color input when the FBO
+    /// is linear-format (mesa won't import dmabuf as sRGB-format, so
+    /// GL_FRAMEBUFFER_SRGB has no conversion to apply on write).
+    fn linearToSrgbF(v: f32) f32 {
+        if (v <= 0.0031308) return v * 12.92;
+        return 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+    }
+
+    /// sRGB-domain color pre-encoded so that snail's text shader's
+    /// `srgbDecode(v_color)` step produces a value back in sRGB-domain.
+    /// The result is gamma-incorrect for blending math but lands the
+    /// right pixel values in a linear-format framebuffer.
+    pub fn toPreEncodedFloat4(self: Rgb, alpha: f32) [4]f32 {
+        return .{
+            linearToSrgbF(@as(f32, @floatFromInt(self.r)) / 255.0),
+            linearToSrgbF(@as(f32, @floatFromInt(self.g)) / 255.0),
+            linearToSrgbF(@as(f32, @floatFromInt(self.b)) / 255.0),
+            alpha,
+        };
+    }
 };
 
 pub const Lab = struct {

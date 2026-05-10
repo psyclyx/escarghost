@@ -233,10 +233,11 @@ const DmabufTarget = struct {
         if (self.import_fd < 0) return error.GbmImportDupFailed;
 
         const use_modifiers = modifier != drm_format_mod_invalid;
-        // Tag the import as sRGB-encoded. snail's GL pipeline assumes an
-        // sRGB-format target so its linear shader output gets gamma-encoded
-        // on write; without this attribute mesa imports the texture as
-        // linear and snail's output ends up gamma-dark on screen.
+        // mesa rejects EGL_GL_COLORSPACE on EGL_LINUX_DMA_BUF_EXT imports,
+        // so the FBO stays linear-format. We compensate by pre-encoding the
+        // colors we hand to snail's text shader (see textColor4 in
+        // renderer.zig); snail's srgbDecode then yields sRGB-domain output
+        // which writes correctly to the non-sRGB FBO.
         const attrs_with_modifiers = [_]c.EGLint{
             c.EGL_WIDTH,                          @intCast(width),
             c.EGL_HEIGHT,                         @intCast(height),
@@ -246,7 +247,6 @@ const DmabufTarget = struct {
             c.EGL_DMA_BUF_PLANE0_PITCH_EXT,       @intCast(self.desc.stride),
             c.EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, @intCast(self.desc.modifier_lo),
             c.EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, @intCast(self.desc.modifier_hi),
-            c.EGL_GL_COLORSPACE,                  c.EGL_GL_COLORSPACE_SRGB,
             c.EGL_NONE,
         };
         const attrs_without_modifiers = [_]c.EGLint{
@@ -256,7 +256,6 @@ const DmabufTarget = struct {
             c.EGL_DMA_BUF_PLANE0_FD_EXT,     self.import_fd,
             c.EGL_DMA_BUF_PLANE0_OFFSET_EXT, @intCast(self.desc.offset),
             c.EGL_DMA_BUF_PLANE0_PITCH_EXT,  @intCast(self.desc.stride),
-            c.EGL_GL_COLORSPACE,             c.EGL_GL_COLORSPACE_SRGB,
             c.EGL_NONE,
         };
         const egl_attrs: []const c.EGLint = if (use_modifiers)
@@ -547,11 +546,12 @@ pub const Frontend = struct {
         // Signal context ready — main can now send configure
         writeResponse(self.response_fds[1], .{ .tag = .context_ready });
 
-        // FBOs are sRGB-format (see EGL_GL_COLORSPACE_SRGB on dmabuf import).
-        // snail's pipeline expects this and outputs linear from its shaders;
-        // GL gamma-encodes on FBO write. gl_rect and the clear path also
-        // pass linear inputs (handled inside the renderer module).
-        c.glEnable(c.GL_FRAMEBUFFER_SRGB);
+        // mesa won't import a dmabuf as sRGB-format, so we keep the FBO
+        // linear-format and pre-encode colors going into snail (see
+        // textColor4 in renderer.zig). snail's pipeline still flips
+        // GL_FRAMEBUFFER_SRGB on per draw — that's a no-op against a
+        // linear-format target, which is exactly what we want.
+        c.glDisable(c.GL_FRAMEBUFFER_SRGB);
 
         var allocator_state: ?DmabufAllocator = null;
         defer if (allocator_state) |*existing| existing.deinit(&egl);
@@ -612,7 +612,7 @@ pub const Frontend = struct {
                             writeResponse(self.response_fds[1], .{ .tag = .failed });
                             continue;
                         };
-                        renderer.?.framebuffer_srgb = true;
+                        renderer.?.framebuffer_srgb = false;
                         const debug_opts = rendererDebugOptions();
                         renderer.?.setDebugLogs(debug_opts);
                         const runtime_flags = render_env.parseRuntimeFlags(
