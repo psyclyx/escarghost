@@ -212,6 +212,7 @@ pub const SnapshotRenderer = struct {
         // Buffer is reinit'd per frame with the SHM map.
         var cpu = snail.CpuRenderer.init(@ptrFromInt(@alignOf(u8)), 1, 1, 4);
         cpu.setSubpixelOrder(.none); // greyscale AA
+        cpu.setOutputSrgb(true); // SHM buffer holds sRGB-encoded bytes
 
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
@@ -630,6 +631,7 @@ pub const SnapshotRenderer = struct {
                 .pixel_width = @floatFromInt(viewport_w),
                 .pixel_height = @floatFromInt(viewport_h),
                 .subpixel_order = .none,
+                .output_srgb = true, // SHM buffer holds sRGB-encoded bytes
             },
         };
 

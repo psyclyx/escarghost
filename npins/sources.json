@@ -42,9 +42,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "549fcb88ad2e12681cc382919b3da1c9a45f0c10",
-      "url": "https://github.com/psyclyx/snail/archive/549fcb88ad2e12681cc382919b3da1c9a45f0c10.tar.gz",
-      "hash": "sha256-TZKY4gkcNOSdkvT6pfaCkzzVN2jyqPNUtlywZaaXfFg="
+      "revision": "929aa9778406fb3a85e3c2aae284915641e6ba79",
+      "url": "https://github.com/psyclyx/snail/archive/929aa9778406fb3a85e3c2aae284915641e6ba79.tar.gz",
+      "hash": "sha256-tQZRezjACBBAK6L138C3miq2nOSj+k0TYP8dFXNgxLc="
     },
     "zig-overlay": {
       "type": "Git",

@@ -113,7 +113,6 @@ pub const Renderer = struct {
     viewport_h: f32,
 
     draw_buffers_ready: bool = false,
-    framebuffer_srgb: bool = true,
     debug_log_renderers: bool = false,
     debug_log_frames: bool = false,
     debug_log_atlas: bool = false,
@@ -130,6 +129,11 @@ pub const Renderer = struct {
     ) !Renderer {
         var gl_renderer = try snail.GlRenderer.init(allocator);
         errdefer gl_renderer.deinit();
+        // mesa won't import dmabuf as sRGB-format, so we tell snail's
+        // pipeline the FBO is linear-format. Combined with
+        // DrawOptions.target.output_srgb = true, snail's text shader
+        // will gamma-encode internally before writing.
+        gl_renderer.state.setSrgbFormatTarget(false);
 
         const atlas = atlas_ref.load();
         const builder = snail.TextBlobBuilder.init(allocator, atlas);
@@ -218,24 +222,13 @@ pub const Renderer = struct {
         self.clearCache();
     }
 
-    /// Color for gl_rect / glClearColor: linear when the framebuffer is
-    /// sRGB-format (GL gamma-encodes on write), raw sRGB otherwise.
+    /// Color for both gl_rect and snail text input. snail expects sRGB
+    /// per its color convention; gl_rect writes it as-is to a linear-
+    /// format FBO (no GL_FRAMEBUFFER_SRGB conversion). Both paths land
+    /// sRGB bytes in the dmabuf, which is what the compositor wants.
     fn color4(self: *const Renderer, rgb: Rgb, alpha: f32) [4]f32 {
-        return if (self.framebuffer_srgb)
-            rgb.toLinearFloat4(alpha)
-        else
-            rgb.toFloat4(alpha);
-    }
-
-    /// Color for snail text input. snail's text fragment shader does
-    /// `srgbDecode(v_color)` and outputs linear values, expecting a
-    /// sRGB-format target. mesa refuses to import dmabufs as sRGB-format,
-    /// so we keep the FBO linear and pre-encode our colors with the
-    /// linear→sRGB curve; snail's decode then yields sRGB-domain output
-    /// that writes correctly to the linear-format target.
-    fn textColor4(self: *const Renderer, rgb: Rgb, alpha: f32) [4]f32 {
         _ = self;
-        return rgb.toPreEncodedFloat4(alpha);
+        return rgb.toFloat4(alpha);
     }
 
     fn baseline(self: *const Renderer) f32 {
@@ -353,7 +346,7 @@ pub const Renderer = struct {
             opts_x,
             self.baseline(),
             self.font_size,
-            self.textColor4(fg, 1.0),
+            self.color4(fg, 1.0),
         );
 
         const had_misses = result.missing;
@@ -619,7 +612,7 @@ pub const Renderer = struct {
             cx,
             cy + self.baseline(),
             self.font_size,
-            self.textColor4(cell.bg, 1.0),
+            self.color4(cell.bg, 1.0),
         ) catch return;
         if (result.missing) return;
         const blob = inv_builder.finish() catch return;
@@ -657,6 +650,9 @@ pub const Renderer = struct {
                 .pixel_width = self.viewport_w,
                 .pixel_height = self.viewport_h,
                 .subpixel_order = .none, // greyscale AA
+                // FBO is linear-format (see setSrgbFormatTarget(false) in
+                // init); ask snail's shader to gamma-encode before write.
+                .output_srgb = true,
             },
         };
     }

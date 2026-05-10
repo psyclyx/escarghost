@@ -546,11 +546,11 @@ pub const Frontend = struct {
         // Signal context ready — main can now send configure
         writeResponse(self.response_fds[1], .{ .tag = .context_ready });
 
-        // mesa won't import a dmabuf as sRGB-format, so we keep the FBO
-        // linear-format and pre-encode colors going into snail (see
-        // textColor4 in renderer.zig). snail's pipeline still flips
-        // GL_FRAMEBUFFER_SRGB on per draw — that's a no-op against a
-        // linear-format target, which is exactly what we want.
+        // Sane default for our linear-format dmabuf FBO. snail's GL
+        // pipeline manages this state per-draw via setSrgbFormatTarget
+        // (we set it to false in renderer.init); explicit disable here
+        // just guards against any pre-existing state from a previous
+        // GL context.
         c.glDisable(c.GL_FRAMEBUFFER_SRGB);
 
         var allocator_state: ?DmabufAllocator = null;
@@ -612,7 +612,6 @@ pub const Frontend = struct {
                             writeResponse(self.response_fds[1], .{ .tag = .failed });
                             continue;
                         };
-                        renderer.?.framebuffer_srgb = false;
                         const debug_opts = rendererDebugOptions();
                         renderer.?.setDebugLogs(debug_opts);
                         const runtime_flags = render_env.parseRuntimeFlags(
