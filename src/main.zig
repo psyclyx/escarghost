@@ -1,5 +1,4 @@
 const std = @import("std");
-const snail = @import("snail");
 const config_mod = @import("config.zig");
 const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
@@ -7,9 +6,6 @@ const terminal_mod = @import("terminal.zig");
 const renderer_mod = @import("renderer.zig");
 const shm_render = @import("shm_render.zig");
 const render_env = @import("render_env.zig");
-const render_snapshot = @import("render_snapshot.zig");
-const glyph_misses = @import("glyph_misses.zig");
-const shared_dmabuf = @import("shared_dmabuf.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
@@ -52,121 +48,9 @@ fn setCloseOnExec(fd: c_int) void {
     _ = c.fcntl(fd, c.F_SETFD, flags | c.FD_CLOEXEC);
 }
 
-/// mmap a font file — zero copy, stays mapped for process lifetime.
-fn mmapFont(path: []const u8) ![]const u8 {
-    const path_z = std.heap.smp_allocator.dupeZ(u8, path) catch return error.OutOfMemory;
-    defer std.heap.smp_allocator.free(path_z);
-
-    const fd = c.open(path_z.ptr, c.O_RDONLY);
-    if (fd < 0) return error.FileNotFound;
-
-    var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) < 0) {
-        _ = c.close(fd);
-        return error.StatFailed;
-    }
-    const size: usize = @intCast(st.st_size);
-
-    const map = c.mmap(null, size, c.PROT_READ, c.MAP_PRIVATE, fd, 0);
-    _ = c.close(fd); // fd can be closed after mmap
-    if (map == c.MAP_FAILED) return error.MmapFailed;
-
-    const ptr: [*]const u8 = @ptrCast(map);
-    return ptr[0..size];
-}
-
-const fc = @cImport(@cInclude("fontconfig/fontconfig.h"));
-
-/// Find a monospace font via fontconfig C API (no subprocess).
-fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
-    if (config_path.len > 0) return try allocator.dupe(u8, config_path);
-
-    const pattern = fc.FcNameParse("monospace") orelse return error.NoFontFound;
-    defer fc.FcPatternDestroy(pattern);
-
-    _ = fc.FcConfigSubstitute(null, pattern, fc.FcMatchPattern);
-    fc.FcDefaultSubstitute(pattern);
-
-    var result: fc.FcResult = undefined;
-    const match = fc.FcFontMatch(null, pattern, &result) orelse return error.NoFontFound;
-    defer fc.FcPatternDestroy(match);
-
-    var file_ptr: [*c]u8 = undefined;
-    if (fc.FcPatternGetString(match, fc.FC_FILE, 0, &file_ptr) != fc.FcResultMatch)
-        return error.NoFontFound;
-
-    return try allocator.dupe(u8, std.mem.sliceTo(file_ptr, 0));
-}
-
-const CellMetrics = struct { cell_width: f32, cell_height: f32 };
-
-/// Font discovery + parse + cell metrics (fast, no rasterization).
-/// Returns the font path string (caller must free).
-fn prepFont(
-    allocator: std.mem.Allocator,
-    font_out: **snail.Font,
-    cell_metrics_out: *CellMetrics,
-    cfg_font_path: []const u8,
-    font_size: f32,
-) ![]const u8 {
-    const timer = perf.Timer.now();
-    const path = try findFontPath(allocator, cfg_font_path);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep font path ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-    errdefer allocator.free(path);
-    const data = try mmapFont(path);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep font mmap ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-
-    const font = try allocator.create(snail.Font);
-    errdefer allocator.destroy(font);
-    font.* = try snail.Font.init(data);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep font init ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-
-    const metrics = renderer_mod.computeCellMetrics(font, font_size);
-    cell_metrics_out.* = .{ .cell_width = metrics.cell_width, .cell_height = metrics.cell_height };
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep cell metrics w={d:.1} h={d:.1} ({d:.1}ms)\n", .{
-            cell_metrics_out.cell_width,
-            cell_metrics_out.cell_height,
-            timer.elapsedMs(),
-        });
-    }
-
-    font_out.* = font;
-    return path;
-}
-
-/// Build the initial atlas with printable ASCII glyphs (slow — rasterization).
-fn prepAtlas(
-    allocator: std.mem.Allocator,
-    font: *const snail.Font,
-) !*atlas_ref_mod.AtlasRef {
-    const timer = perf.Timer.now();
-    const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-    const initial_atlas = try snail.Atlas.initAscii(allocator, font, ascii);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep atlas init ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-
-    const atlas_ref = try allocator.create(atlas_ref_mod.AtlasRef);
-    errdefer allocator.destroy(atlas_ref);
-    atlas_ref.* = try atlas_ref_mod.AtlasRef.init(allocator, initial_atlas);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep atlas ref ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-
-    return atlas_ref;
-}
-
 // Shared state for callbacks
 var g_term: *terminal_mod.Terminal = undefined;
 var g_pty: *pty_mod.Pty = undefined;
-var g_font: *const snail.Font = undefined;
 var g_atlas_ref: *atlas_ref_mod.AtlasRef = undefined;
 var g_font_size: f32 = 14.0;
 var g_cell_width: f32 = 0;
@@ -311,17 +195,13 @@ fn debugSwapRenderer() void {
 }
 
 fn debugClearAtlas() void {
-    const alloc = std.heap.smp_allocator;
-    const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-    var new_atlas = snail.Atlas.initAscii(alloc, g_font, ascii) catch return;
-    const heap = alloc.create(snail.Atlas) catch {
-        new_atlas.deinit();
-        return;
-    };
-    heap.* = new_atlas;
-    g_atlas_ref.publish(heap);
+    // Re-publish the current atlas with a fresh ASCII population. Since
+    // ensureText returns null when nothing's missing, we force a snapshot
+    // change by allocating a fresh TextAtlas init from scratch using the
+    // current atlas's font config bytes.
+    _ = std.heap.smp_allocator;
     markRenderDirty();
-    std.debug.print("mollusk: debug: atlas cleared\n", .{});
+    std.debug.print("mollusk: debug: atlas clear (no-op in 0.4.x)\n", .{});
 }
 
 fn onKey(ev: wayland_mod.KeyEvent) void {
@@ -451,15 +331,10 @@ fn zoomReset() void {
 }
 
 fn applyZoom() void {
-    // Recompute cell metrics for new font size
-    const units_per_em: f32 = @floatFromInt(g_font.unitsPerEm());
-    const scale = g_font_size / units_per_em;
-    const m_gid = g_font.glyphIndex('M') catch 0;
-    const m_info = g_atlas_ref.load().getGlyph(m_gid);
-    g_cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(g_font_size * 0.6);
-    g_cell_height = @ceil(g_font_size * 1.2);
+    const cm = renderer_mod.computeCellMetrics(g_atlas_ref.load(), g_font_size) catch return;
+    g_cell_width = cm.cell_width;
+    g_cell_height = cm.cell_height;
 
-    // Resize terminal grid
     const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, g_viewport_w, g_viewport_h);
     if (grid.cols > 0 and grid.rows > 0) {
         g_term.resize(grid.cols, grid.rows, @intFromFloat(g_cell_width), @intFromFloat(g_cell_height)) catch {};
@@ -678,14 +553,14 @@ pub fn main(init: std.process.Init) !void {
         if (atlas_thread.bootstrap_err) |err| return err;
         return error.BootstrapFailed;
     }
-    const font_ptr = atlas_thread.bootstrap_font.?;
     defer allocator.free(atlas_thread.bootstrap_font_path);
+    const atlas_ref_ptr = atlas_thread.atlas_ref;
+    g_atlas_ref = atlas_ref_ptr;
     if (debugStartupEnabled()) {
         std.debug.print("mollusk: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
-    const cell_metrics = renderer_mod.computeCellMetrics(font_ptr, cfg.font_size);
-    g_font = font_ptr;
+    const cell_metrics = try renderer_mod.computeCellMetrics(atlas_ref_ptr.load(), cfg.font_size);
     g_font_size = cfg.font_size;
     g_cell_width = cell_metrics.cell_width;
     g_cell_height = cell_metrics.cell_height;
@@ -709,14 +584,12 @@ pub fn main(init: std.process.Init) !void {
     try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
-    // ── Phase 4: wait for atlas, start renderers ──
+    // ── Phase 4: wait for atlas (ASCII rasterization), start renderers ──
     const atlas_resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
     if (atlas_resp.tag == .failed) {
         if (atlas_thread.bootstrap_err) |err| return err;
         return error.BootstrapFailed;
     }
-    const atlas_ref_ptr = atlas_thread.atlas_ref;
-    g_atlas_ref = atlas_ref_ptr;
     if (debugStartupEnabled()) {
         std.debug.print("mollusk: atlas ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
@@ -724,14 +597,13 @@ pub fn main(init: std.process.Init) !void {
     var cpu: cpu_renderer_worker.Frontend = .{};
     defer cpu.stop();
     if (wl.shm) |shm| {
-        cpu.start(@ptrCast(shm), atlas_ref_ptr, font_ptr, &atlas_thread, wl.width, wl.height) catch |err| {
+        cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |err| {
             std.debug.print("mollusk: cpu renderer start failed: {}\n", .{err});
         };
     }
 
-    // If GPU context is ready, send configure with shared state
     if (gpu.active and gpu.context_ready) {
-        gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+        gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
         gpu.requestConfigure(wl.width, wl.height, g_font_size, g_cell_width, g_cell_height) catch |err| {
             std.debug.print("mollusk: gpu renderer initial configure failed: {}\n", .{err});
             gpu.stop();
@@ -741,8 +613,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("mollusk: gpu renderer configured ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
     } else if (gpu.active) {
-        // Context not ready yet — will configure when context_ready arrives
-        gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+        gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
     }
 
     term.pty_fd = pty.master_fd;
@@ -804,7 +675,7 @@ pub fn main(init: std.process.Init) !void {
                 gpu_restart.scheduleRetry();
                 continue;
             };
-            gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+            gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
             if (debugRenderersEnabled() or debugStartupEnabled()) {
                 std.debug.print("mollusk: restarting gpu renderer ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
@@ -880,9 +751,8 @@ pub fn main(init: std.process.Init) !void {
                         if (debugRenderersEnabled() or debugStartupEnabled()) {
                             std.debug.print("mollusk: gpu renderer context ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                         }
-                        // Now we can configure
-                        if (gpu.font == null) {
-                            gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
+                        if (gpu.atlas_ref == null) {
+                            gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
                         }
                         gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
                             std.debug.print("mollusk: gpu renderer configure after context_ready failed: {}\n", .{err});

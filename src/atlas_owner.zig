@@ -62,9 +62,8 @@ pub const Frontend = struct {
     stop_requested: bool = false,
     active: bool = false,
 
-    // Bootstrap state (font + atlas init on thread)
+    // Bootstrap state — set by thread, read by main after responses.
     bootstrap_config: ?BootstrapConfig = null,
-    bootstrap_font: ?*snail.Font = null,
     bootstrap_font_path: []const u8 = "",
     bootstrap_err: ?anyerror = null,
 
@@ -170,7 +169,6 @@ pub const Frontend = struct {
             std.debug.print("mollusk[atlas-owner] thread running\n", .{});
         }
 
-        // Bootstrap: font + atlas init (before entering normal loop)
         if (self.bootstrap_config) |config| {
             self.runBootstrap(config) catch |err| {
                 self.bootstrap_err = err;
@@ -200,14 +198,12 @@ pub const Frontend = struct {
             }
 
             const timer = perf.Timer.now();
-
-            // Read current atlas (lock-free).
             const current = self.atlas_ref.load();
             const before_pages = current.pageCount();
-
             const pending_text = local_pending.text();
-            const maybe_next = current.extendText(pending_text) catch {
-                atlasDebug(timer, "extend failed for {} bytes", .{pending_text.len});
+
+            const maybe_next = current.ensureText(.{}, pending_text) catch {
+                atlasDebug(timer, "ensureText failed for {} bytes", .{pending_text.len});
                 writeResponse(self.response_fds[1], .{
                     .tag = .failed,
                     .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
@@ -216,8 +212,7 @@ pub const Frontend = struct {
             };
 
             if (maybe_next) |next_atlas| {
-                // Move the new atlas to the heap and publish atomically.
-                const heap_atlas = allocator.create(snail.Atlas) catch {
+                const heap_atlas = allocator.create(snail.TextAtlas) catch {
                     atlasDebug(timer, "alloc failed for atlas", .{});
                     var discard = next_atlas;
                     discard.deinit();
@@ -232,7 +227,7 @@ pub const Frontend = struct {
                 const after_pages = heap_atlas.pageCount();
                 self.atlas_ref.publish(heap_atlas);
 
-                atlasDebug(timer, "extended text ({} bytes) pages {}->{}", .{
+                atlasDebug(timer, "extended ({} bytes) pages {}->{}", .{
                     pending_text.len,
                     before_pages,
                     after_pages,
@@ -257,39 +252,36 @@ pub const Frontend = struct {
         const timer = perf.Timer.now();
         const alloc = config.allocator;
 
-        // Phase 1: font prep (main needs this for PTY grid size)
-        const font_result = try bootstrapFont(alloc, config.font_path_cfg);
-        self.bootstrap_font = font_result.font;
-        self.bootstrap_font_path = font_result.path;
-        atlasDebug(timer, "font ready", .{});
+        // Phase 1: parse the font into a TextAtlas. No rasterization yet, but
+        // cellMetrics already works against the parsed font config.
+        const font_path = try findFontPathFc(alloc, config.font_path_cfg);
+        errdefer alloc.free(font_path);
 
-        // Signal font ready — main can fork PTY while atlas init continues
-        writeResponse(self.response_fds[1], .{ .tag = .font_ready });
+        const font_data = try mmapFontFile(font_path);
 
-        // Phase 2: atlas init (overlaps with PTY fork on main thread)
-        const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-        var initial_atlas = try snail.Atlas.initAscii(alloc, font_result.font, ascii);
+        var initial_atlas = try snail.TextAtlas.init(alloc, &.{.{ .data = font_data }});
         errdefer initial_atlas.deinit();
 
         const atlas_ref = try alloc.create(atlas_ref_mod.AtlasRef);
         errdefer alloc.destroy(atlas_ref);
         atlas_ref.* = try atlas_ref_mod.AtlasRef.init(alloc, initial_atlas);
 
+        self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
+        atlasDebug(timer, "font ready", .{});
+
+        // Tell main it can compute cell metrics and fork the PTY now.
+        writeResponse(self.response_fds[1], .{ .tag = .font_ready });
+
+        // Phase 2: rasterize printable ASCII into a new snapshot.
+        const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        const current = atlas_ref.load();
+        if (try current.ensureText(.{}, ascii)) |populated| {
+            const heap = try alloc.create(snail.TextAtlas);
+            heap.* = populated;
+            atlas_ref.publish(heap);
+        }
         atlasDebug(timer, "bootstrap complete", .{});
-    }
-
-    fn bootstrapFont(alloc: std.mem.Allocator, font_path_cfg: []const u8) !struct { font: *snail.Font, path: []const u8 } {
-        const font_path = try findFontPathFc(alloc, font_path_cfg);
-        errdefer alloc.free(font_path);
-
-        const font_data = try mmapFontFile(font_path);
-
-        const font = try alloc.create(snail.Font);
-        errdefer alloc.destroy(font);
-        font.* = try snail.Font.init(font_data);
-
-        return .{ .font = font, .path = font_path };
     }
 };
 

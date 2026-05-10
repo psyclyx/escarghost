@@ -65,7 +65,6 @@ const Request = struct {
 pub const Frontend = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     atlas_thread: ?*atlas_owner.Frontend = null,
-    font: *const snail.Font = undefined,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
@@ -90,7 +89,6 @@ pub const Frontend = struct {
         self: *Frontend,
         shm_opaque: *anyopaque,
         atlas_ref: *atlas_ref_mod.AtlasRef,
-        font: *const snail.Font,
         atlas_thread: *atlas_owner.Frontend,
         width: u32,
         height: u32,
@@ -100,7 +98,6 @@ pub const Frontend = struct {
         self.* = .{
             .atlas_ref = atlas_ref,
             .atlas_thread = atlas_thread,
-            .font = font,
         };
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
@@ -195,7 +192,7 @@ pub const Frontend = struct {
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, self.font);
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, self.atlas_ref.load());
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);
@@ -248,6 +245,12 @@ pub const Frontend = struct {
         if (cpuRendererDebugEnabled()) {
             std.debug.print("mollusk[cpu-renderer] thread running\n", .{});
         }
+        var ctx = shm_render.SnapshotRenderer.init(std.heap.smp_allocator) catch |err| {
+            std.debug.print("mollusk[cpu-renderer]: init failed: {}\n", .{err});
+            return;
+        };
+        defer ctx.deinit();
+
         while (true) {
             _ = c.pthread_mutex_lock(&self.mutex);
             while (!self.request_pending and !self.stop_requested) {
@@ -297,21 +300,31 @@ pub const Frontend = struct {
                         continue;
                     };
 
-                    // Load current atlas atomically — no lock needed.
                     const atlas = self.atlas_ref.load();
 
-                    const misses = shm_render.renderSnapshotToMemory(
+                    const misses = ctx.renderToMemory(
                         map_ptr,
                         buffer.desc.width,
                         buffer.desc.height,
                         buffer.desc.stride,
                         &self.snapshots[snapshot_slot],
                         atlas,
-                        self.font,
                         request.font_size,
                         request.cell_width,
                         request.cell_height,
-                    );
+                    ) catch |err| {
+                        cpuRendererDebug(timer, "render failed buffer={} serial={} err={}", .{
+                            buffer_index, request.serial, err,
+                        });
+                        writeResponse(self.response_fds[1], .{
+                            .tag = .failed,
+                            .buffer_index = buffer_index,
+                            .snapshot_slot = snapshot_slot,
+                            .serial = request.serial,
+                        });
+                        continue;
+                    };
+
                     if (!misses.isEmpty()) {
                         if (self.atlas_thread) |thread| thread.requestMany(&misses);
                     }

@@ -325,7 +325,6 @@ pub const Frontend = struct {
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
 
     // Set by main before spawning thread
-    font: ?*const snail.Font = null,
     atlas_ref: ?*atlas_ref_mod.AtlasRef = null,
     atlas_thread: ?*atlas_owner.Frontend = null,
 
@@ -379,15 +378,13 @@ pub const Frontend = struct {
         self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
     }
 
-    /// Provide the font and atlas ref after they are initialized.
+    /// Provide the atlas ref after it is initialized.
     /// Must be called before requestConfigure.
     pub fn setSharedState(
         self: *Frontend,
-        font: *const snail.Font,
         atlas_ref: *atlas_ref_mod.AtlasRef,
         atlas_thread: *atlas_owner.Frontend,
     ) void {
-        self.font = font;
         self.atlas_ref = atlas_ref;
         self.atlas_thread = atlas_thread;
     }
@@ -427,11 +424,11 @@ pub const Frontend = struct {
     pub fn queueRender(self: *Frontend, term: anytype, serial: u32) !void {
         if (!self.active or !self.ready) return error.NotReady;
         if (self.render_in_flight or self.request_pending) return error.Busy;
-        const font = self.font orelse return error.NotReady;
+        const atlas_ref = self.atlas_ref orelse return error.NotReady;
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, font);
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_ref.load());
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);
@@ -574,11 +571,6 @@ pub const Frontend = struct {
                     const reconfigure_timer = perf.Timer.now();
                     gpuDebug(timer, "configure {}x{} font={d:.1}", .{ request.width, request.height, request.font_size });
 
-                    const font = self.font orelse {
-                        gpuDebug(timer, "configure failed: no font set", .{});
-                        writeResponse(self.response_fds[1], .{ .tag = .failed });
-                        continue;
-                    };
                     const atlas_ref = self.atlas_ref orelse {
                         gpuDebug(timer, "configure failed: no atlas_ref set", .{});
                         writeResponse(self.response_fds[1], .{ .tag = .failed });
@@ -602,7 +594,6 @@ pub const Frontend = struct {
                     } else {
                         renderer = renderer_mod.Renderer.init(
                             std.heap.smp_allocator,
-                            font,
                             atlas_ref,
                             request.font_size,
                             request.cell_width,
@@ -620,9 +611,6 @@ pub const Frontend = struct {
                         );
                         renderer.?.setDebugResetAtlas(runtime_flags.reset_atlas_each_frame);
                         renderer.?.reconfigure(request.width, request.height, request.font_size, request.cell_width, request.cell_height);
-                        if (renderer.?.debug_log_renderers) {
-                            std.debug.print("mollusk[gpu-renderer]: backend {s}\n", .{renderer.?.snail_renderer.backendName()});
-                        }
                     }
 
                     // Publish buffer descriptors for main thread

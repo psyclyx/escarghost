@@ -55,11 +55,12 @@ pub const SharedSnapshot = struct {
     cells: [MaxCells]Cell = [_]Cell{.{}} ** MaxCells,
 };
 
-pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, font: *const snail.Font) !void {
+pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *const snail.TextAtlas) !void {
     try term.updateRenderState();
 
     const colors = term.getColors();
     const cursor = term.getCursor();
+    const primary = atlas.primaryFaceIndex() catch 0;
 
     snapshot.header.default_fg = colors.foreground;
     snapshot.header.default_bg = colors.background;
@@ -100,12 +101,17 @@ pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, font: *c
                 .strikethrough = info.style.strikethrough != false,
             };
 
+            const glyph_id: u16 = blk: {
+                if (!info.has_text) break :blk 0;
+                if (!render_common.isRenderableCodepoint(info.codepoint)) break :blk 0;
+                const cp: u21 = @intCast(info.codepoint);
+                if (atlas.glyphIndex(primary, cp) catch null) |gid| break :blk gid;
+                break :blk 0;
+            };
+
             snapshot.cells[cell_index] = .{
                 .codepoint = info.codepoint,
-                .glyph_id = if (info.has_text and render_common.isRenderableCodepoint(info.codepoint))
-                    (font.glyphIndex(info.codepoint) catch 0)
-                else
-                    0,
+                .glyph_id = glyph_id,
                 .fg = info.fg orelse colors.foreground,
                 .bg = info.bg orelse colors.background,
                 .flags = @bitCast(flags),
