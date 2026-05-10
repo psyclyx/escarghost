@@ -6,11 +6,13 @@ const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_common = @import("render_common.zig");
+const gl_rect = @import("gl_rect.zig");
 const color = @import("color.zig");
 const perf = @import("perf.zig");
 const Rgb = color.Rgb;
 const Terminal = terminal_mod.Terminal;
 const CursorCell = render_common.CursorCell;
+const ColoredRect = gl_rect.ColoredRect;
 
 const gl = @cImport({
     @cDefine("GL_GLEXT_PROTOTYPES", "1");
@@ -37,8 +39,8 @@ fn detectSubpixelOrder() snail.SubpixelOrder {
 }
 
 fn hashColors(colors: terminal_mod.RenderColors) u64 {
-    var h: u64 = 0xcbf29ce484222325; // FNV offset basis
-    const m: u64 = 0x100000001b3; // FNV prime
+    var h: u64 = 0xcbf29ce484222325;
+    const m: u64 = 0x100000001b3;
     inline for (.{ colors.foreground, colors.background }) |c| {
         h = (h ^ c.r) *% m;
         h = (h ^ c.g) *% m;
@@ -59,7 +61,7 @@ fn hashColors(colors: terminal_mod.RenderColors) u64 {
 
 const CacheEntry = struct {
     text: []f32,
-    vec: []f32,
+    rects: []ColoredRect,
     generation: u64,
     byte_size: usize,
 };
@@ -68,11 +70,8 @@ const CacheEntry = struct {
 // Text: 4 vertices * 20 floats. Y is at offset 1 within each vertex.
 const TEXT_VERTEX_STRIDE = 20;
 const TEXT_Y_OFFSETS = [4]usize{ 1, 21, 41, 61 };
-// Vector: 1 packed primitive record. For translated row caching, adjust the
-// affine transform's translation Y (`ty`) so world-space Y shifts by `delta`.
-const VEC_FLOATS_PER_PRIM = snail.VECTOR_FLOATS_PER_PRIMITIVE;
-const VEC_TY_OFFSET = 22;
 const empty_f32_slice: []f32 = @constCast((&[_]f32{})[0..]);
+const empty_rect_slice: []ColoredRect = @constCast((&[_]ColoredRect{})[0..]);
 
 /// Patch Y coordinates in text vertex data by adding delta.
 fn patchTextY(data: []f32, delta: f32) void {
@@ -85,22 +84,19 @@ fn patchTextY(data: []f32, delta: f32) void {
     }
 }
 
-/// Patch Y coordinates in vector vertex data by adding delta.
-fn patchVecY(data: []f32, delta: f32) void {
-    var i: usize = 0;
-    while (i + VEC_FLOATS_PER_PRIM <= data.len) : (i += VEC_FLOATS_PER_PRIM) {
-        data[i + VEC_TY_OFFSET] += delta;
-    }
+/// Patch Y coordinates in ColoredRect array by adding delta.
+fn patchRectY(rects: []ColoredRect, delta: f32) void {
+    for (rects) |*r| r.y += delta;
 }
 
-/// Compute font cell metrics from a font and atlas.
-pub fn computeCellMetrics(font: *const snail.Font, atlas: *const snail.Atlas, font_size: f32) struct { cell_width: f32, cell_height: f32 } {
+/// Compute font cell metrics from font tables alone (no atlas needed).
+pub fn computeCellMetrics(font: *const snail.Font, font_size: f32) struct { cell_width: f32, cell_height: f32 } {
     const units_per_em: f32 = @floatFromInt(font.unitsPerEm());
     const scale = font_size / units_per_em;
     const m_gid = font.glyphIndex('M') catch 0;
-    const m_info = atlas.getGlyph(m_gid);
+    const advance = if (m_gid != 0) (font.advanceWidth(m_gid) catch null) else null;
     return .{
-        .cell_width = if (m_info) |g| @ceil(@as(f32, @floatFromInt(g.advance_width)) * scale) else @ceil(font_size * 0.6),
+        .cell_width = if (advance) |a| @ceil(@as(f32, @floatFromInt(a)) * scale) else @ceil(font_size * 0.6),
         .cell_height = @ceil(font_size * 1.2),
     };
 }
@@ -113,6 +109,10 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
     };
 }
 
+// Max rects per row: backgrounds + underlines + strikethrough = 3 * max_cols
+const MAX_RECTS_PER_ROW = 400 * 3;
+const MAX_DRAW_RECTS = 400 * 200 * 3 + 16; // all rows + cursor etc.
+
 /// GPU renderer state. Owned exclusively by the GPU renderer thread.
 /// Reads the shared font (immutable) and atlas (via AtlasRef, lock-free).
 pub const Renderer = struct {
@@ -122,8 +122,10 @@ pub const Renderer = struct {
 
     // GPU-private state
     snail_renderer: snail.Renderer,
-    atlas_view: snail.AtlasView = .{ .atlas = undefined, .layer_base = 0 },
+    atlas_handle: snail.AtlasHandle = .{ .atlas = undefined, .layer_base = 0 },
     atlas_generation: u64 = 0,
+
+    rect_renderer: gl_rect.GlRectRenderer,
 
     row_cache: std.AutoHashMap(u64, CacheEntry),
     generation: u64 = 0,
@@ -132,9 +134,12 @@ pub const Renderer = struct {
     cache_budget: usize = 32 * 1024 * 1024,
 
     draw_text: []f32,
-    draw_vec: []f32,
     scratch_text: []f32,
-    scratch_vec: []f32,
+    draw_rects: []ColoredRect,
+    scratch_rects: []ColoredRect,
+
+    // Scratch buffer for building UTF-8 text runs
+    run_buf: [2048]u8 = undefined,
 
     cell_width: f32,
     cell_height: f32,
@@ -172,21 +177,24 @@ pub const Renderer = struct {
         errdefer snail_renderer.deinit();
 
         const atlas = atlas_ref.load();
-        const atlas_view = snail_renderer.uploadAtlas(atlas);
+        const atlas_handle = snail_renderer.uploadAtlas(atlas);
         snail_renderer.setSubpixelOrder(detectSubpixelOrder());
         snail_renderer.setFillRule(.non_zero);
+
+        const rect_renderer = gl_rect.GlRectRenderer.init();
 
         return .{
             .font = font,
             .atlas_ref = atlas_ref,
             .snail_renderer = snail_renderer,
-            .atlas_view = atlas_view,
+            .atlas_handle = atlas_handle,
             .atlas_generation = atlas_ref.loadGeneration(),
+            .rect_renderer = rect_renderer,
             .row_cache = std.AutoHashMap(u64, CacheEntry).init(allocator),
             .draw_text = empty_f32_slice,
-            .draw_vec = empty_f32_slice,
             .scratch_text = empty_f32_slice,
-            .scratch_vec = empty_f32_slice,
+            .draw_rects = empty_rect_slice,
+            .scratch_rects = empty_rect_slice,
             .cell_width = cell_width,
             .cell_height = cell_height,
             .font_size = font_size,
@@ -202,7 +210,7 @@ pub const Renderer = struct {
         const gen = self.atlas_ref.loadGeneration();
         const atlas = self.atlas_ref.load();
         if (gen != self.atlas_generation) {
-            self.atlas_view = self.snail_renderer.uploadAtlas(atlas);
+            self.atlas_handle = self.snail_renderer.uploadAtlas(atlas);
             self.atlas_generation = gen;
             self.generation += 1;
             self.has_prev_frame = false;
@@ -227,24 +235,25 @@ pub const Renderer = struct {
         self.clearCache();
         self.row_cache.deinit();
         if (self.draw_buffers_ready) {
-            self.allocator.free(self.scratch_vec);
+            self.allocator.free(self.scratch_rects);
             self.allocator.free(self.scratch_text);
-            self.allocator.free(self.draw_vec);
+            self.allocator.free(self.draw_rects);
             self.allocator.free(self.draw_text);
         }
+        self.rect_renderer.deinit();
         self.snail_renderer.deinit();
     }
 
     pub fn ensureDrawBuffers(self: *Renderer) !void {
         if (self.draw_buffers_ready) return;
         const max_cells: usize = 400 * 200;
-        self.draw_text = try self.allocator.alloc(f32, max_cells * snail.FLOATS_PER_GLYPH);
+        self.draw_text = try self.allocator.alloc(f32, max_cells * snail.TEXT_FLOATS_PER_GLYPH);
         errdefer self.allocator.free(self.draw_text);
-        self.draw_vec = try self.allocator.alloc(f32, max_cells * @as(usize, snail.VECTOR_FLOATS_PER_PRIMITIVE) * 3);
-        errdefer self.allocator.free(self.draw_vec);
-        self.scratch_text = try self.allocator.alloc(f32, @as(usize, self.max_cols) * snail.FLOATS_PER_GLYPH);
+        self.draw_rects = try self.allocator.alloc(ColoredRect, MAX_DRAW_RECTS);
+        errdefer self.allocator.free(self.draw_rects);
+        self.scratch_text = try self.allocator.alloc(f32, @as(usize, self.max_cols) * snail.TEXT_FLOATS_PER_GLYPH);
         errdefer self.allocator.free(self.scratch_text);
-        self.scratch_vec = try self.allocator.alloc(f32, @as(usize, self.max_cols) * @as(usize, snail.VECTOR_FLOATS_PER_PRIMITIVE) * 3);
+        self.scratch_rects = try self.allocator.alloc(ColoredRect, MAX_RECTS_PER_ROW);
         self.draw_buffers_ready = true;
     }
 
@@ -252,7 +261,7 @@ pub const Renderer = struct {
         var it = self.row_cache.valueIterator();
         while (it.next()) |e| {
             self.allocator.free(e.text);
-            self.allocator.free(e.vec);
+            self.allocator.free(e.rects);
         }
         self.row_cache.clearRetainingCapacity();
         self.cache_bytes = 0;
@@ -301,7 +310,7 @@ pub const Renderer = struct {
         self: *Renderer,
         atlas: *const snail.Atlas,
         draw_text_len: *usize,
-        draw_vec_len: *usize,
+        draw_rect_len: *usize,
         x: u16,
         y: u16,
         style: terminal_mod.CursorVisualStyle,
@@ -318,25 +327,30 @@ pub const Renderer = struct {
         const cy = @as(f32, @floatFromInt(y)) * self.cell_height;
         const cc = self.color4(cursor_color orelse default_fg, 1.0);
 
-        var cbuf: [snail.VECTOR_FLOATS_PER_PRIMITIVE]f32 = undefined;
-        var cb = snail.VectorBatch.init(&cbuf);
         switch (style) {
-            .block => _ = cb.addRect(.{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height }, cc, .{ 0, 0, 0, 0 }, 0),
-            .bar => _ = cb.addRect(.{ .x = cx, .y = cy, .w = 2, .h = self.cell_height }, cc, .{ 0, 0, 0, 0 }, 0),
-            .underline => _ = cb.addRect(.{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2 }, cc, .{ 0, 0, 0, 0 }, 0),
-            .block_hollow => _ = cb.addRect(.{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height }, .{ 0, 0, 0, 0 }, cc, 1.5),
+            .block => self.draw_rects[draw_rect_len.*] = .{ .x = cx, .y = cy, .w = self.cell_width, .h = self.cell_height, .color = cc },
+            .bar => self.draw_rects[draw_rect_len.*] = .{ .x = cx, .y = cy, .w = 2, .h = self.cell_height, .color = cc },
+            .underline => self.draw_rects[draw_rect_len.*] = .{ .x = cx, .y = cy + self.cell_height - 2, .w = self.cell_width, .h = 2, .color = cc },
+            .block_hollow => {
+                // Draw 4 edges for hollow cursor
+                self.draw_rects[draw_rect_len.*] = .{ .x = cx, .y = cy, .w = self.cell_width, .h = 1.5, .color = cc };
+                draw_rect_len.* += 1;
+                self.draw_rects[draw_rect_len.*] = .{ .x = cx, .y = cy + self.cell_height - 1.5, .w = self.cell_width, .h = 1.5, .color = cc };
+                draw_rect_len.* += 1;
+                self.draw_rects[draw_rect_len.*] = .{ .x = cx, .y = cy, .w = 1.5, .h = self.cell_height, .color = cc };
+                draw_rect_len.* += 1;
+                self.draw_rects[draw_rect_len.*] = .{ .x = cx + self.cell_width - 1.5, .y = cy, .w = 1.5, .h = self.cell_height, .color = cc };
+            },
         }
-        const clen = cb.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE;
-        @memcpy(self.draw_vec[draw_vec_len.*..][0..clen], cb.slice());
-        draw_vec_len.* += clen;
+        draw_rect_len.* += 1;
 
         if (style != .block) return;
         const cell = cursor_cell orelse return;
         if (!cell.has_text or cell.glyph_id == 0) return;
         const info = atlas.getGlyph(cell.glyph_id) orelse return;
-        const cursor_text_y = self.viewport_h - @as(f32, @floatFromInt(y + 1)) * self.cell_height + self.cell_height * 0.2;
-        var inv_buf: [snail.FLOATS_PER_GLYPH]f32 = undefined;
-        var inv_batch = snail.Batch.init(&inv_buf);
+        const cursor_text_y = @as(f32, @floatFromInt(y)) * self.cell_height + self.cell_height * 0.8;
+        var inv_buf: [snail.TEXT_FLOATS_PER_GLYPH]f32 = undefined;
+        var inv_batch = snail.TextBatch.init(&inv_buf);
         _ = inv_batch.addGlyph(
             cx,
             cursor_text_y,
@@ -344,33 +358,35 @@ pub const Renderer = struct {
             info.bbox,
             info.band_entry,
             self.color4(cell.bg, 1.0),
-            self.atlas_view.glyphLayer(info.page_index),
+            self.atlas_handle.glyphLayer(info.page_index),
         );
-        @memcpy(self.draw_text[draw_text_len.*..][0..snail.FLOATS_PER_GLYPH], inv_batch.slice());
-        draw_text_len.* += snail.FLOATS_PER_GLYPH;
+        @memcpy(self.draw_text[draw_text_len.*..][0..snail.TEXT_FLOATS_PER_GLYPH], inv_batch.slice());
+        draw_text_len.* += snail.TEXT_FLOATS_PER_GLYPH;
         _ = default_bg;
     }
 
     /// Build row vertices into scratch buffers at Y=0 (position-independent).
-    /// NO cursor baked in — cursor is drawn as overlay.
+    /// Uses TextBatch.addText for shaped text runs with ligatures.
     fn buildRow(
         self: *Renderer,
-        atlas: *const snail.Atlas,
         term: *Terminal,
         default_fg: Rgb,
         default_bg: Rgb,
         misses: *glyph_misses.Set,
-    ) struct { text_len: usize, vec_len: usize } {
-        // Y=0 origin for both pipelines. Actual Y applied via patchTextY/patchVecY.
-        const cell_y_tl: f32 = 0;
-        const cell_y_bl: f32 = 0; // text baseline offset added below
+    ) struct { text_len: usize, rect_len: usize } {
+        const cell_y: f32 = 0;
 
-        var text_batch = snail.Batch.init(self.scratch_text);
-        var vec_batch = snail.VectorBatch.init(self.scratch_vec);
+        var text_batch = snail.TextBatch.init(self.scratch_text);
+        var rect_count: usize = 0;
 
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
         var bg_span_len: u16 = 0;
+
+        // Text run state: collect consecutive cells with same fg color
+        var run_start: u16 = 0;
+        var run_fg: ?Rgb = null;
+        var run_len: usize = 0;
 
         term.beginCellIteration();
         var col_idx: u16 = 0;
@@ -400,12 +416,16 @@ pub const Renderer = struct {
             } else {
                 if (bg_span_len > 0) {
                     if (bg_span_color) |sc| {
-                        _ = vec_batch.addRect(.{
-                            .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                            .y = cell_y_tl,
-                            .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                            .h = self.cell_height,
-                        }, self.color4(sc, 1.0), .{ 0, 0, 0, 0 }, 0);
+                        if (rect_count < self.scratch_rects.len) {
+                            self.scratch_rects[rect_count] = .{
+                                .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                                .y = cell_y,
+                                .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                                .h = self.cell_height,
+                                .color = self.color4(sc, 1.0),
+                            };
+                            rect_count += 1;
+                        }
                     }
                 }
                 if (cell_bg) |cbg| {
@@ -418,75 +438,135 @@ pub const Renderer = struct {
                 }
             }
 
-            if (cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000) {
-                const gid = self.font.glyphIndex(cell.codepoint) catch 0;
-                if (atlas.getGlyph(gid)) |info| {
-                    _ = text_batch.addGlyph(
-                        @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                        cell_y_bl + self.cell_height * 0.2,
-                        self.font_size,
-                        info.bbox,
-                        info.band_entry,
-                        self.color4(fg, 1.0),
-                        self.atlas_view.glyphLayer(info.page_index),
-                    );
-                } else {
-                    misses.add(cell.codepoint);
+            // Check if this cell breaks the current text run (color change or non-text)
+            const has_renderable_text = cell.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
+            const fg_matches = if (run_fg) |rf| rf.r == fg.r and rf.g == fg.g and rf.b == fg.b else false;
+
+            if (!has_renderable_text or !fg_matches or cell.style.underline != 0 or cell.style.strikethrough != false) {
+                // Flush current text run
+                if (run_len > 0) {
+                    self.flushTextRun(&text_batch, run_start, run_len, cell_y, run_fg.?, misses);
+                    run_len = 0;
+                    run_fg = null;
                 }
-                if (cell.style.underline != 0)
-                    _ = vec_batch.addRect(.{
-                        .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                        .y = cell_y_tl + self.cell_height - 1,
-                        .w = self.cell_width,
-                        .h = 1,
-                    }, self.color4(fg, 1.0), .{ 0, 0, 0, 0 }, 0);
-                if (cell.style.strikethrough != false)
-                    _ = vec_batch.addRect(.{
-                        .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                        .y = cell_y_tl + self.cell_height * 0.45,
-                        .w = self.cell_width,
-                        .h = 1,
-                    }, self.color4(fg, 1.0), .{ 0, 0, 0, 0 }, 0);
+            }
+
+            if (has_renderable_text) {
+                if (run_fg == null) {
+                    run_start = col_idx;
+                    run_fg = fg;
+                    run_len = 0;
+                }
+                // Encode codepoint to run_buf
+                const encoded = std.unicode.utf8Encode(@intCast(cell.codepoint), self.run_buf[run_len..]) catch 0;
+                if (encoded > 0) {
+                    run_len += encoded;
+                } else {
+                    // Encoding failed, flush and skip
+                    if (run_len > 0) {
+                        self.flushTextRun(&text_batch, run_start, run_len, cell_y, run_fg.?, misses);
+                        run_len = 0;
+                        run_fg = null;
+                    }
+                }
+
+                if (cell.style.underline != 0) {
+                    if (rect_count < self.scratch_rects.len) {
+                        self.scratch_rects[rect_count] = .{
+                            .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
+                            .y = cell_y + self.cell_height - 1,
+                            .w = self.cell_width,
+                            .h = 1,
+                            .color = self.color4(fg, 1.0),
+                        };
+                        rect_count += 1;
+                    }
+                }
+                if (cell.style.strikethrough != false) {
+                    if (rect_count < self.scratch_rects.len) {
+                        self.scratch_rects[rect_count] = .{
+                            .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
+                            .y = cell_y + self.cell_height * 0.45,
+                            .w = self.cell_width,
+                            .h = 1,
+                            .color = self.color4(fg, 1.0),
+                        };
+                        rect_count += 1;
+                    }
+                }
             }
         }
+
+        // Flush final text run
+        if (run_len > 0) {
+            self.flushTextRun(&text_batch, run_start, run_len, cell_y, run_fg.?, misses);
+        }
+
+        // Flush final bg span
         if (bg_span_len > 0) {
             if (bg_span_color) |sc| {
-                _ = vec_batch.addRect(.{
-                    .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                    .y = cell_y_tl,
-                    .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                    .h = self.cell_height,
-                }, self.color4(sc, 1.0), .{ 0, 0, 0, 0 }, 0);
+                if (rect_count < self.scratch_rects.len) {
+                    self.scratch_rects[rect_count] = .{
+                        .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                        .y = cell_y,
+                        .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                        .h = self.cell_height,
+                        .color = self.color4(sc, 1.0),
+                    };
+                    rect_count += 1;
+                }
             }
         }
 
         return .{
-            .text_len = text_batch.glyphCount() * snail.FLOATS_PER_GLYPH,
-            .vec_len = vec_batch.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE,
+            .text_len = text_batch.glyphCount() * snail.TEXT_FLOATS_PER_GLYPH,
+            .rect_len = rect_count,
         };
     }
 
-    fn cacheRow(self: *Renderer, row_id: u64, text_len: usize, vec_len: usize) void {
+    fn flushTextRun(
+        self: *Renderer,
+        batch: *snail.TextBatch,
+        start_col: u16,
+        run_byte_len: usize,
+        y_base: f32,
+        fg: Rgb,
+        misses: *glyph_misses.Set,
+    ) void {
+        const x = @as(f32, @floatFromInt(start_col)) * self.cell_width;
+        const y = y_base + self.cell_height * 0.8;
+        const text = self.run_buf[0..run_byte_len];
+        const glyphs_before = batch.glyphCount();
+        _ = batch.addText(&self.atlas_handle, self.font, text, x, y, self.font_size, self.color4(fg, 1.0));
+        if (batch.glyphCount() == glyphs_before) {
+            // addText emitted nothing — glyphs are missing. Send the
+            // text to the atlas thread so extendText can discover them
+            // (including ligature substitutions via HarfBuzz).
+            misses.addRun(text);
+        }
+    }
+
+    fn cacheRow(self: *Renderer, row_id: u64, text_len: usize, rect_len: usize) void {
         if (self.row_cache.fetchRemove(row_id)) |kv| {
             self.cache_bytes -= kv.value.byte_size;
             self.allocator.free(kv.value.text);
-            self.allocator.free(kv.value.vec);
+            self.allocator.free(kv.value.rects);
         }
 
         const text = self.allocator.dupe(f32, self.scratch_text[0..text_len]) catch return;
-        const vec = self.allocator.dupe(f32, self.scratch_vec[0..vec_len]) catch {
+        const rects = self.allocator.dupe(ColoredRect, self.scratch_rects[0..rect_len]) catch {
             self.allocator.free(text);
             return;
         };
-        const byte_size = (text_len + vec_len) * @sizeOf(f32);
+        const byte_size = text_len * @sizeOf(f32) + rect_len * @sizeOf(ColoredRect);
         self.row_cache.put(row_id, .{
             .text = text,
-            .vec = vec,
+            .rects = rects,
             .generation = self.generation,
             .byte_size = byte_size,
         }) catch {
             self.allocator.free(text);
-            self.allocator.free(vec);
+            self.allocator.free(rects);
             return;
         };
         self.cache_bytes += byte_size;
@@ -496,7 +576,7 @@ pub const Renderer = struct {
             if (evict_it.next()) |entry| {
                 self.cache_bytes -= entry.value_ptr.byte_size;
                 self.allocator.free(entry.value_ptr.text);
-                self.allocator.free(entry.value_ptr.vec);
+                self.allocator.free(entry.value_ptr.rects);
                 self.row_cache.removeByPtr(entry.key_ptr);
             } else break;
         }
@@ -507,14 +587,15 @@ pub const Renderer = struct {
         self: *Renderer,
         entry: CacheEntry,
         text_y_delta: f32,
-        vec_y_delta: f32,
+        rect_y_delta: f32,
         draw_text_len: *usize,
-        draw_vec_len: *usize,
+        draw_rect_len: *usize,
     ) void {
-        if (entry.vec.len > 0) {
-            @memcpy(self.draw_vec[draw_vec_len.*..][0..entry.vec.len], entry.vec);
-            patchVecY(self.draw_vec[draw_vec_len.*..][0..entry.vec.len], vec_y_delta);
-            draw_vec_len.* += entry.vec.len;
+        if (entry.rects.len > 0) {
+            const dst = self.draw_rects[draw_rect_len.*..][0..entry.rects.len];
+            @memcpy(dst, entry.rects);
+            patchRectY(dst, rect_y_delta);
+            draw_rect_len.* += entry.rects.len;
         }
         if (entry.text.len > 0) {
             @memcpy(self.draw_text[draw_text_len.*..][0..entry.text.len], entry.text);
@@ -556,7 +637,7 @@ pub const Renderer = struct {
         }
 
         var draw_text_len: usize = 0;
-        var draw_vec_len: usize = 0;
+        var draw_rect_len: usize = 0;
         var cursor_cell: ?CursorCell = null;
         var misses: glyph_misses.Set = .{};
 
@@ -566,8 +647,7 @@ pub const Renderer = struct {
             if (row_idx >= 200) break;
             const row_id = term.getRowId();
 
-            const vec_y = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
-            const text_y = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
+            const row_y = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
 
             const needs_rebuild = dirty == .full or !self.has_prev_frame or
                 term.isRowDirty();
@@ -594,15 +674,15 @@ pub const Renderer = struct {
                                 cursor_cell = render_common.captureCursorCell(default_bg, cell.codepoint, glyph_id, cell.has_text, resolved);
                             }
                         }
-                        self.appendCached(entry, text_y, vec_y, &draw_text_len, &draw_vec_len);
+                        self.appendCached(entry, row_y, row_y, &draw_text_len, &draw_rect_len);
                         continue;
                     }
                 }
             }
 
-            const lens = self.buildRow(atlas, term, default_fg, default_bg, &misses);
+            const lens = self.buildRow(term, default_fg, default_bg, &misses);
 
-            self.cacheRow(row_id, lens.text_len, lens.vec_len);
+            self.cacheRow(row_id, lens.text_len, lens.rect_len);
 
             if (cursor.visible and cursor.in_viewport and row_idx == cursor.y) {
                 term.beginCellIteration();
@@ -624,14 +704,15 @@ pub const Renderer = struct {
                 }
             }
 
-            if (lens.vec_len > 0) {
-                @memcpy(self.draw_vec[draw_vec_len..][0..lens.vec_len], self.scratch_vec[0..lens.vec_len]);
-                patchVecY(self.draw_vec[draw_vec_len..][0..lens.vec_len], vec_y);
-                draw_vec_len += lens.vec_len;
+            if (lens.rect_len > 0) {
+                const dst = self.draw_rects[draw_rect_len..][0..lens.rect_len];
+                @memcpy(dst, self.scratch_rects[0..lens.rect_len]);
+                patchRectY(dst, row_y);
+                draw_rect_len += lens.rect_len;
             }
             if (lens.text_len > 0) {
                 @memcpy(self.draw_text[draw_text_len..][0..lens.text_len], self.scratch_text[0..lens.text_len]);
-                patchTextY(self.draw_text[draw_text_len..][0..lens.text_len], text_y);
+                patchTextY(self.draw_text[draw_text_len..][0..lens.text_len], row_y);
                 draw_text_len += lens.text_len;
             }
         }
@@ -645,7 +726,7 @@ pub const Renderer = struct {
         self.appendCursorOverlay(
             atlas,
             &draw_text_len,
-            &draw_vec_len,
+            &draw_rect_len,
             cursor.x,
             cursor.y,
             cursor.style,
@@ -657,7 +738,7 @@ pub const Renderer = struct {
             cursor_cell,
         );
 
-        if (draw_text_len == 0 and draw_vec_len == 0) {
+        if (draw_text_len == 0 and draw_rect_len == 0) {
             if (self.debug_log_frames) {
                 std.debug.print("mollusk: skipped blank frame (rows={}, dirty={}, has_prev={})\n", .{ row_idx, @intFromEnum(dirty), self.has_prev_frame });
             }
@@ -669,13 +750,15 @@ pub const Renderer = struct {
         gl.glClearColor(bg4[0], bg4[1], bg4[2], bg4[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
-        const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
-        self.snail_renderer.beginFrame();
+        // Unified Y-down (top-left origin) MVP for both rects and text (snail v0.2.0)
+        const mvp = snail.Mat4.ortho(0, self.viewport_w, self.viewport_h, 0, -1, 1);
 
-        if (draw_vec_len > 0)
-            self.snail_renderer.drawVector(self.draw_vec[0..draw_vec_len], self.viewport_w, self.viewport_h);
+        if (draw_rect_len > 0)
+            self.rect_renderer.drawRects(self.draw_rects[0..draw_rect_len], mvp);
+
+        self.snail_renderer.beginFrame();
         if (draw_text_len > 0)
-            self.snail_renderer.draw(self.draw_text[0..draw_text_len], mvp, self.viewport_w, self.viewport_h);
+            self.snail_renderer.drawText(self.draw_text[0..draw_text_len], mvp, self.viewport_w, self.viewport_h);
 
         gl.glFlush();
         term.resetDirty();
@@ -691,7 +774,7 @@ pub const Renderer = struct {
         const default_bg = header.default_bg;
 
         var draw_text_len: usize = 0;
-        var draw_vec_len: usize = 0;
+        var draw_rect_len: usize = 0;
         var cell_index: usize = 0;
         var cursor_cell: ?CursorCell = null;
 
@@ -700,15 +783,19 @@ pub const Renderer = struct {
 
         var row_idx: u16 = 0;
         while (row_idx < rows) : (row_idx += 1) {
-            const cell_y_tl = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
-            const cell_y_bl = self.viewport_h - @as(f32, @floatFromInt(row_idx + 1)) * self.cell_height;
+            const cell_y = @as(f32, @floatFromInt(row_idx)) * self.cell_height;
 
-            var text_batch = snail.Batch.init(self.draw_text[draw_text_len..]);
-            var vec_batch = snail.VectorBatch.init(self.draw_vec[draw_vec_len..]);
+            var text_batch = snail.TextBatch.init(self.draw_text[draw_text_len..]);
+            var rect_count: usize = 0;
 
             var bg_span_start: u16 = 0;
             var bg_span_color: ?Rgb = null;
             var bg_span_len: u16 = 0;
+
+            // Text run state for this row
+            var run_start: u16 = 0;
+            var run_fg: ?Rgb = null;
+            var run_len: usize = 0;
 
             var col_idx: u16 = 0;
             while (col_idx < cols and cell_index < header.cell_count) : ({
@@ -733,6 +820,7 @@ pub const Renderer = struct {
                     cursor_cell = render_common.captureCursorCell(default_bg, cell.codepoint, cell.glyph_id, flags.has_text, resolved);
                 }
 
+                // BG coalescing
                 const bg_matches = if (cell_bg) |cbg|
                     if (bg_span_color) |sc| sc.r == cbg.r and sc.g == cbg.g and sc.b == cbg.b else false
                 else
@@ -743,12 +831,16 @@ pub const Renderer = struct {
                 } else {
                     if (bg_span_len > 0) {
                         if (bg_span_color) |sc| {
-                            _ = vec_batch.addRect(.{
-                                .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                                .y = cell_y_tl,
-                                .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                                .h = self.cell_height,
-                            }, self.color4(sc, 1.0), .{ 0, 0, 0, 0 }, 0);
+                            if (draw_rect_len + rect_count < self.draw_rects.len) {
+                                self.draw_rects[draw_rect_len + rect_count] = .{
+                                    .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                                    .y = cell_y,
+                                    .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                                    .h = self.cell_height,
+                                    .color = self.color4(sc, 1.0),
+                                };
+                                rect_count += 1;
+                            }
                         }
                     }
                     if (cell_bg) |cbg| {
@@ -761,59 +853,96 @@ pub const Renderer = struct {
                     }
                 }
 
-                if (flags.has_text and cell.glyph_id != 0) {
-                    if (atlas.getGlyph(cell.glyph_id)) |info| {
-                        _ = text_batch.addGlyph(
-                            @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                            cell_y_bl + self.cell_height * 0.2,
-                            self.font_size,
-                            info.bbox,
-                            info.band_entry,
-                            self.color4(fg, 1.0),
-                            self.atlas_view.glyphLayer(info.page_index),
-                        );
-                    } else {
-                        misses.add(cell.codepoint);
+                // Check if this cell breaks the text run
+                const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
+                const fg_matches_run = if (run_fg) |rf| rf.r == fg.r and rf.g == fg.g and rf.b == fg.b else false;
+
+                if (!has_renderable_text or !fg_matches_run or flags.underline or flags.strikethrough) {
+                    // Flush text run
+                    if (run_len > 0) {
+                        const run_text = self.run_buf[0..run_len];
+                        const x = @as(f32, @floatFromInt(run_start)) * self.cell_width;
+                        const y = cell_y + self.cell_height * 0.8;
+                        const before = text_batch.glyphCount();
+                        _ = text_batch.addText(&self.atlas_handle, self.font, run_text, x, y, self.font_size, self.color4(run_fg.?, 1.0));
+                        if (text_batch.glyphCount() == before) misses.addRun(run_text);
+                        run_len = 0;
+                        run_fg = null;
+                    }
+                }
+
+                if (has_renderable_text) {
+                    if (run_fg == null) {
+                        run_start = col_idx;
+                        run_fg = fg;
+                        run_len = 0;
+                    }
+                    const encoded = std.unicode.utf8Encode(@intCast(cell.codepoint), self.run_buf[run_len..]) catch 0;
+                    if (encoded > 0) {
+                        run_len += encoded;
                     }
                 }
 
                 if (flags.underline) {
-                    _ = vec_batch.addRect(.{
-                        .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                        .y = cell_y_tl + self.cell_height - 1,
-                        .w = self.cell_width,
-                        .h = 1,
-                    }, self.color4(fg, 1.0), .{ 0, 0, 0, 0 }, 0);
+                    if (draw_rect_len + rect_count < self.draw_rects.len) {
+                        self.draw_rects[draw_rect_len + rect_count] = .{
+                            .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
+                            .y = cell_y + self.cell_height - 1,
+                            .w = self.cell_width,
+                            .h = 1,
+                            .color = self.color4(fg, 1.0),
+                        };
+                        rect_count += 1;
+                    }
                 }
                 if (flags.strikethrough) {
-                    _ = vec_batch.addRect(.{
-                        .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                        .y = cell_y_tl + self.cell_height * 0.45,
-                        .w = self.cell_width,
-                        .h = 1,
-                    }, self.color4(fg, 1.0), .{ 0, 0, 0, 0 }, 0);
+                    if (draw_rect_len + rect_count < self.draw_rects.len) {
+                        self.draw_rects[draw_rect_len + rect_count] = .{
+                            .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
+                            .y = cell_y + self.cell_height * 0.45,
+                            .w = self.cell_width,
+                            .h = 1,
+                            .color = self.color4(fg, 1.0),
+                        };
+                        rect_count += 1;
+                    }
                 }
             }
 
+            // Flush final text run for this row
+            if (run_len > 0) {
+                const run_text = self.run_buf[0..run_len];
+                const x = @as(f32, @floatFromInt(run_start)) * self.cell_width;
+                const y = cell_y + self.cell_height * 0.8;
+                const before = text_batch.glyphCount();
+                _ = text_batch.addText(&self.atlas_handle, self.font, run_text, x, y, self.font_size, self.color4(run_fg.?, 1.0));
+                if (text_batch.glyphCount() == before) misses.addRun(run_text);
+            }
+
+            // Flush final bg span
             if (bg_span_len > 0) {
                 if (bg_span_color) |sc| {
-                    _ = vec_batch.addRect(.{
-                        .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                        .y = cell_y_tl,
-                        .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                        .h = self.cell_height,
-                    }, self.color4(sc, 1.0), .{ 0, 0, 0, 0 }, 0);
+                    if (draw_rect_len + rect_count < self.draw_rects.len) {
+                        self.draw_rects[draw_rect_len + rect_count] = .{
+                            .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
+                            .y = cell_y,
+                            .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
+                            .h = self.cell_height,
+                            .color = self.color4(sc, 1.0),
+                        };
+                        rect_count += 1;
+                    }
                 }
             }
 
-            draw_text_len += text_batch.glyphCount() * snail.FLOATS_PER_GLYPH;
-            draw_vec_len += vec_batch.shapeCount() * snail.VECTOR_FLOATS_PER_PRIMITIVE;
+            draw_text_len += text_batch.glyphCount() * snail.TEXT_FLOATS_PER_GLYPH;
+            draw_rect_len += rect_count;
         }
 
         self.appendCursorOverlay(
             atlas,
             &draw_text_len,
-            &draw_vec_len,
+            &draw_rect_len,
             header.cursor_x,
             header.cursor_y,
             snapshotCursorStyle(header.cursor_style),
@@ -831,12 +960,14 @@ pub const Renderer = struct {
         gl.glClearColor(bg4[0], bg4[1], bg4[2], bg4[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
-        const mvp = snail.Mat4.ortho(0, self.viewport_w, 0, self.viewport_h, -1, 1);
+        const mvp = snail.Mat4.ortho(0, self.viewport_w, self.viewport_h, 0, -1, 1);
+
+        if (draw_rect_len > 0)
+            self.rect_renderer.drawRects(self.draw_rects[0..draw_rect_len], mvp);
+
         self.snail_renderer.beginFrame();
-        if (draw_vec_len > 0)
-            self.snail_renderer.drawVector(self.draw_vec[0..draw_vec_len], self.viewport_w, self.viewport_h);
         if (draw_text_len > 0)
-            self.snail_renderer.draw(self.draw_text[0..draw_text_len], mvp, self.viewport_w, self.viewport_h);
+            self.snail_renderer.drawText(self.draw_text[0..draw_text_len], mvp, self.viewport_w, self.viewport_h);
 
         gl.glFlush();
     }

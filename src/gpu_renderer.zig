@@ -54,6 +54,7 @@ pub const ResponseTag = enum(u8) {
     ready = 2,
     frame = 3,
     failed = 4,
+    retry = 5,
 };
 
 pub const Response = extern struct {
@@ -467,7 +468,7 @@ pub const Frontend = struct {
                 }
                 self.render_in_flight = false;
             },
-            .failed => {
+            .failed, .retry => {
                 if (response.snapshot_slot < SnapshotSlotCount) {
                     self.snapshot_busy[response.snapshot_slot] = false;
                 }
@@ -488,6 +489,7 @@ pub const Frontend = struct {
                 self.buffer_descs[i],
             );
             self.buffer_export_fds[i] = -1; // create() took ownership of the fd
+            self.buffers[i].attachListener();
             self.frontend_buffer_count += 1;
         }
     }
@@ -659,10 +661,10 @@ pub const Frontend = struct {
                     };
 
                     if (!misses.isEmpty()) {
-                        // Request atlas extension, report frame as failed (will retry)
+                        // Request atlas extension, retry after atlas update
                         if (self.atlas_thread) |at| at.requestMany(&misses);
                         writeResponse(self.response_fds[1], .{
-                            .tag = .failed,
+                            .tag = .retry,
                             .buffer_index = request.buffer_index,
                             .snapshot_slot = request.snapshot_slot,
                             .serial = request.serial,

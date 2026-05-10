@@ -24,6 +24,7 @@ let
     wayland
     libxkbcommon
     fontconfig
+    harfbuzz
   ];
 
   allBuildInputs = runtimeLibs ++ [

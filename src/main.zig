@@ -100,12 +100,11 @@ fn findFontPath(allocator: std.mem.Allocator, config_path: []const u8) ![]const 
 
 const CellMetrics = struct { cell_width: f32, cell_height: f32 };
 
-/// Font discovery + parse + atlas build (all CPU, no GL).
+/// Font discovery + parse + cell metrics (fast, no rasterization).
 /// Returns the font path string (caller must free).
-fn prepRenderer(
+fn prepFont(
     allocator: std.mem.Allocator,
     font_out: **snail.Font,
-    atlas_ref_out: **atlas_ref_mod.AtlasRef,
     cell_metrics_out: *CellMetrics,
     cfg_font_path: []const u8,
     font_size: f32,
@@ -121,7 +120,6 @@ fn prepRenderer(
         std.debug.print("mollusk: prep font mmap ({d:.1}ms)\n", .{timer.elapsedMs()});
     }
 
-    // Create font on heap
     const font = try allocator.create(snail.Font);
     errdefer allocator.destroy(font);
     font.* = try snail.Font.init(data);
@@ -129,24 +127,7 @@ fn prepRenderer(
         std.debug.print("mollusk: prep font init ({d:.1}ms)\n", .{timer.elapsedMs()});
     }
 
-    // Build initial atlas with printable ASCII
-    const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-    const initial_atlas = try snail.Atlas.initAscii(allocator, font, ascii);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep atlas init ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-
-    // Create AtlasRef on heap
-    const atlas_ref = try allocator.create(atlas_ref_mod.AtlasRef);
-    errdefer allocator.destroy(atlas_ref);
-    atlas_ref.* = try atlas_ref_mod.AtlasRef.init(allocator, initial_atlas);
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: prep atlas ref ({d:.1}ms)\n", .{timer.elapsedMs()});
-    }
-
-    // Compute cell metrics
-    const atlas = atlas_ref.load();
-    const metrics = renderer_mod.computeCellMetrics(font, atlas, font_size);
+    const metrics = renderer_mod.computeCellMetrics(font, font_size);
     cell_metrics_out.* = .{ .cell_width = metrics.cell_width, .cell_height = metrics.cell_height };
     if (debugStartupEnabled()) {
         std.debug.print("mollusk: prep cell metrics w={d:.1} h={d:.1} ({d:.1}ms)\n", .{
@@ -157,8 +138,29 @@ fn prepRenderer(
     }
 
     font_out.* = font;
-    atlas_ref_out.* = atlas_ref;
     return path;
+}
+
+/// Build the initial atlas with printable ASCII glyphs (slow — rasterization).
+fn prepAtlas(
+    allocator: std.mem.Allocator,
+    font: *const snail.Font,
+) !*atlas_ref_mod.AtlasRef {
+    const timer = perf.Timer.now();
+    const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    const initial_atlas = try snail.Atlas.initAscii(allocator, font, ascii);
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: prep atlas init ({d:.1}ms)\n", .{timer.elapsedMs()});
+    }
+
+    const atlas_ref = try allocator.create(atlas_ref_mod.AtlasRef);
+    errdefer allocator.destroy(atlas_ref);
+    atlas_ref.* = try atlas_ref_mod.AtlasRef.init(allocator, initial_atlas);
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: prep atlas ref ({d:.1}ms)\n", .{timer.elapsedMs()});
+    }
+
+    return atlas_ref;
 }
 
 // Shared state for callbacks
@@ -177,6 +179,14 @@ var g_needs_redraw: bool = false;
 var g_gpu_snapshot_dirty: bool = false;
 var g_gpu_reconfigure_requested: bool = false;
 var g_render_serial: u32 = 0;
+
+// Debug state (set in main, used by debug key handlers)
+var g_gpu: *gpu_renderer.Frontend = undefined;
+var g_cpu: *cpu_renderer_worker.Frontend = undefined;
+var g_active_render_path: *RenderPath = undefined;
+var g_gpu_restart: *GpuRestartBackoff = undefined;
+var g_atlas_thread: *atlas_owner.Frontend = undefined;
+var g_target_render_path: RenderPath = .gpu;
 
 const RenderPath = enum {
     cpu,
@@ -277,6 +287,43 @@ const GpuRestartBackoff = struct {
     }
 };
 
+fn debugKillActiveRenderer() void {
+    if (g_active_render_path.* == .gpu and g_gpu.active) {
+        noteGpuUnavailable(g_gpu, g_active_render_path, g_gpu_restart);
+        std.debug.print("mollusk: debug: killed gpu renderer\n", .{});
+    } else if (g_cpu.active) {
+        g_cpu.stop();
+        std.debug.print("mollusk: debug: killed cpu renderer\n", .{});
+    }
+}
+
+fn debugSwapRenderer() void {
+    if (g_target_render_path == .gpu) {
+        g_target_render_path = .cpu;
+        g_active_render_path.* = .cpu;
+        g_needs_redraw = true;
+        std.debug.print("mollusk: debug: target renderer -> cpu\n", .{});
+    } else {
+        g_target_render_path = .gpu;
+        g_gpu_snapshot_dirty = true;
+        std.debug.print("mollusk: debug: target renderer -> gpu\n", .{});
+    }
+}
+
+fn debugClearAtlas() void {
+    const alloc = std.heap.smp_allocator;
+    const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    var new_atlas = snail.Atlas.initAscii(alloc, g_font, ascii) catch return;
+    const heap = alloc.create(snail.Atlas) catch {
+        new_atlas.deinit();
+        return;
+    };
+    heap.* = new_atlas;
+    g_atlas_ref.publish(heap);
+    markRenderDirty();
+    std.debug.print("mollusk: debug: atlas cleared\n", .{});
+}
+
 fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
@@ -327,6 +374,10 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
                 markRenderDirty();
                 return;
             },
+            // Debug: Ctrl+Shift+F1/F2/F3
+            xkb_syms.XKB_KEY_F1 => { debugKillActiveRenderer(); return; },
+            xkb_syms.XKB_KEY_F2 => { debugSwapRenderer(); return; },
+            xkb_syms.XKB_KEY_F3 => { debugClearAtlas(); return; },
             else => {},
         }
     }
@@ -435,6 +486,7 @@ fn onFocus(focused: bool) void {
 }
 
 fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, term: *terminal_mod.Terminal) void {
+    if (g_target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !g_gpu_snapshot_dirty) return;
     gpu.queueRender(term, g_render_serial) catch |err| switch (err) {
         error.NotReady, error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot => return,
@@ -460,7 +512,7 @@ fn renderActivePath(
     term: *terminal_mod.Terminal,
 ) void {
     if (active_path != .cpu or !g_needs_redraw) return;
-    if (gpu.active and gpu.ready) return;
+    if (g_target_render_path == .gpu and gpu.active and gpu.ready) return;
     if (cpu.active) {
         const shm = wl.shm orelse return;
         cpu.ensureBuffers(@ptrCast(shm), wl.width, wl.height) catch |err| switch (err) {
@@ -568,7 +620,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var gpu: gpu_renderer.Frontend = .{};
-    defer gpu.stop();
     var gpu_restart = GpuRestartBackoff.init(
         cfg.gpu_restart_initial_delay_ms,
         cfg.gpu_restart_max_delay_ms,
@@ -586,10 +637,20 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Start atlas thread with font+atlas bootstrap — overlaps with Wayland init
+    var atlas_thread: atlas_owner.Frontend = .{};
+    try atlas_thread.startWithBootstrap(.{
+        .allocator = allocator,
+        .font_path_cfg = cfg.font_path,
+        .font_size = cfg.font_size,
+    });
+    defer atlas_thread.stop();
+
     // ── Phase 1: Wayland connect + 1px background ──
     var wl: wayland_mod.Wayland = undefined;
     try wl.init(800, 600, "mollusk");
     defer wl.deinit();
+    defer gpu.stop(); // must run before wl.deinit() to destroy wayland buffers first
 
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
         if (debugStartupEnabled()) {
@@ -611,25 +672,54 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("mollusk: GPU renderer requested but linux-dmabuf is unavailable; falling back to CPU\n", .{});
     }
 
-    // ── Phase 2: font + atlas init ──
-    var font_ptr: *snail.Font = undefined;
-    var atlas_ref_ptr: *atlas_ref_mod.AtlasRef = undefined;
-    var cell_metrics: CellMetrics = undefined;
-    const font_path = try prepRenderer(allocator, &font_ptr, &atlas_ref_ptr, &cell_metrics, cfg.font_path, cfg.font_size);
-    defer allocator.free(font_path);
+    // ── Phase 2: wait for font (overlapped with Wayland init) ──
+    const font_resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
+    if (font_resp.tag == .failed) {
+        if (atlas_thread.bootstrap_err) |err| return err;
+        return error.BootstrapFailed;
+    }
+    const font_ptr = atlas_thread.bootstrap_font.?;
+    defer allocator.free(atlas_thread.bootstrap_font_path);
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
 
+    const cell_metrics = renderer_mod.computeCellMetrics(font_ptr, cfg.font_size);
     g_font = font_ptr;
-    g_atlas_ref = atlas_ref_ptr;
     g_font_size = cfg.font_size;
     g_cell_width = cell_metrics.cell_width;
     g_cell_height = cell_metrics.cell_height;
 
-    // ── Phase 3: spawn atlas + CPU threads, fork PTY ──
-    var atlas_thread: atlas_owner.Frontend = .{};
-    defer atlas_thread.stop();
-    atlas_thread.start(atlas_ref_ptr) catch |err| {
-        std.debug.print("mollusk: atlas owner start failed: {}\n", .{err});
-    };
+    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, wl.width, wl.height);
+    g_viewport_w = wl.width;
+    g_viewport_h = wl.height;
+
+    // ── Phase 3: fork PTY (while atlas init continues in background) ──
+    var pty = if (exec_argv.items.len > 0)
+        try pty_mod.Pty.spawnCommand(exec_argv.items, grid.cols, grid.rows)
+    else
+        try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
+    defer pty.close();
+
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+    }
+
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    // ── Phase 4: wait for atlas, start renderers ──
+    const atlas_resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
+    if (atlas_resp.tag == .failed) {
+        if (atlas_thread.bootstrap_err) |err| return err;
+        return error.BootstrapFailed;
+    }
+    const atlas_ref_ptr = atlas_thread.atlas_ref;
+    g_atlas_ref = atlas_ref_ptr;
+    if (debugStartupEnabled()) {
+        std.debug.print("mollusk: atlas ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
 
     var cpu: cpu_renderer_worker.Frontend = .{};
     defer cpu.stop();
@@ -655,20 +745,6 @@ pub fn main(init: std.process.Init) !void {
         gpu.setSharedState(font_ptr, atlas_ref_ptr, &atlas_thread);
     }
 
-    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, wl.width, wl.height);
-    g_viewport_w = wl.width;
-    g_viewport_h = wl.height;
-
-    var term: terminal_mod.Terminal = undefined;
-    try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
-    defer term.deinit();
-
-    var pty = if (exec_argv.items.len > 0)
-        try pty_mod.Pty.spawnCommand(exec_argv.items, grid.cols, grid.rows)
-    else
-        try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
-    defer pty.close();
-
     term.pty_fd = pty.master_fd;
 
     g_term = &term;
@@ -684,12 +760,13 @@ pub fn main(init: std.process.Init) !void {
     g_gpu_reconfigure_requested = false;
     g_render_serial = 0;
 
-    if (debugStartupEnabled()) {
-        std.debug.print("mollusk: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
-    }
-
-    // ── Phase 4: early PTY drain + event loop ──
+    // ── Phase 5: early PTY drain + event loop ──
     var active_render_path: RenderPath = .cpu;
+    g_gpu = &gpu;
+    g_cpu = &cpu;
+    g_active_render_path = &active_render_path;
+    g_gpu_restart = &gpu_restart;
+    g_atlas_thread = &atlas_thread;
 
     // Drain early PTY output
     var have_early_output = false;
@@ -721,7 +798,7 @@ pub fn main(init: std.process.Init) !void {
     var child_exited = false;
 
     main_loop: while (!wl.closed and !child_exited) {
-        if (!gpu.active and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
+        if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
             gpu.start() catch |err| {
                 std.debug.print("mollusk: gpu renderer restart failed: {}\n", .{err});
                 gpu_restart.scheduleRetry();
@@ -749,7 +826,7 @@ pub fn main(init: std.process.Init) !void {
                     noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
                     continue;
                 };
-            } else if (gpu_allowed and wl.linux_dmabuf != null) {
+            } else if (g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null) {
                 gpu_restart.scheduleImmediate();
             }
         }
@@ -760,7 +837,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Key repeat timeout — wake up in time for next repeat event
         const repeat_timeout: c_int = if (wl.pumpRepeat()) |ms| @intCast(ms) else -1;
-        const restart_timeout = if (!gpu.active and gpu_allowed and wl.linux_dmabuf != null)
+        const restart_timeout = if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null)
             gpu_restart.timeoutMs()
         else
             null;
@@ -830,8 +907,8 @@ pub fn main(init: std.process.Init) !void {
                         }
                     },
                     .frame => {
-                        if (resp.serial != g_render_serial) {
-                            // Stale frame, ignore
+                        if (resp.serial != g_render_serial or g_target_render_path != .gpu) {
+                            // Stale frame or target changed, discard
                         } else {
                             if (debugRenderersEnabled()) {
                                 std.debug.print("mollusk: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
@@ -860,6 +937,10 @@ pub fn main(init: std.process.Init) !void {
                                 term.resetDirty();
                             }
                         }
+                    },
+                    .retry => {
+                        // Glyph miss — atlas extension requested, retry on next frame
+                        g_gpu_snapshot_dirty = true;
                     },
                     .failed => {
                         std.debug.print("mollusk: gpu renderer failed\n", .{});
@@ -912,6 +993,7 @@ pub fn main(init: std.process.Init) !void {
                     .failed => {
                         std.debug.print("mollusk: atlas owner update failed for {} codepoints\n", .{resp.requested_count});
                     },
+                    .font_ready, .bootstrap_ready => {},
                 }
             }
         }

@@ -49,8 +49,10 @@ pub fn build(b: *std.Build) void {
         const snail_dep = b.dependency("snail", .{});
         const snail_opts = b.addOptions();
         snail_opts.addOption(bool, "enable_profiling", false);
-        snail_opts.addOption(bool, "enable_harfbuzz", false);
+        snail_opts.addOption(bool, "enable_harfbuzz", true);
         snail_opts.addOption(bool, "enable_vulkan", false);
+        snail_opts.addOption(bool, "enable_opengl", true);
+        snail_opts.addOption(bool, "enable_cpu", true);
         snail_opts.addOption(bool, "force_gl33", false);
 
         const vk_stub = b.createModule(.{
@@ -65,17 +67,9 @@ pub fn build(b: *std.Build) void {
         });
         snail_mod.addOptions("build_options", snail_opts);
         snail_mod.linkSystemLibrary("OpenGL", .{});
+        snail_mod.linkSystemLibrary("harfbuzz", .{});
         snail_mod.addImport("vulkan_shaders", vk_stub);
         root_module.addImport("snail", snail_mod);
-
-        // CPU renderer (snail's extra module for software rendering)
-        const cpu_renderer_mod = b.createModule(.{
-            .root_source_file = snail_dep.path("src/extra/cpu_renderer.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        cpu_renderer_mod.addImport("snail", snail_mod);
-        root_module.addImport("cpu_renderer", cpu_renderer_mod);
     }
 
     // Wayland + EGL + OpenGL
