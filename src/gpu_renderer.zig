@@ -658,15 +658,13 @@ pub const Frontend = struct {
                     };
 
                     if (!misses.isEmpty()) {
-                        // Request atlas extension, retry after atlas update
+                        // Kick off async atlas extension but still commit the
+                        // frame we drew — the atlas thread can't always
+                        // satisfy a miss in one round (e.g. when it produces
+                        // a snapshot whose glyph_map says present but the LUT
+                        // says missing), and we'd rather show partial text
+                        // than spin forever waiting.
                         if (self.atlas_thread) |at| at.requestMany(&misses);
-                        writeResponse(self.response_fds[1], .{
-                            .tag = .retry,
-                            .buffer_index = request.buffer_index,
-                            .snapshot_slot = request.snapshot_slot,
-                            .serial = request.serial,
-                        });
-                        continue;
                     }
 
                     gpuDebug(timer, "render complete buffer={} in {d:.1}ms", .{

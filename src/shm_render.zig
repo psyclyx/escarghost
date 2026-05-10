@@ -155,6 +155,40 @@ pub const ShmFrame = struct {
     }
 };
 
+/// Same as renderer.zig's RunAccumulator: collect a same-color text run for
+/// HB to shape as a unit (ligatures form within the run).
+const RunAccumulator = struct {
+    text: [2048]u8 = undefined,
+    text_len: usize = 0,
+    start_col: u16 = 0,
+    fg: ?Rgb = null,
+
+    fn reset(self: *RunAccumulator) void {
+        self.text_len = 0;
+        self.fg = null;
+    }
+
+    fn isEmpty(self: *const RunAccumulator) bool {
+        return self.text_len == 0;
+    }
+
+    fn appendCell(self: *RunAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
+        if (self.fg == null) {
+            self.start_col = col;
+            self.fg = fg;
+        }
+        if (self.text_len + 4 > self.text.len) return;
+        const n = std.unicode.utf8Encode(@intCast(codepoint), self.text[self.text_len..]) catch 0;
+        if (n == 0) return;
+        self.text_len += n;
+    }
+
+    fn fgMatches(self: *const RunAccumulator, fg: Rgb) bool {
+        const cur = self.fg orelse return false;
+        return cur.r == fg.r and cur.g == fg.g and cur.b == fg.b;
+    }
+};
+
 /// Persistent CPU renderer + scene state. One instance per CPU worker thread.
 pub const SnapshotRenderer = struct {
     allocator: std.mem.Allocator,
@@ -375,6 +409,35 @@ pub const SnapshotRenderer = struct {
         return misses;
     }
 
+    /// Shape the run via HB (so ligatures form), let HB's natural glyph
+    /// advances do the placement. Cell_width matches the font's natural
+    /// advance, so ligatures span exactly the right number of cells.
+    fn flushRun(
+        self: *SnapshotRenderer,
+        run: *RunAccumulator,
+        cell_y: f32,
+        baseline: f32,
+        cell_width: f32,
+        font_size: f32,
+        misses: *glyph_misses.Set,
+    ) !void {
+        if (run.isEmpty()) return;
+        const fg = run.fg.?;
+
+        const opts_x = @as(f32, @floatFromInt(run.start_col)) * cell_width;
+        const result = try self.builder.addText(
+            .{},
+            run.text[0..run.text_len],
+            opts_x,
+            cell_y + baseline,
+            font_size,
+            fg.toFloat4(1.0),
+        );
+
+        if (result.missing) misses.addRun(run.text[0..run.text_len]);
+        run.reset();
+    }
+
     fn appendRow(
         self: *SnapshotRenderer,
         snapshot: *const render_snapshot.SharedSnapshot,
@@ -397,9 +460,13 @@ pub const SnapshotRenderer = struct {
 
         self.builder.reset();
 
+
+
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
         var bg_span_len: u16 = 0;
+
+        var run = RunAccumulator{};
 
         var col_idx: u16 = 0;
         while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
@@ -451,23 +518,17 @@ pub const SnapshotRenderer = struct {
                 }
             }
 
-            // Per-cell glyph emission. Each addText shapes one codepoint in
-            // isolation so the rendered glyph lands exactly at col*cell_width
-            // (HB's natural advance would drift over a long row).
             const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
+            const break_run = !has_renderable_text or flags.underline or flags.strikethrough or
+                (run.fg != null and !run.fgMatches(fg));
+            if (break_run and !run.isEmpty()) {
+                try self.flushRun(&run, cell_y, baseline, cell_width, font_size, misses);
+            }
+
             if (has_renderable_text) {
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &buf) catch 0;
-                if (n > 0) {
-                    const result = try self.builder.addText(
-                        .{},
-                        buf[0..n],
-                        @as(f32, @floatFromInt(col_idx)) * cell_width,
-                        cell_y + baseline,
-                        font_size,
-                        fg.toFloat4(1.0),
-                    );
-                    if (result.missing) misses.addRun(buf[0..n]);
+                run.appendCell(cell.codepoint, col_idx, fg);
+                if (flags.underline or flags.strikethrough) {
+                    try self.flushRun(&run, cell_y, baseline, cell_width, font_size, misses);
                 }
             }
 
@@ -497,6 +558,10 @@ pub const SnapshotRenderer = struct {
                     argbPixel(fg.r, fg.g, fg.b, 255),
                 );
             }
+        }
+
+        if (!run.isEmpty()) {
+            try self.flushRun(&run, cell_y, baseline, cell_width, font_size, misses);
         }
 
         if (bg_span_len > 0) {

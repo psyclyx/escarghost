@@ -30,12 +30,16 @@ const RESOURCE_ENTRY_CAP: usize = 4;
 pub const CellMetrics = struct { cell_width: f32, cell_height: f32 };
 
 /// Compute terminal cell dimensions from the atlas's primary face.
-/// Cell width comes from the 'M' advance; line height from the font's
-/// hhea metrics. Both are ceiled for crisp pixel alignment.
+/// Cell width is the font's natural 'M' advance — *not* ceiled. A
+/// well-behaved monospace font's ligatures (`==`, `=>`, `fl`, etc.) have
+/// advances that are exact N×em multiples of this, so HB's natural glyph
+/// advances align with our cell grid by construction. Rounding cell_width
+/// up would compound a fractional-pixel mismatch over a long row and
+/// drift the cursor away from the text.
 pub fn computeCellMetrics(atlas: *const snail.TextAtlas, font_size: f32) !CellMetrics {
     const cm = try atlas.cellMetrics(.{ .em = font_size });
     return .{
-        .cell_width = @ceil(cm.cell_width),
+        .cell_width = cm.cell_width,
         .cell_height = @ceil(cm.line_height),
     };
 }
@@ -299,20 +303,64 @@ pub const Renderer = struct {
         if (oldest_key) |k| self.evictRow(k);
     }
 
-    const RunResult = struct { missing: bool };
+    /// Accumulates a same-color text run so HB can shape it as a unit
+    /// (ligatures form across cells inside the run, but never across a
+    /// color change or a decorated cell).
+    const RunAccumulator = struct {
+        text: [2048]u8 = undefined,
+        text_len: usize = 0,
+        start_col: u16 = 0,
+        fg: ?Rgb = null,
 
-    /// Emit one cell's glyph at its cell-aligned x. Each call shapes the
-    /// codepoint in isolation so HB doesn't apply cross-cell contextual
-    /// alternates and so the rendered glyph lands exactly on the cell
-    /// grid (terminal cells are independent — natural HB advances would
-    /// drift over a long row).
-    fn emitCellGlyph(self: *Renderer, col_idx: u16, codepoint: u32, fg: Rgb) !RunResult {
-        var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return .{ .missing = false };
-        const x = @as(f32, @floatFromInt(col_idx)) * self.cell_width;
-        const y = self.baseline();
-        const result = try self.builder.addText(.{}, buf[0..n], x, y, self.font_size, self.textColor4(fg, 1.0));
-        return .{ .missing = result.missing };
+        fn reset(self: *RunAccumulator) void {
+            self.text_len = 0;
+            self.fg = null;
+        }
+
+        fn isEmpty(self: *const RunAccumulator) bool {
+            return self.text_len == 0;
+        }
+
+        fn appendCell(self: *RunAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
+            if (self.fg == null) {
+                self.start_col = col;
+                self.fg = fg;
+            }
+            if (self.text_len + 4 > self.text.len) return;
+            const n = std.unicode.utf8Encode(@intCast(codepoint), self.text[self.text_len..]) catch 0;
+            if (n == 0) return;
+            self.text_len += n;
+        }
+
+        fn fgMatches(self: *const RunAccumulator, fg: Rgb) bool {
+            const cur = self.fg orelse return false;
+            return cur.r == fg.r and cur.g == fg.g and cur.b == fg.b;
+        }
+    };
+
+    /// Shape the run as a unit so HB can form ligatures, then let HB's
+    /// natural glyph advances do the placement. Cell_width matches the
+    /// font's natural advance (no ceiling), so a well-behaved monospace
+    /// font's ligatures span exactly the right number of cells.
+    fn flushRun(self: *Renderer, run: *RunAccumulator, misses: *glyph_misses.Set) !bool {
+        if (run.isEmpty()) return false;
+        const fg = run.fg.?;
+
+        const opts_x = @as(f32, @floatFromInt(run.start_col)) * self.cell_width;
+        const result = try self.builder.addText(
+            .{},
+            run.text[0..run.text_len],
+            opts_x,
+            self.baseline(),
+            self.font_size,
+            self.textColor4(fg, 1.0),
+        );
+
+        const had_misses = result.missing;
+        if (had_misses) misses.addRun(run.text[0..run.text_len]);
+
+        run.reset();
+        return had_misses;
     }
 
     /// Build the row's TextBlob and rect set. Y coordinates are local to the
@@ -339,6 +387,8 @@ pub const Renderer = struct {
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;
         var bg_span_len: u16 = 0;
+
+        var run = RunAccumulator{};
 
         var col_idx: u16 = 0;
         while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
@@ -390,13 +440,20 @@ pub const Renderer = struct {
             }
 
             const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
+            // A run breaks on: non-text cell, fg color change, or any cell
+            // with underline/strikethrough (so decorations don't bleed across
+            // a ligature glyph that spans cells).
+            const break_run = !has_renderable_text or flags.underline or flags.strikethrough or
+                (run.fg != null and !run.fgMatches(fg));
+            if (break_run and !run.isEmpty()) {
+                if (try self.flushRun(&run, misses)) had_misses = true;
+            }
+
             if (has_renderable_text) {
-                const result = try self.emitCellGlyph(col_idx, cell.codepoint, fg);
-                if (result.missing) {
-                    had_misses = true;
-                    var buf: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &buf) catch 0;
-                    if (n > 0) misses.addRun(buf[0..n]);
+                run.appendCell(cell.codepoint, col_idx, fg);
+                // Cells with decorations don't ligate with neighbors.
+                if (flags.underline or flags.strikethrough) {
+                    if (try self.flushRun(&run, misses)) had_misses = true;
                 }
             }
 
@@ -420,6 +477,10 @@ pub const Renderer = struct {
                 };
                 rect_count += 1;
             }
+        }
+
+        if (!run.isEmpty()) {
+            if (try self.flushRun(&run, misses)) had_misses = true;
         }
 
         if (bg_span_len > 0) {
@@ -712,11 +773,10 @@ pub const Renderer = struct {
             cursor_cell,
         );
 
-        if (!misses.isEmpty()) {
-            self.releaseEphemeralBlobs();
-            return;
-        }
-
+        // Draw whatever we have, even with misses. The misses set is still
+        // forwarded to the atlas thread by the caller for an out-of-band
+        // extension, but we never want to drop a frame entirely — better
+        // for the user to see partial text than a stale/blank screen.
         try self.flushDraw(rect_index, default_bg);
         self.releaseEphemeralBlobs();
         frame_stats.record(frame_timer.elapsedUs());

@@ -273,36 +273,16 @@ pub const Frontend = struct {
         // Tell main it can compute cell metrics and fork the PTY now.
         writeResponse(self.response_fds[1], .{ .tag = .font_ready });
 
-        // Phase 2: rasterize printable ASCII one char at a time. Shaping the
-        // whole string at once activates contextual alternates (calt/liga) on
-        // programming fonts, producing variant GIDs we'd populate the atlas
-        // with — but at runtime we shape each cell in isolation, so HB
-        // returns the *standalone* GID, which would then be missing. Looping
-        // per char keeps bootstrap and runtime in agreement.
+        // Phase 2: rasterize printable ASCII as a single shape pass so HB
+        // can also discover and bake in the programming ligatures embedded
+        // in the string (`<=`, `==`, `=>`, `!=`, etc.) — those would
+        // otherwise be misses on first use at runtime.
         const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-        var current_ptr = atlas_ref.load();
-        var owned: ?*snail.TextAtlas = null;
-        errdefer if (owned) |heap| {
-            heap.deinit();
-            alloc.destroy(heap);
-        };
-        for (ascii) |ch| {
-            var buf: [1]u8 = .{ch};
-            const next = current_ptr.ensureText(.{}, buf[0..]) catch continue;
-            if (next) |populated| {
-                const heap = try alloc.create(snail.TextAtlas);
-                heap.* = populated;
-                if (owned) |old| {
-                    old.deinit();
-                    alloc.destroy(old);
-                }
-                owned = heap;
-                current_ptr = heap;
-            }
-        }
-        if (owned) |heap| {
+        const current = atlas_ref.load();
+        if (try current.ensureText(.{}, ascii)) |populated| {
+            const heap = try alloc.create(snail.TextAtlas);
+            heap.* = populated;
             atlas_ref.publish(heap);
-            owned = null;
         }
         atlasDebug(timer, "bootstrap complete", .{});
     }
