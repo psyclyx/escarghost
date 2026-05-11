@@ -271,45 +271,11 @@ pub const Frontend = struct {
         atlasDebug(timer, "font ready", .{});
 
         // Tell main it can compute cell metrics and fork the PTY now.
+        // Glyph rasterization happens lazily via the atlas-thread miss
+        // path — same mechanism programming ligatures and non-ASCII
+        // already use. The renderer's actual shaping context picks the
+        // correct GID, so we can't pollute the atlas with wrong variants.
         writeResponse(self.response_fds[1], .{ .tag = .font_ready });
-
-        // Phase 2: rasterize printable ASCII one char at a time. Shaping
-        // the whole string at once activates contextual alternates on
-        // programming fonts (Fira Code etc.), so HB returns *variant*
-        // GIDs for plain Latin chars depending on neighbours. We'd
-        // populate the atlas with those variants — but at runtime each
-        // run shapes in a different context and HB returns the
-        // *standalone* GID, which would be missing. Per-char bootstrap
-        // keeps plain chars in the atlas under their standalone GIDs.
-        // Programming ligatures (`==`, `=>`, etc.) are NOT covered here;
-        // they get rasterized lazily on first use via the atlas-thread
-        // miss path.
-        const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-        var current_ptr = atlas_ref.load();
-        var owned: ?*snail.TextAtlas = null;
-        errdefer if (owned) |heap| {
-            heap.deinit();
-            alloc.destroy(heap);
-        };
-        for (ascii) |ch| {
-            var buf: [1]u8 = .{ch};
-            const next = current_ptr.ensureText(.{}, buf[0..]) catch continue;
-            if (next) |populated| {
-                const heap = try alloc.create(snail.TextAtlas);
-                heap.* = populated;
-                if (owned) |old| {
-                    old.deinit();
-                    alloc.destroy(old);
-                }
-                owned = heap;
-                current_ptr = heap;
-            }
-        }
-        if (owned) |heap| {
-            atlas_ref.publish(heap);
-            owned = null;
-        }
-        atlasDebug(timer, "bootstrap complete", .{});
     }
 };
 
