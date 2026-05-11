@@ -27,6 +27,12 @@ writeShellApplication {
   ];
 
   text = ''
+    # shell.nix sets LD_LIBRARY_PATH for `zig build` dev runs; it points
+    # at the unslimmed harfbuzz (and friends) which overrides the
+    # nix-built binary's RUNPATH. Drop it so the bench reflects what an
+    # end user running the installed binary actually loads.
+    unset LD_LIBRARY_PATH
+
     RUNS=20
     WARMUP=10
     NESTED_SOCKET="wayland-bench-$$"
