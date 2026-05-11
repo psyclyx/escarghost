@@ -48,6 +48,13 @@ pub const Mods = struct {
     super_: bool = false,
 };
 
+pub const PendingMods = struct {
+    depressed: u32 = 0,
+    latched: u32 = 0,
+    locked: u32 = 0,
+    group: u32 = 0,
+};
+
 pub const MouseEvent = struct {
     kind: enum { button_press, button_release, motion, scroll },
     button: u32 = 0,
@@ -89,6 +96,13 @@ pub const Wayland = struct {
     xkb_context: ?*xkb.xkb_context = null,
     xkb_keymap: ?*xkb.xkb_keymap = null,
     xkb_state: ?*xkb.xkb_state = null,
+    // mmap'd keymap text from the compositor, owned by us, parsed lazily on
+    // first key event. xkb_keymap_new_from_buffer is ~12% of total startup
+    // cycles, and compositors push the keymap (and a modifier event) on
+    // initial seat bind whether the surface ever gets focus or not — so for
+    // short-lived sessions that never see a key press, the parse is waste.
+    keymap_buf: ?[]const u8 = null,
+    pending_mods: ?PendingMods = null,
 
     width: u32 = 0,
     height: u32 = 0,
@@ -263,6 +277,7 @@ pub const Wayland = struct {
         if (self.xkb_state) |s| xkb.xkb_state_unref(s);
         if (self.xkb_keymap) |k| xkb.xkb_keymap_unref(k);
         if (self.xkb_context) |ctx| xkb.xkb_context_unref(ctx);
+        self.unmapKeymapBuf();
 
         if (self.egl_display != egl.EGL_NO_DISPLAY) {
             _ = egl.eglMakeCurrent(self.egl_display, egl.EGL_NO_SURFACE, egl.EGL_NO_SURFACE, egl.EGL_NO_CONTEXT);
@@ -560,28 +575,48 @@ pub const Wayland = struct {
 
         if (format != wl.WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) return;
 
+        // Discard any prior parsed state and mapping; we'll parse the new
+        // keymap on demand via ensureKeymapParsed when a key/modifier
+        // event arrives.
+        if (self.xkb_state) |s| { xkb.xkb_state_unref(s); self.xkb_state = null; }
+        if (self.xkb_keymap) |k| { xkb.xkb_keymap_unref(k); self.xkb_keymap = null; }
+        self.unmapKeymapBuf();
+
         const c_mmap = @cImport(@cInclude("sys/mman.h"));
         const map = c_mmap.mmap(null, size, c_mmap.PROT_READ, c_mmap.MAP_PRIVATE, fd, 0);
         if (map == c_mmap.MAP_FAILED) return;
-        defer _ = c_mmap.munmap(map, size);
+        self.keymap_buf = @as([*]const u8, @ptrCast(map))[0..size];
+    }
 
-        const new_keymap = xkb.xkb_keymap_new_from_buffer(
+    fn unmapKeymapBuf(self: *Wayland) void {
+        const buf = self.keymap_buf orelse return;
+        const c_mmap = @cImport(@cInclude("sys/mman.h"));
+        _ = c_mmap.munmap(@constCast(@ptrCast(buf.ptr)), buf.len);
+        self.keymap_buf = null;
+    }
+
+    fn ensureKeymapParsed(self: *Wayland) bool {
+        if (self.xkb_keymap != null) return true;
+        const buf = self.keymap_buf orelse return false;
+        const km = xkb.xkb_keymap_new_from_buffer(
             self.xkb_context,
-            @ptrCast(map),
-            size - 1,
+            buf.ptr,
+            buf.len - 1, // strip trailing NUL the compositor includes
             xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
             xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
-        ) orelse return;
-
-        const new_state = xkb.xkb_state_new(new_keymap) orelse {
-            xkb.xkb_keymap_unref(new_keymap);
-            return;
+        ) orelse return false;
+        const state = xkb.xkb_state_new(km) orelse {
+            xkb.xkb_keymap_unref(km);
+            return false;
         };
-
-        if (self.xkb_state) |s| xkb.xkb_state_unref(s);
-        if (self.xkb_keymap) |k| xkb.xkb_keymap_unref(k);
-        self.xkb_keymap = new_keymap;
-        self.xkb_state = new_state;
+        self.xkb_keymap = km;
+        self.xkb_state = state;
+        // Apply any modifier state the compositor delivered before this point.
+        if (self.pending_mods) |m| {
+            _ = xkb.xkb_state_update_mask(state, m.depressed, m.latched, m.locked, 0, 0, m.group);
+            self.pending_mods = null;
+        }
+        return true;
     }
 
     fn keyboardEnter(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, _: ?*wl.wl_surface, _: ?*wl.wl_array) callconv(.c) void {
@@ -599,6 +634,7 @@ pub const Wayland = struct {
 
     fn keyboardKey(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
+        if (!self.ensureKeymapParsed()) return;
         const xkb_state = self.xkb_state orelse return;
 
         const keycode = key + 8; // evdev offset
@@ -634,8 +670,17 @@ pub const Wayland = struct {
 
     fn keyboardModifiers(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, depressed: u32, latched: u32, locked: u32, group: u32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
+        // Stash; ensureKeymapParsed will apply on first parse if we haven't
+        // already. If the keymap is already parsed, push the update through.
+        self.pending_mods = .{
+            .depressed = depressed,
+            .latched = latched,
+            .locked = locked,
+            .group = group,
+        };
         if (self.xkb_state) |state| {
             _ = xkb.xkb_state_update_mask(state, depressed, latched, locked, 0, 0, group);
+            self.pending_mods = null;
         }
     }
 
