@@ -72,6 +72,7 @@ writeShellApplication {
       --runs "$RUNS" \
       --warmup "$WARMUP" \
       --ignore-failure \
+      --shell=none \
       --command-name scrgo     "scrgo -e ${trueBin}" \
       --command-name foot      "foot ${trueBin}" \
       --command-name alacritty "alacritty -e ${trueBin}" \
