@@ -511,11 +511,27 @@ pub const Frontend = struct {
 
     pub fn stop(self: *Frontend) void {
         if (!self.active) return;
+        var was_ready: bool = undefined;
         {
             _ = c.pthread_mutex_lock(&self.mutex);
             defer _ = c.pthread_mutex_unlock(&self.mutex);
             self.stop_requested = true;
+            was_ready = self.context_ready;
             _ = c.pthread_cond_signal(&self.cond);
+        }
+        if (!was_ready) {
+            // OffscreenEgl.init() has no cancellation point, so joining
+            // would block on the full EGL bringup. Detach and skip libc's
+            // exit chain: atexit-run library destructors (libEGL._fini)
+            // race with the worker still inside the EGL platform — that
+            // races into SIGSEGV in EGL teardown. _exit lets the kernel
+            // reap everything at once. No wayland buffers exist yet
+            // (those come from configure, post-context_ready), so the
+            // compositor sees a clean socket close.
+            if (self.thread) |thread| thread.detach();
+            self.thread = null;
+            self.active = false;
+            c._exit(0);
         }
         if (self.thread) |thread| thread.join();
         self.thread = null;
