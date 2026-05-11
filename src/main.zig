@@ -501,6 +501,18 @@ pub fn main(init: std.process.Init) !void {
         cfg.gpu_restart_jitter_percent,
     );
 
+    // Spawn the CPU worker thread BEFORE anything pulls in NVIDIA EGL —
+    // NVIDIA hooks pthread_create on load and every subsequent spawn costs
+    // ~6 ms. The thread parks in cond_wait until start() assigns it work.
+    var cpu: cpu_renderer_worker.Frontend = .{};
+    defer cpu.stop();
+    cpu.spawnThread() catch |err| {
+        std.debug.print("scrgo: cpu renderer thread spawn failed: {}\n", .{err});
+    };
+    if (debugStartupEnabled()) {
+        std.debug.print("scrgo: cpu renderer thread spawned ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
+
     // Start GPU thread early — it begins EGL init immediately, no deps needed
     if (gpu_allowed) {
         gpu.start() catch |err| {
@@ -594,12 +606,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("scrgo: atlas ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
-    var cpu: cpu_renderer_worker.Frontend = .{};
-    defer cpu.stop();
     if (wl.shm) |shm| {
         cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |err| {
             std.debug.print("scrgo: cpu renderer start failed: {}\n", .{err});
         };
+    }
+    if (debugStartupEnabled()) {
+        std.debug.print("scrgo: cpu started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
     if (gpu.active and gpu.context_ready) {

@@ -85,20 +85,13 @@ pub const Frontend = struct {
         return self.response_fds[0];
     }
 
-    pub fn start(
-        self: *Frontend,
-        shm_opaque: *anyopaque,
-        atlas_ref: *atlas_ref_mod.AtlasRef,
-        atlas_thread: *atlas_owner.Frontend,
-        width: u32,
-        height: u32,
-    ) !void {
-        if (self.active) return;
+    // Spawn the worker thread eagerly, before anything that might install
+    // pthread_create wrappers (the NVIDIA EGL stack hooks libpthread when
+    // it loads, costing every later spawn ~6 ms). The thread parks in
+    // cond_wait until start() assigns it real work.
+    pub fn spawnThread(self: *Frontend) !void {
+        if (self.thread != null) return;
         const timer = perf.Timer.now();
-        self.* = .{
-            .atlas_ref = atlas_ref,
-            .atlas_thread = atlas_thread,
-        };
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
@@ -112,12 +105,25 @@ pub const Frontend = struct {
             _ = c.close(self.response_fds[1]);
             self.response_fds = [_]c_int{-1} ** 2;
         }
-
-        try self.ensureBuffers(shm_opaque, width, height);
-        errdefer self.destroyBuffers();
-
-        self.active = true;
         self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
+        cpuRendererDebug(timer, "spawn", .{});
+    }
+
+    pub fn start(
+        self: *Frontend,
+        shm_opaque: *anyopaque,
+        atlas_ref: *atlas_ref_mod.AtlasRef,
+        atlas_thread: *atlas_owner.Frontend,
+        width: u32,
+        height: u32,
+    ) !void {
+        if (self.active) return;
+        const timer = perf.Timer.now();
+        try self.spawnThread();
+        self.atlas_ref = atlas_ref;
+        self.atlas_thread = atlas_thread;
+        try self.ensureBuffers(shm_opaque, width, height);
+        self.active = true;
         cpuRendererDebug(timer, "start {}x{}", .{ width, height });
     }
 
