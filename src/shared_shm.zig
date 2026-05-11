@@ -28,7 +28,7 @@ pub const SharedBuffer = struct {
         const stride = width * 4;
         const size: usize = @as(usize, stride) * height;
 
-        const fd = c.memfd_create("scrgo-gpu-shm", @as(c_uint, 0));
+        const fd = c.memfd_create("scrgo-cpu-shm", @as(c_uint, 0));
         if (fd < 0) return error.MemfdCreateFailed;
         errdefer _ = c.close(fd);
 
