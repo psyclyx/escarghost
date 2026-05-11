@@ -913,6 +913,13 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("scrgo: exiting\n", .{});
     }
+
+    // Skip the defer chain (cpu/atlas/gpu thread joins, wl_display_disconnect,
+    // buffer/surface destroys, allocator frees). Wayland is designed so the
+    // compositor treats socket close identically to a clean disconnect — it
+    // tears down our resources either way. Threads and memory are reaped by
+    // the kernel. Saves ~2 ms of teardown on the critical path.
+    c._exit(0);
 }
 
 fn keysymToGhosttyKey(keysym: u32) c_uint {
