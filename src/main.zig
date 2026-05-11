@@ -652,34 +652,14 @@ pub fn main(init: std.process.Init) !void {
     g_gpu_restart = &gpu_restart;
     g_atlas_thread = &atlas_thread;
 
-    // Drain early PTY output
-    var have_early_output = false;
-    var early_bytes: usize = 0;
-    var early_buf: [4096]u8 = undefined;
-    var early_fds = [_]c.struct_pollfd{.{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 }};
-    _ = c.poll(&early_fds, 1, 5);
-    if (early_fds[0].revents & c.POLLIN != 0) {
-        while (true) {
-            const n = pty.read(&early_buf) catch break;
-            if (n == 0) break;
-            term.feedData(early_buf[0..n]);
-            early_bytes += n;
-            have_early_output = true;
-        }
-    }
-    if (debugStartupEnabled() or debugPtyEnabled()) {
-        std.debug.print("scrgo: early PTY output bytes={} have_output={}\n", .{ early_bytes, have_early_output });
-    }
-
-    if (have_early_output) {
-        markRenderDirty();
-        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
-    }
-    g_gpu_snapshot_dirty = have_early_output;
 
     // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
+
+    if (debugStartupEnabled()) {
+        std.debug.print("scrgo: main loop entry ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
 
     main_loop: while (!wl.closed and !child_exited) {
         if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
@@ -921,6 +901,9 @@ pub fn main(init: std.process.Init) !void {
         maybeQueueGpuRendererFrame(&gpu, &term);
     }
 
+    if (debugStartupEnabled()) {
+        std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
     renderer_mod.Renderer.frame_stats.log("frame");
     if (g_renderer_debug.anyLogs()) {
         if (wl.closed) {
