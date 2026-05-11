@@ -52,7 +52,9 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
 }
 
 const RowCache = struct {
-    blob: snail.TextBlob,
+    // Heap-allocated so the pointer stays stable when row_cache rehashes
+    // mid-frame; the scene records `cache.blob` directly.
+    blob: *snail.TextBlob,
     rects: []ColoredRect,
     content_hash: u64,
     atlas_identity: u64,
@@ -190,6 +192,7 @@ pub const Renderer = struct {
         var it = self.row_cache.valueIterator();
         while (it.next()) |e| {
             e.blob.deinit();
+            self.allocator.destroy(e.blob);
             self.allocator.free(e.rects);
         }
         self.row_cache.clearRetainingCapacity();
@@ -276,8 +279,8 @@ pub const Renderer = struct {
 
     fn evictRow(self: *Renderer, key: u64) void {
         if (self.row_cache.fetchRemove(key)) |kv| {
-            var blob = kv.value.blob;
-            blob.deinit();
+            kv.value.blob.deinit();
+            self.allocator.destroy(kv.value.blob);
             self.allocator.free(kv.value.rects);
             self.cache_bytes -= kv.value.byte_size;
         }
@@ -504,15 +507,22 @@ pub const Renderer = struct {
         had_misses: bool,
     ) ?*RowCache {
         if (self.row_cache.fetchRemove(key)) |kv| {
-            var prev = kv.value.blob;
-            prev.deinit();
+            kv.value.blob.deinit();
+            self.allocator.destroy(kv.value.blob);
             self.allocator.free(kv.value.rects);
             self.cache_bytes -= kv.value.byte_size;
         }
 
         const byte_size = rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
+        const blob_slot = self.allocator.create(snail.TextBlob) catch {
+            var b = blob;
+            b.deinit();
+            self.allocator.free(rects);
+            return null;
+        };
+        blob_slot.* = blob;
         self.row_cache.put(key, .{
-            .blob = blob,
+            .blob = blob_slot,
             .rects = rects,
             .content_hash = key,
             .atlas_identity = self.last_atlas_identity,
@@ -520,8 +530,8 @@ pub const Renderer = struct {
             .last_used_frame = self.frame_counter,
             .byte_size = byte_size,
         }) catch {
-            var b = blob;
-            b.deinit();
+            blob_slot.deinit();
+            self.allocator.destroy(blob_slot);
             self.allocator.free(rects);
             return null;
         };
@@ -554,7 +564,7 @@ pub const Renderer = struct {
     ) !void {
         cache.last_used_frame = self.frame_counter;
         const ov = self.allocOverrideSlot(override_index, row_y) orelse return error.TooManyDraws;
-        try self.scene.addText(.{ .blob = &cache.blob, .instances = ov });
+        try self.scene.addText(.{ .blob = cache.blob, .instances = ov });
         for (cache.rects) |r| {
             if (rect_index.* >= self.draw_rects.len) break;
             self.draw_rects[rect_index.*] = .{
