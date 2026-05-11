@@ -9,6 +9,7 @@ const c = @cImport({
     @cInclude("pthread.h");
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
+    @cInclude("stdio.h");
     @cInclude("fcntl.h");
     @cInclude("sys/mman.h");
     @cInclude("sys/stat.h");
@@ -282,6 +283,12 @@ pub const Frontend = struct {
 fn findFontPathFc(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
     if (config_path.len > 0) return try allocator.dupe(u8, config_path);
 
+    // Fast path: on-disk cache of the previous "monospace" resolution.
+    // Skips fontconfig's XML parse (~1.5 ms cold) when nothing relevant
+    // has changed. See font_path_cache.zig-style comment near
+    // tryReadFontPathCache for the invalidation strategy and tradeoff.
+    if (tryReadFontPathCache(allocator)) |cached| return cached;
+
     const pattern = c.FcNameParse("monospace") orelse return error.NoFontFound;
     defer c.FcPatternDestroy(pattern);
 
@@ -296,7 +303,119 @@ fn findFontPathFc(allocator: std.mem.Allocator, config_path: []const u8) ![]cons
     if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch)
         return error.NoFontFound;
 
-    return try allocator.dupe(u8, std.mem.sliceTo(file_ptr, 0));
+    const path = std.mem.sliceTo(file_ptr, 0);
+    writeFontPathCache(path);
+    return try allocator.dupe(u8, path);
+}
+
+// ── Font path cache ────────────────────────────────────────────────────────
+//
+// Caches the fontconfig "monospace" resolution at
+// $XDG_CACHE_HOME/scrgo/font-path (or ~/.cache/scrgo/font-path) so that
+// subsequent launches can skip fontconfig's XML parse — about 1.5 ms of
+// wall time on a typical cold start.
+//
+// Invalidation: the cache file's mtime is compared against:
+//   - /etc/fonts/fonts.conf            (system fontconfig config)
+//   - /var/cache/fontconfig            (system fontconfig cache dir)
+//   - ~/.config/fontconfig/fonts.conf  (user fontconfig override)
+//   - ~/.cache/fontconfig              (user fontconfig cache dir)
+// If any of those is newer than our cache, we re-resolve. We also stat()
+// the cached font path itself; a missing file forces re-resolution.
+//
+// Tradeoff: a user can edit fontconfig configuration in a way that
+// doesn't bump any of these mtimes (e.g. adds a font to a directory that
+// fontconfig hasn't yet rescanned), in which case our cache stays stale
+// until something else nudges it. Recovery is a single `rm` of the cache
+// file. We accept that residual stale window in exchange for the 1.5 ms
+// saving on every cold start.
+
+const font_cache_rel = "scrgo/font-path";
+
+fn buildCachePathZ(buf: []u8) ?[:0]const u8 {
+    if (c.getenv("XDG_CACHE_HOME")) |xdg_z| {
+        const xdg = std.mem.sliceTo(xdg_z, 0);
+        return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ xdg, font_cache_rel }) catch null;
+    }
+    if (c.getenv("HOME")) |home_z| {
+        const home = std.mem.sliceTo(home_z, 0);
+        return std.fmt.bufPrintZ(buf, "{s}/.cache/{s}", .{ home, font_cache_rel }) catch null;
+    }
+    return null;
+}
+
+fn mtimeNs(path_z: [*:0]const u8) ?i128 {
+    var st: c.struct_stat = undefined;
+    if (c.stat(path_z, &st) < 0) return null;
+    return @as(i128, st.st_mtim.tv_sec) * std.time.ns_per_s + @as(i128, st.st_mtim.tv_nsec);
+}
+
+fn pathNewerThan(path: []const u8, cache_mtime: i128) bool {
+    var z_buf: [4096]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{path}) catch return false;
+    const m = mtimeNs(z.ptr) orelse return false;
+    return m > cache_mtime;
+}
+
+fn cacheInvalidated(cache_mtime: i128) bool {
+    if (pathNewerThan("/etc/fonts/fonts.conf", cache_mtime)) return true;
+    if (pathNewerThan("/var/cache/fontconfig", cache_mtime)) return true;
+    if (c.getenv("HOME")) |home_z| {
+        const home = std.mem.sliceTo(home_z, 0);
+        var buf: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{s}/.config/fontconfig/fonts.conf", .{home})) |p| {
+            if (pathNewerThan(p, cache_mtime)) return true;
+        } else |_| {}
+        if (std.fmt.bufPrint(&buf, "{s}/.cache/fontconfig", .{home})) |p| {
+            if (pathNewerThan(p, cache_mtime)) return true;
+        } else |_| {}
+    }
+    return false;
+}
+
+fn tryReadFontPathCache(allocator: std.mem.Allocator) ?[]const u8 {
+    var path_buf: [4096]u8 = undefined;
+    const cache_z = buildCachePathZ(&path_buf) orelse return null;
+
+    const cache_mtime = mtimeNs(cache_z.ptr) orelse return null;
+    if (cacheInvalidated(cache_mtime)) return null;
+
+    const fd = c.open(cache_z.ptr, c.O_RDONLY);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+
+    var data_buf: [4096]u8 = undefined;
+    const n = c.read(fd, &data_buf, data_buf.len);
+    if (n <= 0) return null;
+    const trimmed = std.mem.trim(u8, data_buf[0..@intCast(n)], " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    var path_z_buf: [4096]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{trimmed}) catch return null;
+    if (c.access(path_z.ptr, c.F_OK) != 0) return null;
+
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
+fn writeFontPathCache(path: []const u8) void {
+    var path_buf: [4096]u8 = undefined;
+    const cache_z = buildCachePathZ(&path_buf) orelse return;
+
+    const last_slash = std.mem.lastIndexOfScalar(u8, cache_z, '/') orelse return;
+    var dir_buf: [4096]u8 = undefined;
+    const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}", .{cache_z[0..last_slash]}) catch return;
+    _ = c.mkdir(dir_z.ptr, 0o755); // ignore EEXIST
+
+    var tmp_buf: [4096]u8 = undefined;
+    const tmp_z = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{cache_z}) catch return;
+
+    const fd = c.open(tmp_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
+    if (fd < 0) return;
+    _ = c.write(fd, path.ptr, path.len);
+    _ = c.write(fd, "\n", 1);
+    _ = c.close(fd);
+
+    _ = c.rename(tmp_z.ptr, cache_z.ptr);
 }
 
 fn mmapFontFile(path: []const u8) ![]const u8 {
