@@ -29,5 +29,9 @@ let
   bench-startup = pkgs.callPackage ./bench-startup.nix {
     inherit scrgo;
   };
+
+  integration-test = pkgs.callPackage ./integration-test.nix {
+    inherit scrgo;
+  };
 in
-scrgo // { inherit bench-startup; }
+scrgo // { inherit bench-startup integration-test; }

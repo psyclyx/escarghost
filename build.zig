@@ -168,4 +168,73 @@ pub fn build(b: *std.Build) void {
         const headless_step = b.step("test-headless", "Run headless terminal tests");
         headless_step.dependOn(&headless_run.step);
     }
+
+    // Integration test (sway-headless harness; spawns scrgo as a child,
+    // detects its window via wlr_foreign_toplevel, injects keys via
+    // zwp_virtual_keyboard, captures frames via zwlr_screencopy, and
+    // verifies per-keystroke pixel deltas. Run via the `integration-test`
+    // nix wrapper which boots sway and supplies WAYLAND_DISPLAY.)
+    {
+        const it_module = b.createModule(.{
+            .root_source_file = b.path("src/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        it_module.linkSystemLibrary("wayland-client", .{});
+        it_module.linkSystemLibrary("xkbcommon", .{});
+        addScannedWaylandProtocol(
+            b,
+            it_module,
+            wayland_scanner,
+            b.path("protocol/wlr-foreign-toplevel-management-unstable-v1.xml").getPath(b),
+            "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h",
+            "wlr-foreign-toplevel-management-unstable-v1-protocol.c",
+        );
+        addScannedWaylandProtocol(
+            b,
+            it_module,
+            wayland_scanner,
+            b.path("protocol/wlr-screencopy-unstable-v1.xml").getPath(b),
+            "wlr-screencopy-unstable-v1-client-protocol.h",
+            "wlr-screencopy-unstable-v1-protocol.c",
+        );
+        addScannedWaylandProtocol(
+            b,
+            it_module,
+            wayland_scanner,
+            b.path("protocol/virtual-keyboard-unstable-v1.xml").getPath(b),
+            "virtual-keyboard-unstable-v1-client-protocol.h",
+            "virtual-keyboard-unstable-v1-protocol.c",
+        );
+        const it_exe = b.addExecutable(.{
+            .name = "scrgo-integration-test",
+            .root_module = it_module,
+        });
+        b.installArtifact(it_exe);
+    }
+
+    // Headless input test (no GL, no wayland; PTY round-trip via line
+    // discipline echo into the Terminal grid).
+    {
+        const input_module = b.createModule(.{
+            .root_source_file = b.path("src/headless_input_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+
+        if (vt_include) |inc| input_module.addIncludePath(.{ .cwd_relative = inc });
+        if (vt_static_lib) |lib_path| input_module.addObjectFile(.{ .cwd_relative = lib_path });
+
+        const input_exe = b.addExecutable(.{
+            .name = "scrgo-headless-input-test",
+            .root_module = input_module,
+        });
+        b.installArtifact(input_exe);
+
+        const input_run = b.addRunArtifact(input_exe);
+        const input_step = b.step("test-input", "Run headless input round-trip tests");
+        input_step.dependOn(&input_run.step);
+    }
 }
