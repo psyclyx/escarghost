@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
         });
 
         const snail_mod = b.createModule(.{
-            .root_source_file = snail_dep.path("src/snail.zig"),
+            .root_source_file = snail_dep.path("src/snail/root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,

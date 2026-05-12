@@ -131,11 +131,10 @@ pub const Renderer = struct {
     ) !Renderer {
         var gl_renderer = try snail.GlRenderer.init(allocator);
         errdefer gl_renderer.deinit();
-        // mesa won't import dmabuf as sRGB-format, so we tell snail's
-        // pipeline the FBO is linear-format. Combined with
-        // DrawOptions.target.output_srgb = true, snail's text shader
-        // will gamma-encode internally before writing.
-        gl_renderer.state.setSrgbFormatTarget(false);
+        // mesa won't import dmabuf as sRGB-format, so the FBO is linear.
+        // ResolveTarget.encoding is now per-draw (see drawOptions()) and
+        // replaces the old renderer-global setSrgbFormatTarget +
+        // DrawOptions.output_srgb pair.
 
         const atlas = atlas_ref.load();
         const builder = snail.TextBlobBuilder.init(allocator, atlas);
@@ -660,9 +659,9 @@ pub const Renderer = struct {
                 .pixel_width = self.viewport_w,
                 .pixel_height = self.viewport_h,
                 .subpixel_order = .none, // greyscale AA
-                // FBO is linear-format (see setSrgbFormatTarget(false) in
-                // init); ask snail's shader to gamma-encode before write.
-                .output_srgb = true,
+                // FBO storage is linear; consumer (compositor) expects
+                // sRGB bytes. snail's shader gamma-encodes before write.
+                .encoding = .srgb_pixels_on_linear_framebuffer,
             },
         };
     }

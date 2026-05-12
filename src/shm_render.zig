@@ -212,7 +212,10 @@ pub const SnapshotRenderer = struct {
         // Buffer is reinit'd per frame with the SHM map.
         var cpu = snail.CpuRenderer.init(@ptrFromInt(@alignOf(u8)), 1, 1, 4);
         cpu.setSubpixelOrder(.none); // greyscale AA
-        cpu.setOutputSrgb(true); // SHM buffer holds sRGB-encoded bytes
+        // Default encoding; the per-draw ResolveTarget.encoding in
+        // flushDraw is what actually drives output, but match here for
+        // consistency.
+        cpu.setTargetEncoding(.srgb_pixels_on_linear_framebuffer);
 
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
@@ -631,7 +634,9 @@ pub const SnapshotRenderer = struct {
                 .pixel_width = @floatFromInt(viewport_w),
                 .pixel_height = @floatFromInt(viewport_h),
                 .subpixel_order = .none,
-                .output_srgb = true, // SHM buffer holds sRGB-encoded bytes
+                // CPU "framebuffer" is the linear byte buffer; final
+                // stored pixels are sRGB-encoded.
+                .encoding = .srgb_pixels_on_linear_framebuffer,
             },
         };
 
