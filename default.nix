@@ -41,5 +41,9 @@ let
   bench-stream = pkgs.callPackage ./bench-stream.nix {
     inherit scrgo;
   };
+
+  bench-memory = pkgs.callPackage ./bench-memory.nix {
+    inherit scrgo;
+  };
 in
-scrgo // { inherit bench-startup integration-test bench-input-latency bench-stream; }
+scrgo // { inherit bench-startup integration-test bench-input-latency bench-stream bench-memory; }
