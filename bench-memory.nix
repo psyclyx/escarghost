@@ -9,6 +9,9 @@
 , scrgo
 }:
 
+let
+  termCfg = import ./bench-term-config.nix { };
+in
 writeShellApplication {
   name = "bench-memory";
 
@@ -27,6 +30,8 @@ writeShellApplication {
     unset LD_LIBRARY_PATH
 
     RUNS="''${BENCH_RUNS:-5}"
+
+    ${termCfg.setup}
 
     # Payload: ~7 MB of mixed-length lines. Each terminal cats this
     # into its scrollback, sleeps briefly so MaxRSS captures the
@@ -56,6 +61,7 @@ writeShellApplication {
       kill "$SWAY_PID" 2>/dev/null || true
       wait "$SWAY_PID" 2>/dev/null || true
       rm -f "$PAYLOAD" "$CFG"
+      ${termCfg.cleanup}
     }
     trap cleanup EXIT
 

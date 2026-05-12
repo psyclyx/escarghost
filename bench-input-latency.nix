@@ -8,6 +8,9 @@
 , scrgo
 }:
 
+let
+  termCfg = import ./bench-term-config.nix { };
+in
 writeShellApplication {
   name = "bench-input-latency";
 
@@ -27,6 +30,8 @@ writeShellApplication {
     SAMPLES="''${BENCH_SAMPLES:-30}"
     SWAY_LOG="$(mktemp -t sway-bench.XXXXXX.log)"
     CFG="$(mktemp -t sway-bench.XXXXXX.cfg)"
+
+    ${termCfg.setup}
 
     # Nest inside the host wayland session — same model as
     # bench-startup.nix and integration-test.nix. Dmabuf round-trips
@@ -49,6 +54,7 @@ writeShellApplication {
       kill "$SWAY_PID" 2>/dev/null || true
       wait "$SWAY_PID" 2>/dev/null || true
       rm -f "$CFG"
+      ${termCfg.cleanup}
     }
     trap cleanup EXIT
 

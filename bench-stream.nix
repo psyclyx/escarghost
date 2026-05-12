@@ -8,6 +8,9 @@
 , scrgo
 }:
 
+let
+  termCfg = import ./bench-term-config.nix { };
+in
 writeShellApplication {
   name = "bench-stream";
 
@@ -26,6 +29,8 @@ writeShellApplication {
 
     RUNS="''${BENCH_RUNS:-3}"
     DEADLINE_MS="''${BENCH_DEADLINE_MS:-30000}"
+
+    ${termCfg.setup}
 
     # Build the payload: ~7 MB of mixed-length numbered lines. Varied
     # widths so the terminal exercises wrapping/scrolling code paths.
@@ -54,6 +59,7 @@ writeShellApplication {
       kill "$SWAY_PID" 2>/dev/null || true
       wait "$SWAY_PID" 2>/dev/null || true
       rm -f "$PAYLOAD" "$CFG"
+      ${termCfg.cleanup}
     }
     trap cleanup EXIT
 
