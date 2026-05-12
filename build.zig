@@ -214,6 +214,50 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(it_exe);
     }
 
+    // Input-latency bench. Iterates scrgo/foot/alacritty/kitty/wezterm,
+    // injects keys via virtual_keyboard, times each one's roundtrip to
+    // a pixel change via screencopy. Shares the wlroots client
+    // plumbing with the integration test via wlr_harness.zig.
+    {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path("src/bench_input_latency.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        bench_mod.linkSystemLibrary("wayland-client", .{});
+        bench_mod.linkSystemLibrary("xkbcommon", .{});
+        addScannedWaylandProtocol(
+            b,
+            bench_mod,
+            wayland_scanner,
+            b.path("protocol/wlr-foreign-toplevel-management-unstable-v1.xml").getPath(b),
+            "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h",
+            "wlr-foreign-toplevel-management-unstable-v1-protocol.c",
+        );
+        addScannedWaylandProtocol(
+            b,
+            bench_mod,
+            wayland_scanner,
+            b.path("protocol/wlr-screencopy-unstable-v1.xml").getPath(b),
+            "wlr-screencopy-unstable-v1-client-protocol.h",
+            "wlr-screencopy-unstable-v1-protocol.c",
+        );
+        addScannedWaylandProtocol(
+            b,
+            bench_mod,
+            wayland_scanner,
+            b.path("protocol/virtual-keyboard-unstable-v1.xml").getPath(b),
+            "virtual-keyboard-unstable-v1-client-protocol.h",
+            "virtual-keyboard-unstable-v1-protocol.c",
+        );
+        const bench_exe = b.addExecutable(.{
+            .name = "scrgo-bench-input-latency",
+            .root_module = bench_mod,
+        });
+        b.installArtifact(bench_exe);
+    }
+
     // Headless input test (no GL, no wayland; PTY round-trip via line
     // discipline echo into the Terminal grid).
     {

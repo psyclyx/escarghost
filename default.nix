@@ -33,5 +33,9 @@ let
   integration-test = pkgs.callPackage ./integration-test.nix {
     inherit scrgo;
   };
+
+  bench-input-latency = pkgs.callPackage ./bench-input-latency.nix {
+    inherit scrgo;
+  };
 in
-scrgo // { inherit bench-startup integration-test; }
+scrgo // { inherit bench-startup integration-test bench-input-latency; }

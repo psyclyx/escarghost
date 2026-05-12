@@ -69,9 +69,9 @@ stdenv.mkDerivation {
   installPhase = ''
     mkdir -p $out/bin
     cp zig-out/bin/scrgo $out/bin/
-    # Test binaries are also installed so integration-test.nix can run
-    # them; they're tiny and don't pull extra runtime deps.
-    for t in scrgo-integration-test scrgo-headless-test scrgo-headless-input-test; do
+    # Test + bench binaries are also installed so their nix wrappers
+    # can find them; they're tiny and don't pull extra runtime deps.
+    for t in scrgo-integration-test scrgo-headless-test scrgo-headless-input-test scrgo-bench-input-latency; do
       if [ -f "zig-out/bin/$t" ]; then
         cp "zig-out/bin/$t" "$out/bin/"
       fi
