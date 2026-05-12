@@ -24,6 +24,7 @@ pub const posix = @cImport({
     @cInclude("signal.h");
     @cInclude("sys/wait.h");
     @cInclude("sys/mman.h");
+    @cInclude("sys/stat.h");
     @cInclude("poll.h");
     @cInclude("string.h");
     @cInclude("time.h");

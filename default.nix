@@ -37,5 +37,9 @@ let
   bench-input-latency = pkgs.callPackage ./bench-input-latency.nix {
     inherit scrgo;
   };
+
+  bench-stream = pkgs.callPackage ./bench-stream.nix {
+    inherit scrgo;
+  };
 in
-scrgo // { inherit bench-startup integration-test bench-input-latency; }
+scrgo // { inherit bench-startup integration-test bench-input-latency bench-stream; }
