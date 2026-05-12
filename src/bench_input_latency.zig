@@ -25,12 +25,23 @@ const Spec = struct {
 // Per-terminal command shape. The bin path comes from an env var
 // (e.g. SCRGO_BIN, FOOT_BIN…) so the nix wrapper can pin the exact
 // build. cat_path is read from BENCH_CAT.
+//
+// wezterm: `--always-new-process` keeps us out of the mux daemon
+// (otherwise `wezterm start` may reuse an existing GUI process and
+// our `pid` no longer owns the window). `start --class bench-wezterm`
+// sets the wayland app_id so we have a stable string to wait on
+// regardless of nixpkgs' default app_id.
 const specs = [_]Spec{
     .{ .label = "scrgo", .app_id = "scrgo", .env_var = "SCRGO_BIN", .args_after_bin = &.{"-e"} },
     .{ .label = "foot", .app_id = "foot", .env_var = "FOOT_BIN", .args_after_bin = &.{} },
     .{ .label = "alacritty", .app_id = "Alacritty", .env_var = "ALACRITTY_BIN", .args_after_bin = &.{"-e"} },
     .{ .label = "kitty", .app_id = "kitty", .env_var = "KITTY_BIN", .args_after_bin = &.{"-e"} },
-    .{ .label = "wezterm", .app_id = "org.wezfurlong.wezterm", .env_var = "WEZTERM_BIN", .args_after_bin = &.{ "start", "--" } },
+    .{
+        .label = "wezterm",
+        .app_id = "bench-wezterm",
+        .env_var = "WEZTERM_BIN",
+        .args_after_bin = &.{ "start", "--always-new-process", "--class", "bench-wezterm", "--" },
+    },
 };
 
 fn envOrNull(name: [*:0]const u8) ?[]const u8 {
@@ -100,27 +111,46 @@ fn measureTerminal(harness: *h.Harness, spec: Spec, bin: []const u8, cat: []cons
     }
 
     // Let the terminal finish startup + first frame paint. We capture
-    // a couple of frames to drain any in-flight rendering and pick up
-    // the steady-state bg color from a probe well inside the surface.
-    _ = try harness.captureFrame();
-    _ = try harness.captureFrame();
+    // a generous number of frames so the steady-state bg color and
+    // the focus/keymap handshake (alacritty in particular sometimes
+    // drops keys typed before it's focused) are out of the way.
+    var settle_n: u32 = 0;
+    while (settle_n < 10) : (settle_n += 1) _ = try harness.captureFrame();
     const settle = try harness.captureFrame();
     const stride = harness.cached_frame.stride;
     const pix_fmt = h.pixelFmtFromShm(harness.cached_frame.format) orelse return error.UnsupportedFmt;
     const bg = h.pixelAt(settle, stride, pix_fmt, 100, 100) orelse return error.ProbeOOB;
 
-    // Top-left cell row probe — same shape as the integration test.
+    // Warmup: send a few keystrokes that we don't measure, just to
+    // burn off any first-input cost (cursor reposition, focus latch,
+    // shaper warmup, etc.). Drop their pixels into prev_count so the
+    // first measured key sees a clean delta.
+    {
+        var w: u32 = 0;
+        while (w < 3) : (w += 1) {
+            try harness.typeKey(h.keyEvdev('x') orelse continue);
+            _ = try harness.captureFrame();
+            _ = try harness.captureFrame();
+        }
+    }
+
+    // Top-left probe. Generous height (two cell rows) so terminals
+    // with padding (alacritty defaults included) still hit the
+    // window, and wide enough to catch the cursor + glyphs as they
+    // scroll across columns.
     const probe_x: u32 = 0;
     const probe_y: u32 = 0;
-    const probe_w: u32 = 200;
-    const probe_h: u32 = 24;
-    const non_bg_thresh: i32 = 30;
+    const probe_w: u32 = 400;
+    const probe_h: u32 = 60;
+    const non_bg_thresh: i32 = 20;
     const input_deadline_ms: f64 = 500;
 
     var lat: std.ArrayList(f64) = .empty;
     defer lat.deinit(std.heap.smp_allocator);
     var dropped: usize = 0;
-    var prev_count: u64 = h.nonBgPixels(settle, stride, pix_fmt, probe_x, probe_y, probe_w, probe_h, bg, non_bg_thresh);
+    // Re-sample after warmup; the cell count has moved.
+    const post_warmup = try harness.captureFrame();
+    var prev_count: u64 = h.nonBgPixels(post_warmup, stride, pix_fmt, probe_x, probe_y, probe_w, probe_h, bg, non_bg_thresh);
 
     // Cycle through 'a'..'z' so each sample writes a fresh non-bg
     // shape (cursor block + new glyph). Wrap around if samples > 26.

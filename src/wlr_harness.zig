@@ -491,6 +491,9 @@ pub const Harness = struct {
         const n = @min(s.len, entry.app_id_buf.len);
         @memcpy(entry.app_id_buf[0..n], s[0..n]);
         entry.app_id_len = n;
+        if (posix.getenv("WLR_HARNESS_DEBUG") != null) {
+            std.debug.print("wlr_harness: toplevel app_id='{s}'\n", .{s});
+        }
     }
 
     fn handleOutputEnter(_: ?*anyopaque, _: ?*wl.zwlr_foreign_toplevel_handle_v1, _: ?*wl.wl_output) callconv(.c) void {}
