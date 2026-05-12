@@ -10,7 +10,12 @@
 }:
 
 let
-  trueBin = "${coreutils}/bin/true";
+  # Renders one short line through the PTY then exits immediately. scrgo's
+  # drain phase guarantees the line is committed to the compositor before
+  # the process exits; other terminals are assumed to do the same. With a
+  # no-op like `true` you measure spawn + teardown only — with echo READY
+  # the number reflects spawn-through-first-frame.
+  echoBin = "${coreutils}/bin/echo";
 in
 
 writeShellApplication {
@@ -79,10 +84,10 @@ writeShellApplication {
       --warmup "$WARMUP" \
       --ignore-failure \
       --shell=none \
-      --command-name scrgo     "scrgo -e ${trueBin}" \
-      --command-name foot      "foot ${trueBin}" \
-      --command-name alacritty "alacritty -e ${trueBin}" \
-      --command-name kitty     "kitty -e ${trueBin}" \
-      --command-name wezterm   "wezterm start -- ${trueBin}"
+      --command-name scrgo     "scrgo -e ${echoBin} READY" \
+      --command-name foot      "foot ${echoBin} READY" \
+      --command-name alacritty "alacritty -e ${echoBin} READY" \
+      --command-name kitty     "kitty -e ${echoBin} READY" \
+      --command-name wezterm   "wezterm start -- ${echoBin} READY"
   '';
 }

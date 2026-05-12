@@ -64,6 +64,18 @@ var g_gpu_snapshot_dirty: bool = false;
 var g_gpu_reconfigure_requested: bool = false;
 var g_render_serial: u32 = 0;
 
+// Drain-phase tracking. After the PTY child exits we keep looping until a
+// frame containing its final output has been committed; these two flags
+// tell us when that has happened so we can exit instead of waiting on the
+// 250 ms watchdog.
+var g_first_pty_data_seen: bool = false;
+var g_first_content_painted: bool = false;
+
+fn markFirstContentPaint() void {
+    if (g_first_content_painted or !g_first_pty_data_seen) return;
+    g_first_content_painted = true;
+}
+
 // Debug state (set in main, used by debug key handlers)
 var g_gpu: *gpu_renderer.Frontend = undefined;
 var g_cpu: *cpu_renderer_worker.Frontend = undefined;
@@ -656,12 +668,53 @@ pub fn main(init: std.process.Init) !void {
     // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
     var pty_buf: [65536]u8 = undefined;
     var child_exited = false;
+    // Drain phase: after the child exits we keep looping just long enough
+    // to commit a final frame containing its last output. Without this a
+    // command like `-e echo hi` can exit before any paint reaches the
+    // compositor — including from the bench harness, which would then
+    // never observe first_content_paint.
+    var draining = false;
+    var drain_deadline_ns: u64 = 0;
+    const drain_timeout_ns: u64 = 250 * std.time.ns_per_ms;
 
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: main loop entry ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
-    main_loop: while (!wl.closed and !child_exited) {
+    main_loop: while (!wl.closed) {
+        if (child_exited and !draining) {
+            // Slurp any bytes still buffered on the master before the kernel
+            // closes the slave side.
+            while (true) {
+                const n = pty.read(&pty_buf) catch break;
+                if (n == 0) break;
+                term.feedData(pty_buf[0..n]);
+                g_first_pty_data_seen = true;
+                markRenderDirty();
+            }
+            draining = true;
+            drain_deadline_ns = monotonicNowNs() + drain_timeout_ns;
+            if (debugStartupEnabled()) {
+                std.debug.print("scrgo: child exited, draining final frame ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            }
+        }
+
+        if (draining) {
+            // Exit as soon as a frame containing the final PTY output has
+            // been committed (or no PTY output was ever produced). We
+            // don't wait for the GPU renderer to overtake CPU — the user
+            // has already seen the content.
+            const painted = g_first_content_painted or !g_first_pty_data_seen;
+            const renderers_idle = !gpu.render_in_flight and !cpu.render_in_flight;
+            if (painted and renderers_idle) break;
+            if (monotonicNowNs() >= drain_deadline_ns) {
+                if (debugStartupEnabled()) {
+                    std.debug.print("scrgo: drain timed out ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                }
+                break;
+            }
+        }
+
         if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
             gpu.start() catch |err| {
                 std.debug.print("scrgo: gpu renderer restart failed: {}\n", .{err});
@@ -794,6 +847,7 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                     gpu.first_frame_presented = true;
                                 }
+                                markFirstContentPaint();
                             }
                             if (!g_gpu_snapshot_dirty) {
                                 g_needs_redraw = false;
@@ -827,6 +881,7 @@ pub fn main(init: std.process.Init) !void {
                             {
                                 cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                                 if (!wl.frame_pending) wl.requestFrame();
+                                markFirstContentPaint();
                             }
                             if (!g_needs_redraw) {
                                 term.resetDirty();
@@ -872,13 +927,17 @@ pub fn main(init: std.process.Init) !void {
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => {
-                        std.debug.print("scrgo: PTY read failed: {}, exiting\n", .{err});
+                        if (debugStartupEnabled() or debugPtyEnabled()) {
+                            std.debug.print("scrgo: PTY read failed: {}, exiting\n", .{err});
+                        }
                         child_exited = true;
                         break;
                     },
                 };
                 if (n == 0) {
-                    std.debug.print("scrgo: PTY EOF/EIO, exiting\n", .{});
+                    if (debugStartupEnabled() or debugPtyEnabled()) {
+                        std.debug.print("scrgo: PTY EOF/EIO, exiting\n", .{});
+                    }
                     child_exited = true;
                     break;
                 }
@@ -886,13 +945,18 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("scrgo: PTY read {} bytes\n", .{n});
                 }
                 term.feedData(pty_buf[0..n]);
+                g_first_pty_data_seen = true;
                 markRenderDirty();
             }
         }
 
-        if (pty.checkChild()) |status| {
-            std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
-            child_exited = true;
+        if (!child_exited) {
+            if (pty.checkChild()) |status| {
+                if (debugStartupEnabled() or debugPtyEnabled()) {
+                    std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
+                }
+                child_exited = true;
+            }
         }
 
         maybeQueueGpuRendererFrame(&gpu, &term);
