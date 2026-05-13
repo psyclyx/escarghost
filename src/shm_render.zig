@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const snail = @import("snail");
+const atlas_ref_mod = @import("atlas_ref.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const render_common = @import("render_common.zig");
@@ -196,11 +197,14 @@ pub const SnapshotRenderer = struct {
     cpu: snail.CpuRenderer,
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
-    blobs: std.ArrayList(snail.TextBlob) = .empty,
+    /// Per-frame blobs, heap-allocated so the scene can record stable
+    /// `*const TextBlob` pointers across mid-frame growth.
+    blobs: std.ArrayList(*snail.TextBlob) = .empty,
 
     prepared: ?snail.PreparedResources = null,
     prepared_atlas_identity: u64 = 0,
 
+    atlas_lease: ?atlas_ref_mod.AtlasRef.Lease = null,
     builder_atlas_identity: u64 = 0,
 
     draw_buf: std.ArrayList(u32) = .empty,
@@ -232,20 +236,31 @@ pub const SnapshotRenderer = struct {
     }
 
     pub fn deinit(self: *SnapshotRenderer) void {
-        for (self.blobs.items) |*b| b.deinit();
+        for (self.blobs.items) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+        }
         self.blobs.deinit(self.allocator);
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
-        if (self.builder_atlas_identity != 0) self.builder.deinit();
-        self.scene.deinit();
         if (self.prepared) |*p| p.deinit();
+        if (self.builder_atlas_identity != 0) self.builder.deinit();
+        if (self.atlas_lease) |*lease| lease.release();
+        self.scene.deinit();
     }
 
-    fn ensureBuilderForAtlas(self: *SnapshotRenderer, atlas: *const snail.TextAtlas) void {
-        const id = atlas.snapshotIdentity();
+    fn ensureBuilderForAtlas(self: *SnapshotRenderer, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
+        const id = atlas_lease.get().snapshotIdentity();
         if (id == self.builder_atlas_identity) return;
+        if (self.prepared) |*p| {
+            p.deinit();
+            self.prepared = null;
+            self.prepared_atlas_identity = 0;
+        }
         if (self.builder_atlas_identity != 0) self.builder.deinit();
-        self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
+        if (self.atlas_lease) |*lease| lease.release();
+        self.atlas_lease = atlas_lease.clone();
+        self.builder = snail.TextBlobBuilder.init(self.allocator, self.atlas_lease.?.get());
         self.builder_atlas_identity = id;
     }
 
@@ -271,18 +286,26 @@ pub const SnapshotRenderer = struct {
     }
 
     fn releaseBlobs(self: *SnapshotRenderer) void {
-        for (self.blobs.items) |*b| b.deinit();
+        for (self.blobs.items) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+        }
         self.blobs.clearRetainingCapacity();
     }
 
     fn stashBlob(self: *SnapshotRenderer, blob: snail.TextBlob) ?*const snail.TextBlob {
-        self.blobs.ensureUnusedCapacity(self.allocator, 1) catch {
+        const slot = self.allocator.create(snail.TextBlob) catch {
             var b = blob;
             b.deinit();
             return null;
         };
-        self.blobs.appendAssumeCapacity(blob);
-        return &self.blobs.items[self.blobs.items.len - 1];
+        slot.* = blob;
+        self.blobs.append(self.allocator, slot) catch {
+            slot.deinit();
+            self.allocator.destroy(slot);
+            return null;
+        };
+        return slot;
     }
 
     /// Render a snapshot to a Wayland SHM buffer. Returns any text runs
@@ -295,7 +318,7 @@ pub const SnapshotRenderer = struct {
         height: u32,
         stride: u32,
         snapshot: *const render_snapshot.SharedSnapshot,
-        atlas: *const snail.TextAtlas,
+        atlas_lease: *const atlas_ref_mod.AtlasRef.Lease,
         font_size: f32,
         cell_width: f32,
         cell_height: f32,
@@ -312,8 +335,8 @@ pub const SnapshotRenderer = struct {
         clearBuffer(map_ptr, width, height, stride, argbPixel(default_bg.r, default_bg.g, default_bg.b, 255));
 
         // Atlas snapshot may have advanced since the last frame.
-        self.invalidatePreparedIfStale(atlas.snapshotIdentity());
-        self.ensureBuilderForAtlas(atlas);
+        self.invalidatePreparedIfStale(atlas_lease.get().snapshotIdentity());
+        self.ensureBuilderForAtlas(atlas_lease);
 
         self.scene.reset();
         self.releaseBlobs();
@@ -463,8 +486,6 @@ pub const SnapshotRenderer = struct {
         const default_bg = snapshot.header.default_bg;
 
         self.builder.reset();
-
-
 
         var bg_span_start: u16 = 0;
         var bg_span_color: ?Rgb = null;

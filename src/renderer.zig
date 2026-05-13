@@ -80,6 +80,7 @@ fn hashSnapshotRow(snapshot: *const render_snapshot.SharedSnapshot, start_index:
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     atlas_ref: *atlas_ref_mod.AtlasRef,
+    atlas_lease: atlas_ref_mod.AtlasRef.Lease,
 
     gl_renderer: snail.GlRenderer,
     scene: snail.Scene,
@@ -106,7 +107,9 @@ pub const Renderer = struct {
     seg_buf: std.ArrayList(snail.DrawSegment) = .empty,
 
     // Per-frame ephemeral blob storage (cursor inversion, snapshot rebuilds).
-    ephemeral_blobs: std.ArrayList(snail.TextBlob) = .empty,
+    // Heap-allocated so the scene can record stable `*const TextBlob`
+    // pointers across mid-frame growth.
+    ephemeral_blobs: std.ArrayList(*snail.TextBlob) = .empty,
 
     cell_width: f32,
     cell_height: f32,
@@ -136,7 +139,9 @@ pub const Renderer = struct {
         // replaces the old renderer-global setSrgbFormatTarget +
         // DrawOptions.output_srgb pair.
 
-        const atlas = atlas_ref.load();
+        var atlas_lease = atlas_ref.acquire();
+        errdefer atlas_lease.release();
+        const atlas = atlas_lease.get();
         const builder = snail.TextBlobBuilder.init(allocator, atlas);
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
@@ -146,6 +151,7 @@ pub const Renderer = struct {
         return .{
             .allocator = allocator,
             .atlas_ref = atlas_ref,
+            .atlas_lease = atlas_lease,
             .gl_renderer = gl_renderer,
             .scene = scene,
             .builder = builder,
@@ -172,9 +178,10 @@ pub const Renderer = struct {
         }
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
-        self.builder.deinit();
-        self.scene.deinit();
         if (self.prepared) |*p| p.deinit();
+        self.builder.deinit();
+        self.atlas_lease.release();
+        self.scene.deinit();
         self.rect_renderer.deinit();
         self.gl_renderer.deinit();
     }
@@ -240,12 +247,22 @@ pub const Renderer = struct {
     /// Refresh atlas snapshot. On identity change, rebind cached blobs and
     /// invalidate the prepared resources cache.
     fn refreshAtlas(self: *Renderer) *const snail.TextAtlas {
-        const atlas = self.atlas_ref.load();
+        var next_lease = self.atlas_ref.acquire();
+        const atlas = next_lease.get();
         const identity = atlas.snapshotIdentity();
-        if (identity == self.last_atlas_identity) return atlas;
+        if (identity == self.last_atlas_identity) {
+            next_lease.release();
+            return self.atlas_lease.get();
+        }
 
         self.last_atlas_gen = self.atlas_ref.loadGeneration();
         self.last_atlas_identity = identity;
+
+        if (self.prepared) |*p| {
+            p.deinit();
+            self.prepared = null;
+            self.prepared_atlas_identity = 0;
+        }
 
         // Builder is anchored to the prior snapshot; rebuild it.
         self.builder.deinit();
@@ -273,6 +290,8 @@ pub const Renderer = struct {
         if (self.debug_log_atlas) {
             std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (rebound={}, evicted={})\n", .{ identity, rebound, stale.items.len });
         }
+        self.atlas_lease.release();
+        self.atlas_lease = next_lease;
         return atlas;
     }
 
@@ -611,7 +630,7 @@ pub const Renderer = struct {
         const cell = cursor_cell orelse return;
         if (!cell.has_text or cell.glyph_id == 0) return;
 
-        var inv_builder = snail.TextBlobBuilder.init(self.allocator, self.atlas_ref.load());
+        var inv_builder = snail.TextBlobBuilder.init(self.allocator, self.atlas_lease.get());
         defer inv_builder.deinit();
         var tmp_buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &tmp_buf) catch return;
@@ -636,18 +655,25 @@ pub const Renderer = struct {
     }
 
     fn stashEphemeralBlob(self: *Renderer, blob: snail.TextBlob) ?*const snail.TextBlob {
-        // Reserve one slot up front so the slice pointer is stable until reset.
-        self.ephemeral_blobs.ensureUnusedCapacity(self.allocator, 1) catch {
+        const slot = self.allocator.create(snail.TextBlob) catch {
             var b = blob;
             b.deinit();
             return null;
         };
-        self.ephemeral_blobs.appendAssumeCapacity(blob);
-        return &self.ephemeral_blobs.items[self.ephemeral_blobs.items.len - 1];
+        slot.* = blob;
+        self.ephemeral_blobs.append(self.allocator, slot) catch {
+            slot.deinit();
+            self.allocator.destroy(slot);
+            return null;
+        };
+        return slot;
     }
 
     fn releaseEphemeralBlobs(self: *Renderer) void {
-        for (self.ephemeral_blobs.items) |*b| b.deinit();
+        for (self.ephemeral_blobs.items) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+        }
         self.ephemeral_blobs.clearRetainingCapacity();
     }
 

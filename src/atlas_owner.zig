@@ -199,7 +199,9 @@ pub const Frontend = struct {
             }
 
             const timer = perf.Timer.now();
-            const current = self.atlas_ref.load();
+            var current_lease = self.atlas_ref.acquire();
+            defer current_lease.release();
+            const current = current_lease.get();
             const before_pages = current.pageCount();
             const pending_text = local_pending.text();
 
@@ -226,7 +228,16 @@ pub const Frontend = struct {
                 heap_atlas.* = next_atlas;
 
                 const after_pages = heap_atlas.pageCount();
-                self.atlas_ref.publish(heap_atlas);
+                self.atlas_ref.publish(heap_atlas) catch {
+                    atlasDebug(timer, "publish failed for atlas", .{});
+                    heap_atlas.deinit();
+                    allocator.destroy(heap_atlas);
+                    writeResponse(self.response_fds[1], .{
+                        .tag = .failed,
+                        .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
+                    });
+                    continue;
+                };
 
                 atlasDebug(timer, "extended ({} bytes) pages {}->{}", .{
                     pending_text.len,

@@ -267,9 +267,18 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
                 return;
             },
             // Debug: Ctrl+Shift+F1/F2/F3
-            xkb_syms.XKB_KEY_F1 => { debugKillActiveRenderer(); return; },
-            xkb_syms.XKB_KEY_F2 => { debugSwapRenderer(); return; },
-            xkb_syms.XKB_KEY_F3 => { debugClearAtlas(); return; },
+            xkb_syms.XKB_KEY_F1 => {
+                debugKillActiveRenderer();
+                return;
+            },
+            xkb_syms.XKB_KEY_F2 => {
+                debugSwapRenderer();
+                return;
+            },
+            xkb_syms.XKB_KEY_F3 => {
+                debugClearAtlas();
+                return;
+            },
             else => {},
         }
     }
@@ -343,7 +352,9 @@ fn zoomReset() void {
 }
 
 fn applyZoom() void {
-    const cm = renderer_mod.computeCellMetrics(g_atlas_ref.load(), g_font_size) catch return;
+    var atlas_lease = g_atlas_ref.acquire();
+    defer atlas_lease.release();
+    const cm = renderer_mod.computeCellMetrics(atlas_lease.get(), g_font_size) catch return;
     g_cell_width = cm.cell_width;
     g_cell_height = cm.cell_height;
 
@@ -584,7 +595,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("scrgo: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
 
-    const cell_metrics = try renderer_mod.computeCellMetrics(atlas_ref_ptr.load(), cfg.font_size);
+    var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
+    defer bootstrap_atlas_lease.release();
+    const cell_metrics = try renderer_mod.computeCellMetrics(bootstrap_atlas_lease.get(), cfg.font_size);
     g_font_size = cfg.font_size;
     g_cell_width = cell_metrics.cell_width;
     g_cell_height = cell_metrics.cell_height;
@@ -663,7 +676,6 @@ pub fn main(init: std.process.Init) !void {
     g_active_render_path = &active_render_path;
     g_gpu_restart = &gpu_restart;
     g_atlas_thread = &atlas_thread;
-
 
     // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
     var pty_buf: [65536]u8 = undefined;

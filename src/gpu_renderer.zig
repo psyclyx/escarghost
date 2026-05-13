@@ -441,7 +441,9 @@ pub const Frontend = struct {
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_ref.load());
+        var atlas_lease = atlas_ref.acquire();
+        defer atlas_lease.release();
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get());
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);
@@ -538,7 +540,10 @@ pub const Frontend = struct {
         self.destroyFrontendBuffers();
         // Close any unclaimed export fds
         for (&self.buffer_export_fds) |*fd| {
-            if (fd.* >= 0) { _ = c.close(fd.*); fd.* = -1; }
+            if (fd.* >= 0) {
+                _ = c.close(fd.*);
+                fd.* = -1;
+            }
         }
         if (self.response_fds[0] >= 0) _ = c.close(self.response_fds[0]);
         if (self.response_fds[1] >= 0) _ = c.close(self.response_fds[1]);

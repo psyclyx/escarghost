@@ -198,7 +198,9 @@ pub const Frontend = struct {
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, self.atlas_ref.load());
+        var atlas_lease = self.atlas_ref.acquire();
+        defer atlas_lease.release();
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get());
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);
@@ -306,7 +308,8 @@ pub const Frontend = struct {
                         continue;
                     };
 
-                    const atlas = self.atlas_ref.load();
+                    var atlas_lease = self.atlas_ref.acquire();
+                    defer atlas_lease.release();
 
                     const misses = ctx.renderToMemory(
                         map_ptr,
@@ -314,7 +317,7 @@ pub const Frontend = struct {
                         buffer.desc.height,
                         buffer.desc.stride,
                         &self.snapshots[snapshot_slot],
-                        atlas,
+                        &atlas_lease,
                         request.font_size,
                         request.cell_width,
                         request.cell_height,
