@@ -835,8 +835,8 @@ pub fn main(init: std.process.Init) !void {
                         }
                     },
                     .frame => {
-                        if (resp.serial != g_render_serial or g_target_render_path != .gpu) {
-                            // Stale frame or target changed, discard
+                        if (g_target_render_path != .gpu) {
+                            // Target switched away from gpu; drop this frame.
                         } else {
                             if (debugRenderersEnabled()) {
                                 std.debug.print("scrgo: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
@@ -861,7 +861,12 @@ pub fn main(init: std.process.Init) !void {
                                 }
                                 markFirstContentPaint();
                             }
-                            if (!g_gpu_snapshot_dirty) {
+                            // Only clear the dirty bit if the snapshot we
+                            // committed reflects the latest state. If PTY
+                            // produced more data while the renderer was
+                            // working, we keep dirty=true and queue
+                            // another render on the next loop iteration.
+                            if (resp.serial == g_render_serial) {
                                 g_needs_redraw = false;
                                 term.resetDirty();
                             }
@@ -886,18 +891,18 @@ pub fn main(init: std.process.Init) !void {
             if (resp_opt) |resp| {
                 switch (resp.tag) {
                     .frame => {
-                        if (resp.serial == g_render_serial) {
-                            if (resp.buffer_index < cpu.buffer_count and
-                                active_render_path == .cpu and
-                                cpu.width == wl.width and cpu.height == wl.height)
-                            {
-                                cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                                if (!wl.frame_pending) wl.requestFrame();
-                                markFirstContentPaint();
-                            }
-                            if (!g_needs_redraw) {
-                                term.resetDirty();
-                            }
+                        if (resp.buffer_index < cpu.buffer_count and
+                            active_render_path == .cpu and
+                            cpu.width == wl.width and cpu.height == wl.height)
+                        {
+                            cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                            if (!wl.frame_pending) wl.requestFrame();
+                            markFirstContentPaint();
+                        }
+                        // Only clear dirty if no new PTY data arrived
+                        // while the renderer was working.
+                        if (resp.serial == g_render_serial and !g_needs_redraw) {
+                            term.resetDirty();
                         }
                     },
                     .failed => {
