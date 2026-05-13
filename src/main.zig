@@ -105,6 +105,12 @@ var g_phase_feed_calls: u64 = 0;
 var g_phase_poll_ns: u64 = 0;
 var g_phase_poll_calls: u64 = 0;
 
+// Lifecycle milestone timestamps (ns since g_commit_trace_start_ns).
+var g_t_first_pty_ns: u64 = 0;
+var g_t_child_exited_ns: u64 = 0;
+var g_t_main_loop_exit_ns: u64 = 0;
+var g_t_before_exit_ns: u64 = 0;
+
 fn markFirstContentPaint() void {
     if (g_first_content_painted or !g_first_pty_data_seen) return;
     g_first_content_painted = true;
@@ -731,6 +737,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     main_loop: while (!wl.closed) {
+        if (g_renderer_debug.commits and child_exited and g_t_child_exited_ns == 0) {
+            g_t_child_exited_ns = monotonicNowNs() - g_commit_trace_start_ns;
+        }
         if (child_exited and !draining) {
             // Slurp any bytes still buffered on the master before the kernel
             // closes the slave side.
@@ -1027,6 +1036,9 @@ pub fn main(init: std.process.Init) !void {
                     g_phase_feed_data_ns += monotonicNowNs() - feed_t0;
                     g_phase_feed_calls += 1;
                 }
+                if (g_renderer_debug.commits and g_t_first_pty_ns == 0) {
+                    g_t_first_pty_ns = monotonicNowNs() - g_commit_trace_start_ns;
+                }
                 g_first_pty_data_seen = true;
                 markRenderDirty();
                 if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
@@ -1039,6 +1051,9 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
                 }
                 child_exited = true;
+                if (g_renderer_debug.commits and g_t_child_exited_ns == 0) {
+                    g_t_child_exited_ns = monotonicNowNs() - g_commit_trace_start_ns;
+                }
             }
         }
 
@@ -1048,6 +1063,9 @@ pub fn main(init: std.process.Init) !void {
         maybeQueueGpuRendererFrame(&gpu, &term);
     }
 
+    if (g_renderer_debug.commits) {
+        g_t_main_loop_exit_ns = monotonicNowNs() - g_commit_trace_start_ns;
+    }
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
@@ -1093,6 +1111,25 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("scrgo: child exit path reached, exiting\n", .{});
         }
         std.debug.print("scrgo: exiting\n", .{});
+    }
+
+    if (g_renderer_debug.commits) {
+        g_t_before_exit_ns = monotonicNowNs() - g_commit_trace_start_ns;
+        const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
+        const last_commit_ms: f32 = if (g_commit_trace_len > 0)
+            g_commit_trace[g_commit_trace_len - 1].t_ms
+        else
+            0;
+        std.debug.print(
+            "scrgo: timeline  first_pty={d:.1}ms  last_commit={d:.1}ms  child_exited={d:.1}ms  main_loop_exit={d:.1}ms  before__exit={d:.1}ms\n",
+            .{
+                @as(f64, @floatFromInt(g_t_first_pty_ns)) / ms,
+                last_commit_ms,
+                @as(f64, @floatFromInt(g_t_child_exited_ns)) / ms,
+                @as(f64, @floatFromInt(g_t_main_loop_exit_ns)) / ms,
+                @as(f64, @floatFromInt(g_t_before_exit_ns)) / ms,
+            },
+        );
     }
 
     // Skip the defer chain (cpu/atlas/gpu thread joins, wl_display_disconnect,
