@@ -1,3 +1,4 @@
+const std = @import("std");
 const snail = @import("snail");
 const terminal_mod = @import("terminal.zig");
 const render_common = @import("render_common.zig");
@@ -55,9 +56,36 @@ pub const SharedSnapshot = struct {
     cells: [MaxCells]Cell = [_]Cell{.{}} ** MaxCells,
 };
 
-pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *const snail.TextAtlas) !void {
-    try term.updateRenderState();
+pub var updateRenderStateAccumNs: u64 = 0;
+pub var updateRenderStateCount: u64 = 0;
 
+fn monotonicNs() u64 {
+    const std_time = std.time;
+    const c = struct {
+        extern fn clock_gettime(clk_id: c_int, tp: *Timespec) callconv(.c) c_int;
+        const Timespec = extern struct { tv_sec: i64, tv_nsec: i64 };
+    };
+    var ts: c.Timespec = .{ .tv_sec = 0, .tv_nsec = 0 };
+    if (c.clock_gettime(1, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.tv_sec)) * std_time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
+}
+
+/// Update the terminal's render_state (consumes terminal/screen dirty
+/// state). Must run on whichever thread owns the Terminal; cheap (<1 ms).
+/// Pair with `captureCells` to read the resulting render_state into a
+/// `SharedSnapshot` — `captureCells` only touches the render_state and
+/// can run on a worker thread.
+pub fn prepare(term: *terminal_mod.Terminal) !void {
+    const t0 = monotonicNs();
+    try term.updateRenderState();
+    updateRenderStateAccumNs += monotonicNs() - t0;
+    updateRenderStateCount += 1;
+}
+
+/// Walk the terminal's render_state (already populated by `prepare`) into
+/// `snapshot`. Reads the render_state only — safe to run on a worker
+/// thread as long as `prepare` is not called concurrently.
+pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *const snail.TextAtlas) !void {
     const colors = term.getColors();
     const cursor = term.getCursor();
     const primary = atlas.primaryFaceIndex() catch 0;
@@ -134,4 +162,13 @@ pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *
     snapshot.header.cols = max_cols;
     snapshot.header.rows = row_count;
     snapshot.header.cell_count = @intCast(cell_index);
+}
+
+/// Convenience: prepare + captureCells on the same thread. Used by the
+/// CPU worker path where snapshot capture already runs after the worker
+/// has been signalled. The GPU path splits the two so iteration can run
+/// off the main thread.
+pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *const snail.TextAtlas) !void {
+    try prepare(term);
+    try captureCells(snapshot, term, atlas);
 }

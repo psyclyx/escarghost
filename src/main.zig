@@ -1055,13 +1055,14 @@ pub fn main(init: std.process.Init) !void {
     if (g_renderer_debug.commits) {
         const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
         std.debug.print(
-            "scrgo: phases  poll={d:.1}ms({})  pty_read={d:.1}ms  feed_data={d:.1}ms  snapshot={d:.1}ms  bytes={}  feed_calls={}  snapshots={}\n",
+            "scrgo: phases  poll={d:.1}ms({})  pty_read={d:.1}ms  feed_data={d:.1}ms  prepare={d:.1}ms  worker_cells={d:.1}ms  bytes={}  feed_calls={}  snapshots={}\n",
             .{
                 @as(f64, @floatFromInt(g_phase_poll_ns)) / ms,
                 g_phase_poll_calls,
                 @as(f64, @floatFromInt(g_phase_pty_read_ns)) / ms,
                 @as(f64, @floatFromInt(g_phase_feed_data_ns)) / ms,
                 @as(f64, @floatFromInt(gpu_renderer.snapshotPhaseAccumNs)) / ms,
+                @as(f64, @floatFromInt(gpu_renderer.captureCellsAccumNs)) / ms,
                 g_phase_bytes_read,
                 g_phase_feed_calls,
                 gpu_renderer.snapshotPhaseCount,

@@ -15,6 +15,7 @@ const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const shared_dmabuf = @import("shared_dmabuf.zig");
+const terminal_mod = @import("terminal.zig");
 const perf = @import("perf.zig");
 
 const c = @cImport({
@@ -49,10 +50,16 @@ fn gpuDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
 pub const MaxBuffers = shared_dmabuf.MaxBuffers;
 const SnapshotSlotCount = 2;
 
-/// Cumulative time spent in render_snapshot.capture on the main thread,
-/// across the lifetime of the process. Dumped at exit (SCRGO_LOG=commits).
+/// Cumulative time spent in `render_snapshot.prepare` on the main thread
+/// (updateRenderState only). Dumped at exit (SCRGO_LOG=commits).
 pub var snapshotPhaseAccumNs: u64 = 0;
 pub var snapshotPhaseCount: u64 = 0;
+
+/// Cumulative time spent in `render_snapshot.captureCells` on the worker
+/// thread. Off the main thread's critical path; tracked so we can see
+/// how much wall time we saved by offloading.
+pub var captureCellsAccumNs: u64 = 0;
+pub var captureCellsCount: u64 = 0;
 
 fn monotonicNs() u64 {
     var ts: c.struct_timespec = undefined;
@@ -92,6 +99,13 @@ const Request = struct {
     cell_width: f32 = 0,
     cell_height: f32 = 0,
     serial: u32 = 0,
+    // Captured snapshot inputs for the worker. The main thread calls
+    // `render_snapshot.prepare(term)` before signalling — that's the
+    // only step that needs exclusive terminal access. The worker then
+    // iterates the render_state via captureCells on its own thread,
+    // overlapping snapshot iteration with continued PTY ingest.
+    term: ?*terminal_mod.Terminal = null,
+    atlas_lease: atlas_ref_mod.AtlasRef.Lease = .{ .ref = undefined, .snapshot = null },
 };
 
 // ── Offscreen EGL (surfaceless) ──
@@ -445,20 +459,25 @@ pub const Frontend = struct {
         return null;
     }
 
-    pub fn queueRender(self: *Frontend, term: anytype, serial: u32) !void {
+    pub fn queueRender(self: *Frontend, term: *terminal_mod.Terminal, serial: u32) !void {
         if (!self.active or !self.ready) return error.NotReady;
         if (self.render_in_flight or self.request_pending) return error.Busy;
         const atlas_ref = self.atlas_ref orelse return error.NotReady;
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
-        var atlas_lease = atlas_ref.acquire();
-        defer atlas_lease.release();
+        // Hand off the snapshot work to the worker. Prepare consumes the
+        // terminal's dirty state on the main thread (cheap, ~50 µs); the
+        // worker then walks the render_state without touching the terminal
+        // again. The acquired lease moves into the request so the atlas
+        // outlives iteration; the worker releases it.
         const snap_t0 = monotonicNs();
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get());
+        try render_snapshot.prepare(term);
         snapshotPhaseAccumNs += monotonicNs() - snap_t0;
         snapshotPhaseCount += 1;
         self.snapshot_busy[snapshot_slot] = true;
+
+        const atlas_lease = atlas_ref.acquire();
 
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
@@ -467,6 +486,8 @@ pub const Frontend = struct {
             .buffer_index = buffer_index,
             .snapshot_slot = snapshot_slot,
             .serial = serial,
+            .term = term,
+            .atlas_lease = atlas_lease,
         };
         self.request_pending = true;
         self.render_in_flight = true;
@@ -682,6 +703,31 @@ pub const Frontend = struct {
                     const r = &renderer.?;
                     if (request.buffer_index >= active_allocator.count) continue;
                     if (request.snapshot_slot >= SnapshotSlotCount) continue;
+
+                    // Iterate the render_state into the snapshot here on
+                    // the worker thread. The main thread already ran
+                    // `prepare(term)` (updateRenderState) before signalling,
+                    // so this only touches the decoupled render_state.
+                    var atlas_lease = request.atlas_lease;
+                    defer atlas_lease.release();
+                    const cells_t0 = monotonicNs();
+                    if (request.term) |term| {
+                        render_snapshot.captureCells(
+                            &self.snapshots[request.snapshot_slot],
+                            term,
+                            atlas_lease.get(),
+                        ) catch {
+                            writeResponse(self.response_fds[1], .{
+                                .tag = .failed,
+                                .buffer_index = request.buffer_index,
+                                .snapshot_slot = request.snapshot_slot,
+                                .serial = request.serial,
+                            });
+                            continue;
+                        };
+                    }
+                    captureCellsAccumNs += monotonicNs() - cells_t0;
+                    captureCellsCount += 1;
 
                     const render_timer = perf.Timer.now();
                     const target = &active_allocator.targets[request.buffer_index];
