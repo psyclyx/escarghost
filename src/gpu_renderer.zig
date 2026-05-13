@@ -49,6 +49,17 @@ fn gpuDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
 pub const MaxBuffers = shared_dmabuf.MaxBuffers;
 const SnapshotSlotCount = 2;
 
+/// Cumulative time spent in render_snapshot.capture on the main thread,
+/// across the lifetime of the process. Dumped at exit (SCRGO_LOG=commits).
+pub var snapshotPhaseAccumNs: u64 = 0;
+pub var snapshotPhaseCount: u64 = 0;
+
+fn monotonicNs() u64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
+}
+
 pub const ResponseTag = enum(u8) {
     context_ready = 1,
     ready = 2,
@@ -443,7 +454,10 @@ pub const Frontend = struct {
 
         var atlas_lease = atlas_ref.acquire();
         defer atlas_lease.release();
+        const snap_t0 = monotonicNs();
         try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get());
+        snapshotPhaseAccumNs += monotonicNs() - snap_t0;
+        snapshotPhaseCount += 1;
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);

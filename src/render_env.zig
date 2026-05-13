@@ -12,9 +12,10 @@ pub const RendererDebug = struct {
     frames: bool = false,
     atlas: bool = false,
     pty: bool = false,
+    commits: bool = false,
 
     pub fn anyLogs(self: RendererDebug) bool {
-        return self.startup or self.renderers or self.frames or self.atlas or self.pty;
+        return self.startup or self.renderers or self.frames or self.atlas or self.pty or self.commits;
     }
 
     pub fn enableAllLogs(self: *RendererDebug) void {
@@ -23,6 +24,7 @@ pub const RendererDebug = struct {
         self.frames = true;
         self.atlas = true;
         self.pty = true;
+        self.commits = true;
     }
 };
 
@@ -70,6 +72,8 @@ pub fn parseRendererDebug(value: ?[]const u8) RendererDebug {
             result.atlas = true;
         } else if (eql(token, "pty")) {
             result.pty = true;
+        } else if (eql(token, "commits") or eql(token, "commit")) {
+            result.commits = true;
         } else if (eql(token, "all")) {
             result.enableAllLogs();
         }

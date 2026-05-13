@@ -71,6 +71,40 @@ var g_render_serial: u32 = 0;
 var g_first_pty_data_seen: bool = false;
 var g_first_content_painted: bool = false;
 
+// Commit timing trace. Enabled via `SCRGO_LOG=commits`. Records the
+// monotonic millis (relative to startup_timer) of every surface commit
+// plus the render path used; dumped at exit so we can see how commits
+// cluster across a run.
+const CommitTrace = struct {
+    t_ms: f32,
+    path: u8, // 'g' = gpu, 'c' = cpu, 'b' = bootstrap bg
+};
+var g_commit_trace: [4096]CommitTrace = undefined;
+var g_commit_trace_len: usize = 0;
+var g_commit_trace_start_ns: u64 = 0;
+
+fn recordCommit(path_tag: u8) void {
+    if (!g_renderer_debug.commits) return;
+    if (g_commit_trace_len >= g_commit_trace.len) return;
+    const now = monotonicNowNs();
+    const dt: f32 = @floatFromInt(now - g_commit_trace_start_ns);
+    g_commit_trace[g_commit_trace_len] = .{
+        .t_ms = dt / @as(f32, std.time.ns_per_ms),
+        .path = path_tag,
+    };
+    g_commit_trace_len += 1;
+}
+
+// Phase timing accumulators. Populated when SCRGO_LOG=commits.
+var g_phase_pty_read_ns: u64 = 0;
+var g_phase_feed_data_ns: u64 = 0;
+var g_phase_snapshot_ns: u64 = 0;
+var g_phase_bytes_read: u64 = 0;
+var g_phase_snapshots: u64 = 0;
+var g_phase_feed_calls: u64 = 0;
+var g_phase_poll_ns: u64 = 0;
+var g_phase_poll_calls: u64 = 0;
+
 fn markFirstContentPaint() void {
     if (g_first_content_painted or !g_first_pty_data_seen) return;
     g_first_content_painted = true;
@@ -448,6 +482,7 @@ fn noteGpuUnavailable(
 
 pub fn main(init: std.process.Init) !void {
     const startup_timer = perf.Timer.now();
+    g_commit_trace_start_ns = monotonicNowNs();
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
@@ -563,6 +598,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpu.stop(); // must run before wl.deinit() to destroy wayland buffers first
 
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
+        recordCommit('b');
         if (debugStartupEnabled()) {
             std.debug.print("scrgo: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
@@ -571,6 +607,7 @@ pub fn main(init: std.process.Init) !void {
         if (bg_frame) |*frame| {
             frame.fillBackground(cfg.background);
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+            recordCommit('b');
             if (debugStartupEnabled()) {
                 std.debug.print("scrgo: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
@@ -780,7 +817,12 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (atlas_thread.active) atlas_thread.responseFd() else -1, .events = if (atlas_thread.active) c.POLLIN else 0, .revents = 0 },
         };
 
+        const poll_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
         const poll_rc = c.poll(&pollfds, 5, poll_timeout);
+        if (g_renderer_debug.commits) {
+            g_phase_poll_ns += monotonicNowNs() - poll_t0;
+            g_phase_poll_calls += 1;
+        }
         if (poll_rc < 0) {
             wl.cancelRead();
             std.debug.print("scrgo: poll failed, exiting\n", .{});
@@ -837,6 +879,7 @@ pub fn main(init: std.process.Init) !void {
                     .frame => {
                         if (g_target_render_path != .gpu) {
                             // Target switched away from gpu; drop this frame.
+                            recordCommit('d');
                         } else {
                             if (debugRenderersEnabled()) {
                                 std.debug.print("scrgo: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
@@ -846,6 +889,7 @@ pub fn main(init: std.process.Init) !void {
                             }
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
                                 gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                                recordCommit('g');
                                 if (!wl.frame_pending) wl.requestFrame();
                                 if (active_render_path != .gpu) {
                                     if (debugFramesEnabled()) {
@@ -896,6 +940,7 @@ pub fn main(init: std.process.Init) !void {
                             cpu.width == wl.width and cpu.height == wl.height)
                         {
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                            recordCommit('c');
                             if (!wl.frame_pending) wl.requestFrame();
                             markFirstContentPaint();
                         }
@@ -951,6 +996,7 @@ pub fn main(init: std.process.Init) !void {
             const read_start_ns = monotonicNowNs();
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
             while (true) {
+                const read_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => {
@@ -971,7 +1017,16 @@ pub fn main(init: std.process.Init) !void {
                 if (debugPtyEnabled()) {
                     std.debug.print("scrgo: PTY read {} bytes\n", .{n});
                 }
+                if (g_renderer_debug.commits) {
+                    g_phase_pty_read_ns += monotonicNowNs() - read_t0;
+                    g_phase_bytes_read += @intCast(n);
+                }
+                const feed_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
                 term.feedData(pty_buf[0..n]);
+                if (g_renderer_debug.commits) {
+                    g_phase_feed_data_ns += monotonicNowNs() - feed_t0;
+                    g_phase_feed_calls += 1;
+                }
                 g_first_pty_data_seen = true;
                 markRenderDirty();
                 if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
@@ -997,6 +1052,39 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
     renderer_mod.Renderer.frame_stats.log("frame");
+    if (g_renderer_debug.commits) {
+        const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
+        std.debug.print(
+            "scrgo: phases  poll={d:.1}ms({})  pty_read={d:.1}ms  feed_data={d:.1}ms  snapshot={d:.1}ms  bytes={}  feed_calls={}  snapshots={}\n",
+            .{
+                @as(f64, @floatFromInt(g_phase_poll_ns)) / ms,
+                g_phase_poll_calls,
+                @as(f64, @floatFromInt(g_phase_pty_read_ns)) / ms,
+                @as(f64, @floatFromInt(g_phase_feed_data_ns)) / ms,
+                @as(f64, @floatFromInt(gpu_renderer.snapshotPhaseAccumNs)) / ms,
+                g_phase_bytes_read,
+                g_phase_feed_calls,
+                gpu_renderer.snapshotPhaseCount,
+            },
+        );
+    }
+    if (g_renderer_debug.commits and g_commit_trace_len > 0) {
+        std.debug.print("scrgo: commit trace ({} commits):\n", .{g_commit_trace_len});
+        var prev_ms: f32 = 0;
+        for (g_commit_trace[0..g_commit_trace_len], 0..) |entry, i| {
+            const path_str: []const u8 = switch (entry.path) {
+                'g' => "gpu",
+                'c' => "cpu",
+                'b' => "bg ",
+                'd' => "dis",
+                else => "?  ",
+            };
+            std.debug.print("  [{:>3}] {s} t={d:>7.2}ms  +{d:>6.2}ms\n", .{
+                i, path_str, entry.t_ms, entry.t_ms - prev_ms,
+            });
+            prev_ms = entry.t_ms;
+        }
+    }
     if (g_renderer_debug.anyLogs()) {
         if (wl.closed) {
             std.debug.print("scrgo: compositor requested close, exiting\n", .{});
