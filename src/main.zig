@@ -923,6 +923,16 @@ pub fn main(init: std.process.Init) !void {
         renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
 
         if (pollfds[1].revents & c.POLLIN != 0) {
+            // Time-bounded drain: read until kernel buffer is empty OR
+            // we've burned the budget. Without the budget cap, a long
+            // stream (`cat largefile`) would hold the main thread for
+            // its full duration and the renderer would only see/commit
+            // the final state. With the cap we yield mid-stream so the
+            // user sees the output scroll by. 4 ms is roughly a
+            // quarter vblank — enough headroom that a slow feedData
+            // call (atlas miss, etc.) won't push past one full frame.
+            const read_start_ns = monotonicNowNs();
+            const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
             while (true) {
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
@@ -947,6 +957,7 @@ pub fn main(init: std.process.Init) !void {
                 term.feedData(pty_buf[0..n]);
                 g_first_pty_data_seen = true;
                 markRenderDirty();
+                if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
             }
         }
 
