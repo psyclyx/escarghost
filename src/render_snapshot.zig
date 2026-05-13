@@ -82,6 +82,9 @@ pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *
     var row_count: u16 = 0;
     var max_cols: u16 = 0;
     var cell_index: usize = 0;
+    const cursor_row: u16 = cursor.y;
+    const cursor_col: u16 = cursor.x;
+    const cursor_visible_in_view = cursor.visible and cursor.in_viewport;
 
     while (row_count < MaxRows and term.nextRow()) : (row_count += 1) {
         term.beginCellIteration();
@@ -101,7 +104,13 @@ pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *
                 .strikethrough = info.style.strikethrough != false,
             };
 
+            // glyph_id is only consulted for the cursor cell downstream;
+            // skip the per-cell font cmap lookup for the rest of the
+            // grid. Saves a hash/cmap probe per cell — adds up fast on
+            // a streaming workload.
             const glyph_id: u16 = blk: {
+                if (row_count != cursor_row or row_cols != cursor_col) break :blk 0;
+                if (!cursor_visible_in_view) break :blk 0;
                 if (!info.has_text) break :blk 0;
                 if (!render_common.isRenderableCodepoint(info.codepoint)) break :blk 0;
                 const cp: u21 = @intCast(info.codepoint);
