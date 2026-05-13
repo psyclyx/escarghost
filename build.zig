@@ -301,6 +301,29 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(bench_exe);
     }
 
+    // Minimal repro for the libghostty-vt linefeed/cursorChangePin
+    // SEGV. Strips PTY, renderer, wayland — just hammers feedData
+    // with linefeed-heavy content.
+    {
+        const repro_mod = b.createModule(.{
+            .root_source_file = b.path("src/libghostty_repro.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        if (vt_include) |inc| repro_mod.addIncludePath(.{ .cwd_relative = inc });
+        if (vt_static_lib) |lib_path| repro_mod.addObjectFile(.{ .cwd_relative = lib_path });
+        const repro_exe = b.addExecutable(.{
+            .name = "scrgo-libghostty-repro",
+            .root_module = repro_mod,
+        });
+        b.installArtifact(repro_exe);
+
+        const repro_run = b.addRunArtifact(repro_exe);
+        const repro_step = b.step("repro-libghostty", "Run minimal libghostty-vt repro");
+        repro_step.dependOn(&repro_run.step);
+    }
+
     // Headless input test (no GL, no wayland; PTY round-trip via line
     // discipline echo into the Terminal grid).
     {
