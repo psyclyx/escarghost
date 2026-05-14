@@ -41,6 +41,54 @@ fn monotonicNowNs() u64 {
     return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
 }
 
+/// Measure the time between fork()/exec() and our `main()` getting
+/// control — i.e. ld.so + library `.init_array` + libc init + Zig's
+/// `_start`. Reads /proc/self/stat field 22 (process start time in
+/// jiffies since boot) and /proc/uptime (current uptime in seconds);
+/// returns the delta in ns, or null if anything failed.
+fn premainAgeNs() ?u64 {
+    var stat_buf: [4096]u8 = undefined;
+    const stat_fd = c.open("/proc/self/stat", c.O_RDONLY);
+    if (stat_fd < 0) return null;
+    const stat_n = c.read(stat_fd, &stat_buf, stat_buf.len - 1);
+    _ = c.close(stat_fd);
+    if (stat_n <= 0) return null;
+    stat_buf[@intCast(stat_n)] = 0;
+    const stat_str = stat_buf[0..@intCast(stat_n)];
+
+    // Skip past "comm" (which can contain spaces and parens), find the
+    // closing ')'; everything after it is space-separated fields. We
+    // want field 22 (starttime, counted from the field after ')').
+    const close_paren = std.mem.lastIndexOfScalar(u8, stat_str, ')') orelse return null;
+    var it = std.mem.tokenizeAny(u8, stat_str[close_paren + 1 ..], " \t\n");
+    // Fields after ')' start at index 3 (state, ppid, ...). starttime
+    // is field 22, i.e. 19 fields after ')'.
+    var i: usize = 0;
+    while (i < 19) : (i += 1) {
+        if (it.next() == null) return null;
+    }
+    const starttime_jiffies_str = it.next() orelse return null;
+    const starttime_jiffies = std.fmt.parseInt(u64, starttime_jiffies_str, 10) catch return null;
+
+    var uptime_buf: [128]u8 = undefined;
+    const uptime_fd = c.open("/proc/uptime", c.O_RDONLY);
+    if (uptime_fd < 0) return null;
+    const uptime_n = c.read(uptime_fd, &uptime_buf, uptime_buf.len - 1);
+    _ = c.close(uptime_fd);
+    if (uptime_n <= 0) return null;
+    uptime_buf[@intCast(uptime_n)] = 0;
+    const uptime_str = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&uptime_buf)), 0);
+    const space = std.mem.indexOfScalar(u8, uptime_str, ' ') orelse uptime_str.len;
+    const uptime_secs = std.fmt.parseFloat(f64, uptime_str[0..space]) catch return null;
+
+    const clk_tck: f64 = @floatFromInt(c.sysconf(c._SC_CLK_TCK));
+    if (clk_tck <= 0) return null;
+    const starttime_secs = @as(f64, @floatFromInt(starttime_jiffies)) / clk_tck;
+    const age_secs = uptime_secs - starttime_secs;
+    if (age_secs < 0) return null;
+    return @intFromFloat(age_secs * @as(f64, std.time.ns_per_s));
+}
+
 fn setCloseOnExec(fd: c_int) void {
     if (fd < 0) return;
     const flags = c.fcntl(fd, c.F_GETFD);
@@ -110,6 +158,9 @@ var g_t_first_pty_ns: u64 = 0;
 var g_t_child_exited_ns: u64 = 0;
 var g_t_main_loop_exit_ns: u64 = 0;
 var g_t_before_exit_ns: u64 = 0;
+// Time between fork()/exec() and main() getting control (ld.so + libc
+// init + Zig _start). Sampled once at main entry.
+var g_t_premain_ns: u64 = 0;
 
 fn markFirstContentPaint() void {
     if (g_first_content_painted or !g_first_pty_data_seen) return;
@@ -489,6 +540,7 @@ fn noteGpuUnavailable(
 pub fn main(init: std.process.Init) !void {
     const startup_timer = perf.Timer.now();
     g_commit_trace_start_ns = monotonicNowNs();
+    if (premainAgeNs()) |age| g_t_premain_ns = age;
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
@@ -1121,8 +1173,9 @@ pub fn main(init: std.process.Init) !void {
         else
             0;
         std.debug.print(
-            "scrgo: timeline  first_pty={d:.1}ms  last_commit={d:.1}ms  child_exited={d:.1}ms  main_loop_exit={d:.1}ms  before__exit={d:.1}ms\n",
+            "scrgo: timeline  pre_main={d:.1}ms  first_pty={d:.1}ms  last_commit={d:.1}ms  child_exited={d:.1}ms  main_loop_exit={d:.1}ms  before__exit={d:.1}ms\n",
             .{
+                @as(f64, @floatFromInt(g_t_premain_ns)) / ms,
                 @as(f64, @floatFromInt(g_t_first_pty_ns)) / ms,
                 last_commit_ms,
                 @as(f64, @floatFromInt(g_t_child_exited_ns)) / ms,
