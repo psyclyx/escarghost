@@ -4,6 +4,7 @@ const terminal_mod = @import("terminal.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
+const render_config = @import("render_config.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_common = @import("render_common.zig");
 const row_build = @import("row_build.zig");
@@ -117,6 +118,7 @@ pub const Renderer = struct {
     font_size: f32,
     viewport_w: f32,
     viewport_h: f32,
+    config: render_config.RenderConfig,
 
     draw_buffers_ready: bool = false,
     debug_log_renderers: bool = false,
@@ -165,6 +167,7 @@ pub const Renderer = struct {
             .font_size = font_size,
             .viewport_w = 0,
             .viewport_h = 0,
+            .config = render_config.loadFromEnv(),
         };
     }
 
@@ -529,7 +532,7 @@ pub const Renderer = struct {
             .target = .{
                 .pixel_width = self.viewport_w,
                 .pixel_height = self.viewport_h,
-                .subpixel_order = .none, // greyscale AA
+                .subpixel_order = render_config.effectiveSubpixelOrder(self.config),
                 // FBO storage is linear; consumer (compositor) expects
                 // sRGB bytes. snail's shader gamma-encodes before write.
                 .encoding = .srgb_pixels_on_linear_framebuffer,

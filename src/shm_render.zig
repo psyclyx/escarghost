@@ -7,6 +7,7 @@ const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
+const render_config = @import("render_config.zig");
 const render_common = @import("render_common.zig");
 const row_build = @import("row_build.zig");
 const color = @import("color.zig");
@@ -188,11 +189,15 @@ pub const SnapshotRenderer = struct {
     overrides: [render_snapshot.MaxRows + 4]snail.Override = undefined,
     resource_entries: [RESOURCE_ENTRY_CAP]snail.ResourceSet.Entry = undefined,
     scratch_rects: []row_build.ColoredRect,
+    config: render_config.RenderConfig,
 
     pub fn init(allocator: std.mem.Allocator) !SnapshotRenderer {
+        const config = render_config.loadFromEnv();
+        const subpixel = render_config.effectiveSubpixelOrder(config);
+
         // Buffer is reinit'd per frame with the SHM map.
         var cpu = snail.CpuRenderer.init(@ptrFromInt(@alignOf(u8)), 1, 1, 4);
-        cpu.setSubpixelOrder(.none); // greyscale AA
+        cpu.setSubpixelOrder(subpixel);
         // Default encoding; the per-draw ResolveTarget.encoding in
         // flushDraw is what actually drives output, but match here for
         // consistency.
@@ -213,6 +218,7 @@ pub const SnapshotRenderer = struct {
             .scene = scene,
             .builder = builder,
             .scratch_rects = scratch_rects,
+            .config = config,
         };
     }
 
@@ -517,7 +523,7 @@ pub const SnapshotRenderer = struct {
             .target = .{
                 .pixel_width = @floatFromInt(viewport_w),
                 .pixel_height = @floatFromInt(viewport_h),
-                .subpixel_order = .none,
+                .subpixel_order = render_config.effectiveSubpixelOrder(self.config),
                 // CPU "framebuffer" is the linear byte buffer; final
                 // stored pixels are sRGB-encoded.
                 .encoding = .srgb_pixels_on_linear_framebuffer,
