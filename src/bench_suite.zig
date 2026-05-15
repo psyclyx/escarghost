@@ -251,8 +251,8 @@ fn runMemory(args: Args) !void {
         .script = script,
     };
     printHeader(
-        "memory (peak after ~9 MB scrollback; KiB)",
-        "terminal      n   rss_med  rss_max  anon_med anon_max vram_med vram_max",
+        "memory (peak after ~9 MB scrollback; MiB)",
+        "terminal      n  rss_med rss_max anon_med anon_max vram_med vram_max",
     );
     for (args.terminals) |spec| {
         const bin = binFor(spec) orelse {
@@ -263,9 +263,17 @@ fn runMemory(args: Args) !void {
             std.debug.print("{s:<10} error: {}\n", .{ spec.label, err });
             continue;
         };
+        // Samples are collected in KiB (matches /proc + rusage). Display
+        // in MiB so the numbers are read-at-a-glance friendly.
+        const k: f64 = 1024.0;
         std.debug.print(
-            "{s:<10}  {d:>3}  {d:>7.0} {d:>7.0}  {d:>7.0} {d:>7.0}  {d:>7.0} {d:>7.0}\n",
-            .{ spec.label, a.n, a.rss.median, a.rss.max, a.anon.median, a.anon.max, a.vram.median, a.vram.max },
+            "{s:<10}  {d:>3}  {d:>6.1} {d:>6.1}  {d:>6.1}  {d:>6.1}   {d:>6.1}  {d:>6.1}\n",
+            .{
+                spec.label,                a.n,
+                a.rss.median / k,          a.rss.max / k,
+                a.anon.median / k,         a.anon.max / k,
+                a.vram.median / k,         a.vram.max / k,
+            },
         );
     }
 }

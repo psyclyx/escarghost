@@ -154,6 +154,21 @@ pub fn spawnArgv(argv: []const []const u8) !posix.pid_t {
     const pid = posix.fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
+        // Silence the terminal-under-test. None of the scenarios read
+        // its stdio, but the terminals each emit chatter that otherwise
+        // garbles the bench report:
+        //   - foot: "compositor does not implement xdg-toplevel-icon",
+        //           "slave exited with signal 1 (Hangup)"
+        //   - scrgo: perf.zig frame-time telemetry on stderr.
+        // Done pre-exec so it covers everything the child writes.
+        const dn = posix.open("/dev/null", posix.O_RDWR | posix.O_CLOEXEC);
+        if (dn >= 0) {
+            _ = posix.dup2(dn, 0);
+            _ = posix.dup2(dn, 1);
+            _ = posix.dup2(dn, 2);
+            if (dn > 2) _ = posix.close(dn);
+        }
+
         var argv_buf: [16:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 16;
         var slots: [16][512]u8 = undefined;
 
