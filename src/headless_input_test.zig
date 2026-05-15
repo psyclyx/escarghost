@@ -1,4 +1,11 @@
+//! Headless tests for the input round-trip: bytes written to a real PTY
+//! master come back via the kernel's line-discipline echo, get fed to
+//! Terminal, and land in the expected cells. Bypasses Wayland and the
+//! renderer; real input-to-pixel timing is covered by the integration
+//! harness. Run via `zig build test-input` (or `zig build test`).
+
 const std = @import("std");
+const testing = std.testing;
 const terminal_mod = @import("terminal.zig");
 const config_mod = @import("config.zig");
 
@@ -11,14 +18,6 @@ const c = @cImport({
 
 const ghostty_c = @cImport(@cInclude("ghostty/vt.h"));
 
-/// Headless test that exercises the input round-trip: bytes written to the
-/// PTY master come back via the kernel's line-discipline echo (ECHO is on
-/// by default), get fed to the Terminal, and land in the expected cells.
-///
-/// This bypasses Wayland and the renderer — the goal is to catch
-/// regressions in scrgo's "input bytes → PTY → terminal grid" path
-/// without needing a compositor or a GL context. Real input-to-pixel
-/// timing is covered by the integration harness.
 const PtyPair = struct {
     master: c_int,
     slave: c_int,
@@ -70,8 +69,6 @@ fn waitAndDrain(fd: c_int, out: []u8, timeout_ms: c_int) !usize {
     return total;
 }
 
-/// Copy printable bytes from `row` of the terminal into `out`. Non-text
-/// cells and codepoints outside basic-ASCII become spaces.
 fn collectRow(term: *terminal_mod.Terminal, row: u16, out: []u8) usize {
     @memset(out, ' ');
     term.beginRowIteration();
@@ -116,8 +113,7 @@ const cases = [_]Case{
     .{ .name = "newline row1", .send = "ab\ncd", .row = 1, .expect = "cd" },
 };
 
-fn runRoundTripCase(allocator: std.mem.Allocator, cfg: *const config_mod.Config, case: Case) !bool {
-    _ = allocator;
+fn runRoundTripCase(cfg: *const config_mod.Config, case: Case) !void {
     const cols: u16 = 40;
     const rows: u16 = 4;
     var term: terminal_mod.Terminal = undefined;
@@ -132,8 +128,8 @@ fn runRoundTripCase(allocator: std.mem.Allocator, cfg: *const config_mod.Config,
     var rbuf: [256]u8 = undefined;
     const n = try waitAndDrain(pair.master, &rbuf, 200);
     if (n == 0) {
-        std.debug.print("FAIL [{s}]: no echo from PTY (line discipline?)\n", .{case.name});
-        return false;
+        std.debug.print("case [{s}]: PTY produced no echo (line-discipline state?)\n", .{case.name});
+        return error.NoEcho;
     }
     term.feedData(rbuf[0..n]);
     try term.updateRenderState();
@@ -143,65 +139,41 @@ fn runRoundTripCase(allocator: std.mem.Allocator, cfg: *const config_mod.Config,
     const got = rtrimSpaces(row_buf[0..got_len]);
     const want = rtrimSpaces(case.expect);
     if (!std.mem.eql(u8, got, want)) {
-        std.debug.print("FAIL [{s}]: want='{s}' got='{s}' (read {} echo bytes)\n", .{ case.name, want, got, n });
-        return false;
+        std.debug.print("case [{s}]: want='{s}' got='{s}' (read {} echo bytes)\n", .{ case.name, want, got, n });
+        return error.MismatchedRow;
     }
-    std.debug.print("ok   [{s}]: row{}='{s}'\n", .{ case.name, case.row, got });
-    return true;
 }
 
-fn checkEncodedKey(term: *terminal_mod.Terminal, key: c_uint, label: []const u8) bool {
-    const enc = term.encodeKey(key, ghostty_c.GHOSTTY_KEY_ACTION_PRESS, 0, null);
-    if (enc == null or enc.?.len == 0) {
-        std.debug.print("FAIL: encodeKey({s}) returned empty\n", .{label});
-        return false;
-    }
-    var hex_buf: [128]u8 = undefined;
-    var w: usize = 0;
-    for (enc.?) |b| {
-        if (w + 3 > hex_buf.len) break;
-        _ = std.fmt.bufPrint(hex_buf[w..], "{x:0>2} ", .{b}) catch {};
-        w += 3;
-    }
-    std.debug.print("ok   encodeKey({s}) = {} bytes [{s}]\n", .{ label, enc.?.len, hex_buf[0 .. if (w > 0) w - 1 else 0] });
-    return true;
-}
-
-pub fn main() !void {
-    const allocator = std.heap.smp_allocator;
+test "PTY echo round-trip lands in the expected cells" {
+    const allocator = testing.allocator;
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
 
-    var failed: u32 = 0;
+    for (cases) |case| try runRoundTripCase(&cfg, case);
+}
 
-    for (cases) |case| {
-        const ok = runRoundTripCase(allocator, &cfg, case) catch |err| blk: {
-            std.debug.print("FAIL [{s}]: error {}\n", .{ case.name, err });
-            break :blk false;
-        };
-        if (!ok) failed += 1;
-    }
+test "encodeKey returns non-empty bytes for the common special keys" {
+    const allocator = testing.allocator;
+    var cfg = try config_mod.load(allocator);
+    defer cfg.deinit(allocator);
 
-    {
-        var term: terminal_mod.Terminal = undefined;
-        try term.init(80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
-        defer term.deinit();
-        const specials = [_]struct { key: c_uint, label: []const u8 }{
-            .{ .key = ghostty_c.GHOSTTY_KEY_ENTER, .label = "Enter" },
-            .{ .key = ghostty_c.GHOSTTY_KEY_ARROW_UP, .label = "ArrowUp" },
-            .{ .key = ghostty_c.GHOSTTY_KEY_ARROW_DOWN, .label = "ArrowDown" },
-            .{ .key = ghostty_c.GHOSTTY_KEY_F1, .label = "F1" },
-            .{ .key = ghostty_c.GHOSTTY_KEY_TAB, .label = "Tab" },
-            .{ .key = ghostty_c.GHOSTTY_KEY_BACKSPACE, .label = "Backspace" },
-        };
-        for (specials) |s| {
-            if (!checkEncodedKey(&term, s.key, s.label)) failed += 1;
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    const specials = [_]struct { key: c_uint, label: []const u8 }{
+        .{ .key = ghostty_c.GHOSTTY_KEY_ENTER, .label = "Enter" },
+        .{ .key = ghostty_c.GHOSTTY_KEY_ARROW_UP, .label = "ArrowUp" },
+        .{ .key = ghostty_c.GHOSTTY_KEY_ARROW_DOWN, .label = "ArrowDown" },
+        .{ .key = ghostty_c.GHOSTTY_KEY_F1, .label = "F1" },
+        .{ .key = ghostty_c.GHOSTTY_KEY_TAB, .label = "Tab" },
+        .{ .key = ghostty_c.GHOSTTY_KEY_BACKSPACE, .label = "Backspace" },
+    };
+    for (specials) |s| {
+        const enc = term.encodeKey(s.key, ghostty_c.GHOSTTY_KEY_ACTION_PRESS, 0, null);
+        if (enc == null or enc.?.len == 0) {
+            std.debug.print("encodeKey({s}) returned empty\n", .{s.label});
+            return error.EmptyEncoding;
         }
     }
-
-    if (failed > 0) {
-        std.debug.print("FAIL: {} input test(s) failed\n", .{failed});
-        std.process.exit(1);
-    }
-    std.debug.print("PASS: all input round-trip tests passed\n", .{});
 }
