@@ -12,8 +12,18 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(ptr, 0);
 }
 
+/// Conventional "points to pixels" factor at the canonical 96-DPI
+/// reference (1 point = 1/72 inch = 96/72 px). Other terminals
+/// (foot/alacritty/kitty/...) interpret `font_size: 11` in their
+/// config as 11 *points*; we follow the same convention and convert
+/// to pixel-em internally because snail's text APIs are pixel-based.
+/// Future HiDPI work should replace this with wl_output scale × 96/72.
+pub const pt_to_px: f32 = 96.0 / 72.0;
+
 pub const Config = struct {
     font_path: []const u8,
+    /// Pixel-em size (already converted from the user-facing point size
+    /// written in the config file). Passed straight to snail.
     font_size: f32,
     cols: u16,
     rows: u16,
@@ -53,7 +63,8 @@ const fallback_shell = "/bin/sh";
 // Tomorrow Night base16
 const defaults = Config{
     .font_path = "",
-    .font_size = 14.0,
+    // 14 pt → ~18.67 px-em, matching other terminals' size=14.
+    .font_size = 14.0 * pt_to_px,
     .cols = 80,
     .rows = 24,
     .max_scrollback = 10000,
@@ -221,8 +232,14 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
     }
 
     if (obj.get("font_size")) |v| {
-        if (v == .float) cfg.font_size = @floatCast(v.float);
-        if (v == .integer) cfg.font_size = @floatFromInt(v.integer);
+        // Config value is in points (matches other terminals' convention);
+        // store as pixel-em.
+        const pt: ?f32 = switch (v) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => null,
+        };
+        if (pt) |p| cfg.font_size = p * pt_to_px;
     }
 
     if (obj.get("cols")) |v| {
@@ -299,7 +316,7 @@ test "defaults load without config file" {
 
     try std.testing.expectEqual(@as(u16, 80), cfg.cols);
     try std.testing.expectEqual(@as(u16, 24), cfg.rows);
-    try std.testing.expectEqual(@as(f32, 14.0), cfg.font_size);
+    try std.testing.expectEqual(@as(f32, 14.0 * pt_to_px), cfg.font_size);
     // Palette index 0 should be ANSI black (base00 mapped)
     try std.testing.expectEqual(cfg.base16[0].r, cfg.palette[0].r);
 }
@@ -310,7 +327,7 @@ test "parseJson basic" {
     ;
     var cfg = defaults;
     try parseJson(std.testing.allocator, json, &cfg);
-    try std.testing.expectEqual(@as(f32, 16.0), cfg.font_size);
+    try std.testing.expectEqual(@as(f32, 16.0 * pt_to_px), cfg.font_size);
     try std.testing.expectEqual(@as(u16, 120), cfg.cols);
     try std.testing.expectEqual(@as(u16, 40), cfg.rows);
     try std.testing.expectEqual(false, cfg.generate_256);
