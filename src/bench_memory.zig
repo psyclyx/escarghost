@@ -10,10 +10,13 @@
 //!   peak_anon  - max RssAnon seen via /proc/<pid>/status (KiB). This is
 //!                the heap/stack/dmabuf contribution — much more useful
 //!                for "how much does this terminal actually allocate".
-//!   peak_vram  - max VRAM seen via /proc/<pid>/fdinfo/*'s
-//!                drm-memory-vram-resident counters (KiB). Supported by
-//!                mesa drivers (amdgpu/intel/radv). NVIDIA's proprietary
-//!                driver doesn't expose this; we report 0 in that case.
+//!   peak_vram  - max VRAM in KiB. On mesa drivers (amdgpu/intel/radv)
+//!                we read /proc/<pid>/fdinfo/*'s drm-memory-vram-resident
+//!                counters. NVIDIA's proprietary driver doesn't expose
+//!                that field, so we fall back to shelling out to
+//!                `nvidia-smi pmon -s m -c 1` and matching by pid. Both
+//!                paths feed the same peak so the value reflects whichever
+//!                source actually reports.
 
 const std = @import("std");
 const h = @import("wlr_harness.zig");
@@ -62,6 +65,8 @@ const Poller = struct {
     stop: std.atomic.Value(bool),
     peak_anon_kib: std.atomic.Value(u64),
     peak_vram_kib: std.atomic.Value(u64),
+    nvidia_smi: ?[*:0]const u8,
+    tick: u32 = 0,
 
     fn pollLoop(self: *Poller) void {
         while (!self.stop.load(.acquire)) {
@@ -69,6 +74,13 @@ const Poller = struct {
             // precision — we just need to catch the peak window.
             sleepMs(5);
             samplePid(self.pid, &self.peak_anon_kib, &self.peak_vram_kib);
+            self.tick +%= 1;
+            // nvidia-smi pmon takes ~25 ms to run, so cap it at ~10 Hz
+            // (every 20 × 5 ms). The terminal lives ~hundreds of ms so
+            // we still catch the peak comfortably.
+            if (self.nvidia_smi) |bin| {
+                if (self.tick % 20 == 0) sampleNvidia(bin, self.pid, &self.peak_vram_kib);
+            }
         }
     }
 };
@@ -160,7 +172,89 @@ fn scanVramFields(path: [:0]const u8, total: *u64) void {
     }
 }
 
-fn runOnce(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Sample {
+/// Probe a few well-known absolute paths for nvidia-smi. The bench
+/// wrapper uses writeShellApplication which strips PATH down to its
+/// runtimeInputs, so we can't rely on PATH-search here. nvidia-smi
+/// must be the host's driver-matched binary anyway (the user-space
+/// tool talks an ABI that's pinned to the loaded kernel module), so
+/// pulling it via Nix would risk a version mismatch.
+fn findNvidiaSmi() ?[*:0]const u8 {
+    const candidates = [_][*:0]const u8{
+        "/run/current-system/sw/bin/nvidia-smi", // NixOS
+        "/usr/bin/nvidia-smi", // most other distros
+        "/usr/local/bin/nvidia-smi",
+    };
+    for (candidates) |p| {
+        if (c.access(p, c.X_OK) == 0) return p;
+    }
+    return null;
+}
+
+/// fork+exec `nvidia-smi pmon -s m -c 1`, slurp stdout, find our pid's
+/// FB column, bump the peak. Output looks like:
+///
+///   # gpu         pid   type     fb   ccpm    command
+///   # Idx           #    C/G     MB     MB    name
+///       0     626250     G    275      0    river
+///
+/// We use fork+exec rather than posix_spawn just to keep the dep
+/// surface identical to spawnArgv. The poller runs on its own thread,
+/// so the brief fork stall doesn't block the 5 ms anon-RSS cadence on
+/// the main thread.
+fn sampleNvidia(bin: [*:0]const u8, target_pid: posix.pid_t, peak_vram: *std.atomic.Value(u64)) void {
+    var pipefd: [2]c_int = undefined;
+    if (c.pipe(&pipefd) != 0) return;
+    const child = posix.fork();
+    if (child < 0) {
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        return;
+    }
+    if (child == 0) {
+        _ = c.close(pipefd[0]);
+        _ = c.dup2(pipefd[1], 1);
+        _ = c.dup2(pipefd[1], 2); // also redirect stderr, otherwise driver warnings garble parsing
+        _ = c.close(pipefd[1]);
+        const argv = [_:null]?[*:0]const u8{ bin, "pmon", "-s", "m", "-c", "1" };
+        _ = posix.execv(bin, @ptrCast(&argv));
+        posix._exit(127);
+    }
+    _ = c.close(pipefd[1]);
+
+    var buf: [16384]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = c.read(pipefd[0], buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    _ = c.close(pipefd[0]);
+    var status: c_int = 0;
+    _ = posix.waitpid(child, &status, 0);
+    if (total == 0) return;
+
+    var line_it = std.mem.tokenizeScalar(u8, buf[0..total], '\n');
+    while (line_it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        // Columns (with -s m): gpu pid type fb ccpm command
+        var tok = std.mem.tokenizeAny(u8, trimmed, " \t");
+        _ = tok.next() orelse continue; // gpu
+        const pid_s = tok.next() orelse continue;
+        const pid_v = std.fmt.parseInt(posix.pid_t, pid_s, 10) catch continue;
+        if (pid_v != target_pid) continue;
+        _ = tok.next() orelse continue; // type (C/G)
+        const fb_s = tok.next() orelse continue;
+        // nvidia-smi reports "-" for processes it can't account memory
+        // to (e.g. just-spawned processes mid-context-create).
+        if (std.mem.eql(u8, fb_s, "-")) return;
+        const fb_mib = std.fmt.parseInt(u64, fb_s, 10) catch return;
+        bumpMax(peak_vram, fb_mib * 1024);
+        return;
+    }
+}
+
+fn runOnce(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options, nvidia_smi: ?[*:0]const u8) !Sample {
     var argv_buf: [16][]const u8 = undefined;
     const extras = [_][]const u8{ opts.sh_bin, "-c", opts.script };
     const argv = spec_mod.buildArgv(&argv_buf, bin, spec, &extras);
@@ -172,6 +266,7 @@ fn runOnce(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Sample 
         .stop = .init(false),
         .peak_anon_kib = .init(0),
         .peak_vram_kib = .init(0),
+        .nvidia_smi = nvidia_smi,
     };
     const thread = std.Thread.spawn(.{}, Poller.pollLoop, .{&poller}) catch null;
 
@@ -200,9 +295,10 @@ pub fn measureTerminal(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Optio
     var vram_buf: std.ArrayList(f64) = .empty;
     defer vram_buf.deinit(std.heap.smp_allocator);
     var dropped: usize = 0;
+    const nvidia_smi = findNvidiaSmi();
     var r: u32 = 0;
     while (r < opts.runs) : (r += 1) {
-        const s = runOnce(spec, bin, opts) catch {
+        const s = runOnce(spec, bin, opts, nvidia_smi) catch {
             dropped += 1;
             continue;
         };
