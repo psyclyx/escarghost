@@ -1,6 +1,10 @@
 const std = @import("std");
 const snail = @import("snail");
 
+const c = @cImport({
+    @cInclude("pthread.h");
+});
+
 /// Thread-safe TextAtlas snapshot reference.
 ///
 /// The atlas thread publishes new (immutable) snapshots by calling `publish()`.
@@ -9,6 +13,13 @@ const snail = @import("snail");
 /// cached TextBlobs cannot race atlas publication.
 pub const AtlasRef = struct {
     mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes `ensureText + publish` pairs. Two concurrent extenders
+    /// (render thread doing sync extension; the optional prefetch worker)
+    /// otherwise race against the same baseline, with the loser's work
+    /// silently overwritten on publish. pthread_mutex (blocking) instead
+    /// of the spin `mutex` above because ensureText is an O(ms) shaping
+    /// + page-build operation; spinning on it would burn CPU.
+    extension_lock: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
     current: ?*Snapshot = null,
     retired: ?*Snapshot = null,
     generation: std.atomic.Value(u64) = .init(0),
@@ -49,11 +60,13 @@ pub const AtlasRef = struct {
         const snapshot = try allocator.create(Snapshot);
         errdefer allocator.destroy(snapshot);
         snapshot.* = .{ .atlas = heap };
-        return .{
+        var ref: AtlasRef = .{
             .current = snapshot,
             .generation = .init(1),
             .allocator = allocator,
         };
+        if (c.pthread_mutex_init(&ref.extension_lock, null) != 0) return error.MutexInitFailed;
+        return ref;
     }
 
     /// Acquire the current snapshot and keep it alive until the lease is
@@ -70,6 +83,40 @@ pub const AtlasRef = struct {
     /// Atomically load the generation counter. Lock-free.
     pub fn loadGeneration(self: *const AtlasRef) u64 {
         return self.generation.load(.acquire);
+    }
+
+    pub const ExtendResult = enum {
+        /// The extension produced a new atlas snapshot and it has been
+        /// published. Caller should re-acquire to see it.
+        extended,
+        /// The font has no glyphs for some of the requested codepoints.
+        /// No new snapshot was produced; caller should ship partial.
+        missing,
+    };
+
+    /// Synchronously extend the atlas snapshot to cover `miss_text`. Holds
+    /// `extension_lock` across the `ensureText + publish` pair to keep two
+    /// concurrent extenders from clobbering each other.
+    pub fn extend(
+        self: *AtlasRef,
+        baseline: *const snail.TextAtlas,
+        miss_text: []const u8,
+    ) !ExtendResult {
+        _ = c.pthread_mutex_lock(&self.extension_lock);
+        defer _ = c.pthread_mutex_unlock(&self.extension_lock);
+
+        var next = (try baseline.ensureText(.{}, miss_text)) orelse return .missing;
+        const heap = self.allocator.create(snail.TextAtlas) catch |err| {
+            next.deinit();
+            return err;
+        };
+        heap.* = next;
+        self.publish(heap) catch |err| {
+            heap.deinit();
+            self.allocator.destroy(heap);
+            return err;
+        };
+        return .extended;
     }
 
     /// Publish a new snapshot, retiring the old one.
@@ -90,18 +137,21 @@ pub const AtlasRef = struct {
 
     /// Clean up all held snapshots. Call only when no threads are reading.
     pub fn deinit(self: *AtlasRef) void {
-        self.lock();
-        defer self.unlock();
+        {
+            self.lock();
+            defer self.unlock();
 
-        self.sweepRetiredLocked();
-        while (self.retired) |snapshot| {
-            self.retired = snapshot.next_retired;
-            self.destroySnapshot(snapshot);
+            self.sweepRetiredLocked();
+            while (self.retired) |snapshot| {
+                self.retired = snapshot.next_retired;
+                self.destroySnapshot(snapshot);
+            }
+            if (self.current) |snapshot| {
+                self.destroySnapshot(snapshot);
+                self.current = null;
+            }
         }
-        if (self.current) |snapshot| {
-            self.destroySnapshot(snapshot);
-            self.current = null;
-        }
+        _ = c.pthread_mutex_destroy(&self.extension_lock);
     }
 
     fn retain(self: *AtlasRef, snapshot: *Snapshot) Lease {

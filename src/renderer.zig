@@ -322,12 +322,12 @@ pub const Renderer = struct {
 
     pub fn drawSnapshot(self: *Renderer, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
         const frame_timer = perf.Timer.now();
-        const atlas = self.refreshAtlas();
+        var atlas = self.refreshAtlas();
         try self.ensureDrawBuffers();
         self.scene.reset();
 
         var rows_buf: [MAX_SNAPSHOT_ROWS]row_build.RowDraw = undefined;
-        const built = try row_build.buildSnapshot(
+        var built = try row_build.buildSnapshot(
             snapshot,
             self.allocator,
             self.rowMetrics(),
@@ -340,6 +340,38 @@ pub const Renderer = struct {
             &self.ephemeral_blobs,
             misses,
         );
+
+        // Pass 1 had glyph misses; try a single sync atlas extension.
+        // On success: refresh state and re-build. On miss/failure: ship
+        // partial — the user sees gaps for the missing glyphs but the
+        // rest of the frame paints normally.
+        if (!misses.isEmpty()) {
+            const result = self.atlas_ref.extend(atlas, misses.text()) catch |err| blk: {
+                if (self.debug_log_atlas) std.debug.print("scrgo[gpu-renderer]: atlas extend failed: {}\n", .{err});
+                break :blk .missing;
+            };
+            if (result == .extended) {
+                self.scene.reset();
+                self.ephemeral_blobs.releaseAll();
+                misses.clear();
+                atlas = self.refreshAtlas();
+                built = try row_build.buildSnapshot(
+                    snapshot,
+                    self.allocator,
+                    self.rowMetrics(),
+                    &self.row_cache,
+                    &self.builder,
+                    atlas,
+                    self.last_atlas_identity,
+                    self.scratch_rects,
+                    rows_buf[0..],
+                    &self.ephemeral_blobs,
+                    misses,
+                );
+            } else if (self.debug_log_atlas) {
+                std.debug.print("scrgo[gpu-renderer]: atlas extend missing for {} bytes\n", .{misses.text().len});
+            }
+        }
 
         var override_index: usize = 0;
         var rect_index: usize = 0;

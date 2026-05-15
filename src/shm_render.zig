@@ -367,7 +367,7 @@ pub const SnapshotRenderer = struct {
         self.scene.reset();
 
         var rows_buf: [render_snapshot.MaxRows]row_build.RowDraw = undefined;
-        const built = try row_build.buildSnapshot(
+        var built = try row_build.buildSnapshot(
             snapshot,
             self.allocator,
             metrics,
@@ -380,6 +380,33 @@ pub const SnapshotRenderer = struct {
             &self.ephemeral_blobs,
             &misses,
         );
+
+        // Pass 1 had glyph misses; try a single sync atlas extension.
+        // On success: republish, refresh local state, re-run the build
+        // against the new atlas. On miss/failure: ship partial — buffer
+        // shows gaps for the missing glyphs but the rest paints.
+        if (!misses.isEmpty()) {
+            const baseline_atlas = self.atlas_lease.?.get();
+            const result = self.extendAtlas(atlas_lease, baseline_atlas, misses.text());
+            if (result == .extended) {
+                self.scene.reset();
+                self.ephemeral_blobs.releaseAll();
+                misses.clear();
+                built = try row_build.buildSnapshot(
+                    snapshot,
+                    self.allocator,
+                    metrics,
+                    &self.row_cache,
+                    &self.builder,
+                    self.atlas_lease.?.get(),
+                    self.builder_atlas_identity,
+                    self.scratch_rects,
+                    rows_buf[0..],
+                    &self.ephemeral_blobs,
+                    &misses,
+                );
+            }
+        }
 
         // Pass B: bg + decoration rects per row, with row_y added.
         for (built.rows) |row_draw| {
@@ -418,14 +445,24 @@ pub const SnapshotRenderer = struct {
             if (cursor.inverted_glyph) |blob| try self.scene.addText(.{ .blob = blob });
         }
 
-        if (!misses.isEmpty()) {
-            self.ephemeral_blobs.releaseAll();
-            return misses;
-        }
-
         try self.flushDraw(width, height);
         self.ephemeral_blobs.releaseAll();
         return misses;
+    }
+
+    fn extendAtlas(
+        self: *SnapshotRenderer,
+        _: *const atlas_ref_mod.AtlasRef.Lease,
+        baseline: *const snail.TextAtlas,
+        miss_text: []const u8,
+    ) atlas_ref_mod.AtlasRef.ExtendResult {
+        const atlas_ref = self.atlas_lease.?.ref;
+        const result = atlas_ref.extend(baseline, miss_text) catch return .missing;
+        if (result != .extended) return result;
+        var new_lease = atlas_ref.acquire();
+        defer new_lease.release();
+        self.ensureBuilderForAtlas(&new_lease);
+        return .extended;
     }
 
     fn flushDraw(self: *SnapshotRenderer, viewport_w: u32, viewport_h: u32) !void {
