@@ -216,19 +216,21 @@ pub const Renderer = struct {
         self.debug_log_atlas = options.atlas;
     }
 
-    pub fn reconfigure(
-        self: *Renderer,
-        w: u32,
-        h: u32,
-        font_size: f32,
-        cell_width: f32,
-        cell_height: f32,
-    ) void {
+    /// Resize the drawable. Pure window-resize; cell metrics are unchanged
+    /// so the row cache stays hot.
+    pub fn setViewport(self: *Renderer, w: u32, h: u32) void {
+        self.viewport_w = @floatFromInt(w);
+        self.viewport_h = @floatFromInt(h);
+    }
+
+    /// Update font metrics. Each cached `TextBlob` bakes `placement.em` into
+    /// its per-instance Transform2D, so any metrics change invalidates the
+    /// entire row cache. No-op when metrics are unchanged.
+    pub fn setMetrics(self: *Renderer, font_size: f32, cell_width: f32, cell_height: f32) void {
+        if (self.font_size == font_size and self.cell_width == cell_width and self.cell_height == cell_height) return;
         self.font_size = font_size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
-        self.viewport_w = @floatFromInt(w);
-        self.viewport_h = @floatFromInt(h);
         self.clearCache();
     }
 

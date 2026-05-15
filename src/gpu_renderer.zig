@@ -663,7 +663,8 @@ pub const Frontend = struct {
 
                     // Init or reconfigure renderer
                     if (renderer) |*r| {
-                        r.reconfigure(request.width, request.height, request.font_size, request.cell_width, request.cell_height);
+                        r.setMetrics(request.font_size, request.cell_width, request.cell_height);
+                        r.setViewport(request.width, request.height);
                     } else {
                         renderer = renderer_mod.Renderer.init(
                             std.heap.smp_allocator,
@@ -682,7 +683,7 @@ pub const Frontend = struct {
                             if (c.getenv("SCRGO_FLAGS")) |value| std.mem.sliceTo(value, 0) else null,
                         );
                         renderer.?.setDebugResetAtlas(runtime_flags.reset_atlas_each_frame);
-                        renderer.?.reconfigure(request.width, request.height, request.font_size, request.cell_width, request.cell_height);
+                        renderer.?.setViewport(request.width, request.height);
                     }
 
                     // Publish buffer descriptors for main thread
