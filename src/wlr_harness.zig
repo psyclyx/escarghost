@@ -481,10 +481,25 @@ pub const Harness = struct {
     fn foreignToplevel(data: ?*anyopaque, _: ?*wl.zwlr_foreign_toplevel_manager_v1, handle: ?*wl.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {
         const self: *Harness = @ptrCast(@alignCast(data));
         const h_ptr = handle orelse return;
-        if (self.toplevels_n < self.toplevels.len) {
-            self.toplevels[self.toplevels_n] = .{ .handle = h_ptr };
+        // Prefer reusing a closed slot so we don't run out across the
+        // multi-scenario run (5 terminals × N runs adds up fast).
+        var slot: ?usize = null;
+        var i: usize = 0;
+        while (i < self.toplevels_n) : (i += 1) {
+            if (self.toplevels[i].closed) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == null and self.toplevels_n < self.toplevels.len) {
+            slot = self.toplevels_n;
             self.toplevels_n += 1;
+        }
+        if (slot) |idx| {
+            self.toplevels[idx] = .{ .handle = h_ptr };
             _ = wl.zwlr_foreign_toplevel_handle_v1_add_listener(handle, &foreign_toplevel_listener, @ptrCast(self));
+        } else {
+            std.debug.print("wlr_harness: toplevel array full ({} live), dropping new handle\n", .{self.toplevels_n});
         }
     }
 
@@ -528,7 +543,15 @@ pub const Harness = struct {
     fn handleDone(_: ?*anyopaque, _: ?*wl.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {}
     fn handleClosed(data: ?*anyopaque, handle: ?*wl.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {
         const self: *Harness = @ptrCast(@alignCast(data));
-        if (self.findEntryByHandle(handle)) |entry| entry.closed = true;
+        if (self.findEntryByHandle(handle)) |entry| {
+            entry.closed = true;
+            // Per the wlr-foreign-toplevel-management protocol, the
+            // handle is semantically dead after `closed` and the client
+            // owns destroying it. Doing it here lets the compositor
+            // release its side and means a stale handle pointer in the
+            // entry can't be confused with a future allocation.
+            wl.zwlr_foreign_toplevel_handle_v1_destroy(handle);
+        }
     }
     fn handleParent(_: ?*anyopaque, _: ?*wl.zwlr_foreign_toplevel_handle_v1, _: ?*wl.zwlr_foreign_toplevel_handle_v1) callconv(.c) void {}
 
