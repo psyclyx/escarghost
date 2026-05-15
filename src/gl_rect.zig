@@ -3,6 +3,7 @@
 //! underlines, cursors, and other simple solid-color geometry.
 
 const snail = @import("snail");
+const row_build = @import("row_build.zig");
 
 const gl = @cImport({
     @cDefine("GL_GLEXT_PROTOTYPES", "1");
@@ -10,13 +11,7 @@ const gl = @cImport({
     @cInclude("GL/glext.h");
 });
 
-pub const ColoredRect = struct {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    color: [4]f32,
-};
+pub const ColoredRect = row_build.ColoredRect;
 
 const vert_src: [*c]const u8 =
     \\#version 330 core

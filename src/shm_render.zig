@@ -8,6 +8,7 @@ const atlas_ref_mod = @import("atlas_ref.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const render_common = @import("render_common.zig");
+const row_build = @import("row_build.zig");
 const color = @import("color.zig");
 const Rgb = color.Rgb;
 
@@ -19,11 +20,20 @@ const c = @cImport({
 
 const wl = @cImport(@cInclude("wayland-client.h"));
 
-const baseline_factor: f32 = 0.8;
+const baseline_factor: f32 = row_build.baseline_factor;
 const RESOURCE_ENTRY_CAP: usize = 4;
 
 inline fn argbPixel(r: u8, g: u8, b: u8, a: u8) u32 {
     return (@as(u32, a) << 24) | (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
+}
+
+/// snail-style float color (sRGB, 0..1) → ARGB8888 with full alpha.
+/// Rounds rather than truncating so a u8→f32→u8 round-trip is exact.
+inline fn colorToArgb(rgba: [4]f32) u32 {
+    const r: u8 = @intFromFloat(@round(@max(0.0, @min(255.0, rgba[0] * 255.0))));
+    const g: u8 = @intFromFloat(@round(@max(0.0, @min(255.0, rgba[1] * 255.0))));
+    const b: u8 = @intFromFloat(@round(@max(0.0, @min(255.0, rgba[2] * 255.0))));
+    return argbPixel(r, g, b, 255);
 }
 
 /// Memset the entire buffer to a single ARGB8 pixel.
@@ -156,40 +166,6 @@ pub const ShmFrame = struct {
     }
 };
 
-/// Same as renderer.zig's RunAccumulator: collect a same-color text run for
-/// HB to shape as a unit (ligatures form within the run).
-const RunAccumulator = struct {
-    text: [2048]u8 = undefined,
-    text_len: usize = 0,
-    start_col: u16 = 0,
-    fg: ?Rgb = null,
-
-    fn reset(self: *RunAccumulator) void {
-        self.text_len = 0;
-        self.fg = null;
-    }
-
-    fn isEmpty(self: *const RunAccumulator) bool {
-        return self.text_len == 0;
-    }
-
-    fn appendCell(self: *RunAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
-        if (self.fg == null) {
-            self.start_col = col;
-            self.fg = fg;
-        }
-        if (self.text_len + 4 > self.text.len) return;
-        const n = std.unicode.utf8Encode(@intCast(codepoint), self.text[self.text_len..]) catch 0;
-        if (n == 0) return;
-        self.text_len += n;
-    }
-
-    fn fgMatches(self: *const RunAccumulator, fg: Rgb) bool {
-        const cur = self.fg orelse return false;
-        return cur.r == fg.r and cur.g == fg.g and cur.b == fg.b;
-    }
-};
-
 /// Persistent CPU renderer + scene state. One instance per CPU worker thread.
 pub const SnapshotRenderer = struct {
     allocator: std.mem.Allocator,
@@ -211,6 +187,7 @@ pub const SnapshotRenderer = struct {
     seg_buf: std.ArrayList(snail.DrawSegment) = .empty,
     overrides: [render_snapshot.MaxRows + 4]snail.Override = undefined,
     resource_entries: [RESOURCE_ENTRY_CAP]snail.ResourceSet.Entry = undefined,
+    scratch_rects: []row_build.ColoredRect,
 
     pub fn init(allocator: std.mem.Allocator) !SnapshotRenderer {
         // Buffer is reinit'd per frame with the SHM map.
@@ -227,11 +204,15 @@ pub const SnapshotRenderer = struct {
         // Builder needs an atlas to bind to; defer real init to the first frame.
         const builder = snail.TextBlobBuilder.init(allocator, undefined);
 
+        const scratch_rects = try allocator.alloc(row_build.ColoredRect, row_build.MAX_RECTS_PER_ROW);
+        errdefer allocator.free(scratch_rects);
+
         return .{
             .allocator = allocator,
             .cpu = cpu,
             .scene = scene,
             .builder = builder,
+            .scratch_rects = scratch_rects,
         };
     }
 
@@ -247,6 +228,7 @@ pub const SnapshotRenderer = struct {
         if (self.builder_atlas_identity != 0) self.builder.deinit();
         if (self.atlas_lease) |*lease| lease.release();
         self.scene.deinit();
+        self.allocator.free(self.scratch_rects);
     }
 
     fn ensureBuilderForAtlas(self: *SnapshotRenderer, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
@@ -347,7 +329,6 @@ pub const SnapshotRenderer = struct {
 
         const rows = @min(header.rows, render_snapshot.MaxRows);
         const cols = @min(header.cols, render_snapshot.MaxCols);
-        const baseline = cell_height * baseline_factor;
 
         var override_index: usize = 0;
         var cursor_cell: ?render_common.CursorCell = null;
@@ -381,7 +362,6 @@ pub const SnapshotRenderer = struct {
                 &cell_index,
                 cols,
                 cell_y,
-                baseline,
                 cell_width,
                 cell_height,
                 font_size,
@@ -421,7 +401,7 @@ pub const SnapshotRenderer = struct {
                             cell,
                             @as(f32, @floatFromInt(header.cursor_x)) * cell_width,
                             @as(f32, @floatFromInt(header.cursor_y)) * cell_height,
-                            baseline,
+                            cell_height * baseline_factor,
                             font_size,
                             &misses,
                         );
@@ -440,42 +420,12 @@ pub const SnapshotRenderer = struct {
         return misses;
     }
 
-    /// Shape the run via HB (so ligatures form), let HB's natural glyph
-    /// advances do the placement. Cell_width matches the font's natural
-    /// advance, so ligatures span exactly the right number of cells.
-    fn flushRun(
-        self: *SnapshotRenderer,
-        run: *RunAccumulator,
-        cell_y: f32,
-        baseline: f32,
-        cell_width: f32,
-        font_size: f32,
-        misses: *glyph_misses.Set,
-    ) !void {
-        if (run.isEmpty()) return;
-        const fg = run.fg.?;
-
-        const opts_x = @as(f32, @floatFromInt(run.start_col)) * cell_width;
-        const atlas = self.atlas_lease.?.get();
-        var shaped = try atlas.shapeText(self.allocator, .{}, run.text[0..run.text_len]);
-        defer shaped.deinit();
-        const result = try self.builder.append(.{
-            .shaped = &shaped,
-            .placement = .{ .baseline = .{ .x = opts_x, .y = cell_y + baseline }, .em = font_size },
-            .fill = .{ .solid = fg.toFloat4(1.0) },
-        });
-
-        if (result.missing) misses.addRun(run.text[0..run.text_len]);
-        run.reset();
-    }
-
     fn appendRow(
         self: *SnapshotRenderer,
         snapshot: *const render_snapshot.SharedSnapshot,
         cell_index: *usize,
         cols: u16,
         cell_y: f32,
-        baseline: f32,
         cell_width: f32,
         cell_height: f32,
         font_size: f32,
@@ -486,127 +436,36 @@ pub const SnapshotRenderer = struct {
         override_index: *usize,
         misses: *glyph_misses.Set,
     ) !void {
-        const default_fg = snapshot.header.default_fg;
-        const default_bg = snapshot.header.default_bg;
-
         self.builder.reset();
+        const built = try row_build.buildRow(
+            snapshot,
+            cell_index,
+            cols,
+            cell_y,
+            self.scratch_rects,
+            &self.builder,
+            self.atlas_lease.?.get(),
+            self.allocator,
+            .{
+                .cell_width = cell_width,
+                .cell_height = cell_height,
+                .font_size = font_size,
+            },
+            misses,
+        );
 
-        var bg_span_start: u16 = 0;
-        var bg_span_color: ?Rgb = null;
-        var bg_span_len: u16 = 0;
-
-        var run = RunAccumulator{};
-
-        var col_idx: u16 = 0;
-        while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
-            col_idx += 1;
-            cell_index.* += 1;
-        }) {
-            const cell = snapshot.cells[cell_index.*];
-            const flags: render_snapshot.CellFlags = @bitCast(cell.flags);
-            const resolved = render_common.resolveCellColors(
-                default_fg,
-                default_bg,
-                if (flags.has_fg) cell.fg else null,
-                if (flags.has_bg) cell.bg else null,
-                flags.inverse,
-                flags.faint,
+        for (self.scratch_rects[0..built.rect_count]) |r| {
+            fillRectArgb(
+                map_ptr,
+                width,
+                height,
+                stride,
+                @intFromFloat(r.x),
+                @intFromFloat(r.y),
+                @intFromFloat(r.w),
+                @intFromFloat(r.h),
+                colorToArgb(r.color),
             );
-            const fg = resolved.fg;
-            const cell_bg = resolved.bg;
-
-            const bg_matches = if (cell_bg) |cbg|
-                if (bg_span_color) |sc| sc.r == cbg.r and sc.g == cbg.g and sc.b == cbg.b else false
-            else
-                false;
-            if (cell_bg != null and bg_matches) {
-                bg_span_len += 1;
-            } else {
-                if (bg_span_len > 0) {
-                    if (bg_span_color) |sc| {
-                        fillRectArgb(
-                            map_ptr,
-                            width,
-                            height,
-                            stride,
-                            @intFromFloat(@as(f32, @floatFromInt(bg_span_start)) * cell_width),
-                            @intFromFloat(cell_y),
-                            @intFromFloat(@as(f32, @floatFromInt(bg_span_len)) * cell_width),
-                            @intFromFloat(cell_height),
-                            argbPixel(sc.r, sc.g, sc.b, 255),
-                        );
-                    }
-                }
-                if (cell_bg) |cbg| {
-                    bg_span_start = col_idx;
-                    bg_span_color = cbg;
-                    bg_span_len = 1;
-                } else {
-                    bg_span_color = null;
-                    bg_span_len = 0;
-                }
-            }
-
-            const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
-            const break_run = !has_renderable_text or flags.underline or flags.strikethrough or
-                (run.fg != null and !run.fgMatches(fg));
-            if (break_run and !run.isEmpty()) {
-                try self.flushRun(&run, cell_y, baseline, cell_width, font_size, misses);
-            }
-
-            if (has_renderable_text) {
-                run.appendCell(cell.codepoint, col_idx, fg);
-                if (flags.underline or flags.strikethrough) {
-                    try self.flushRun(&run, cell_y, baseline, cell_width, font_size, misses);
-                }
-            }
-
-            if (flags.underline) {
-                fillRectArgb(
-                    map_ptr,
-                    width,
-                    height,
-                    stride,
-                    @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
-                    @intFromFloat(cell_y + cell_height - 1),
-                    @intFromFloat(cell_width),
-                    1,
-                    argbPixel(fg.r, fg.g, fg.b, 255),
-                );
-            }
-            if (flags.strikethrough) {
-                fillRectArgb(
-                    map_ptr,
-                    width,
-                    height,
-                    stride,
-                    @intFromFloat(@as(f32, @floatFromInt(col_idx)) * cell_width),
-                    @intFromFloat(cell_y + cell_height * 0.45),
-                    @intFromFloat(cell_width),
-                    1,
-                    argbPixel(fg.r, fg.g, fg.b, 255),
-                );
-            }
-        }
-
-        if (!run.isEmpty()) {
-            try self.flushRun(&run, cell_y, baseline, cell_width, font_size, misses);
-        }
-
-        if (bg_span_len > 0) {
-            if (bg_span_color) |sc| {
-                fillRectArgb(
-                    map_ptr,
-                    width,
-                    height,
-                    stride,
-                    @intFromFloat(@as(f32, @floatFromInt(bg_span_start)) * cell_width),
-                    @intFromFloat(cell_y),
-                    @intFromFloat(@as(f32, @floatFromInt(bg_span_len)) * cell_width),
-                    @intFromFloat(cell_height),
-                    argbPixel(sc.r, sc.g, sc.b, 255),
-                );
-            }
         }
 
         if (self.builder.glyphCount() == 0) return;

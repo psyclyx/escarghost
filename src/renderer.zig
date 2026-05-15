@@ -6,13 +6,14 @@ const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_common = @import("render_common.zig");
+const row_build = @import("row_build.zig");
 const gl_rect = @import("gl_rect.zig");
 const color = @import("color.zig");
 const perf = @import("perf.zig");
 const Rgb = color.Rgb;
 const Terminal = terminal_mod.Terminal;
 const CursorCell = render_common.CursorCell;
-const ColoredRect = gl_rect.ColoredRect;
+const ColoredRect = row_build.ColoredRect;
 
 const gl = @cImport({
     @cDefine("GL_GLEXT_PROTOTYPES", "1");
@@ -20,8 +21,8 @@ const gl = @cImport({
     @cInclude("GL/glext.h");
 });
 
-const baseline_factor: f32 = 0.8;
-const MAX_RECTS_PER_ROW: usize = 400 * 3;
+const baseline_factor: f32 = row_build.baseline_factor;
+const MAX_RECTS_PER_ROW: usize = row_build.MAX_RECTS_PER_ROW;
 const MAX_DRAW_RECTS: usize = 400 * 200 * 3 + 16;
 const MAX_SNAPSHOT_ROWS: usize = render_snapshot.MaxRows;
 const MAX_OVERRIDES: usize = MAX_SNAPSHOT_ROWS + 4; // rows + cursor blob
@@ -320,63 +321,12 @@ pub const Renderer = struct {
         if (oldest_key) |k| self.evictRow(k);
     }
 
-    /// Accumulates a same-color text run so HB can shape it as a unit
-    /// (ligatures form across cells inside the run, but never across a
-    /// color change or a decorated cell).
-    const RunAccumulator = struct {
-        text: [2048]u8 = undefined,
-        text_len: usize = 0,
-        start_col: u16 = 0,
-        fg: ?Rgb = null,
-
-        fn reset(self: *RunAccumulator) void {
-            self.text_len = 0;
-            self.fg = null;
-        }
-
-        fn isEmpty(self: *const RunAccumulator) bool {
-            return self.text_len == 0;
-        }
-
-        fn appendCell(self: *RunAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
-            if (self.fg == null) {
-                self.start_col = col;
-                self.fg = fg;
-            }
-            if (self.text_len + 4 > self.text.len) return;
-            const n = std.unicode.utf8Encode(@intCast(codepoint), self.text[self.text_len..]) catch 0;
-            if (n == 0) return;
-            self.text_len += n;
-        }
-
-        fn fgMatches(self: *const RunAccumulator, fg: Rgb) bool {
-            const cur = self.fg orelse return false;
-            return cur.r == fg.r and cur.g == fg.g and cur.b == fg.b;
-        }
-    };
-
-    /// Shape the run as a unit so HB can form ligatures, then let HB's
-    /// natural glyph advances do the placement. Cell_width matches the
-    /// font's natural advance (no ceiling), so a well-behaved monospace
-    /// font's ligatures span exactly the right number of cells.
-    fn flushRun(self: *Renderer, run: *RunAccumulator, misses: *glyph_misses.Set) !bool {
-        if (run.isEmpty()) return false;
-        const fg = run.fg.?;
-
-        const opts_x = @as(f32, @floatFromInt(run.start_col)) * self.cell_width;
-        var shaped = try self.atlas_lease.get().shapeText(self.allocator, .{}, run.text[0..run.text_len]);
-        defer shaped.deinit();
-        const result = try self.builder.append(.{
-            .shaped = &shaped,
-            .placement = .{ .baseline = .{ .x = opts_x, .y = self.baseline() }, .em = self.font_size },
-            .fill = .{ .solid = self.color4(fg, 1.0) },
-        });
-
-        const had_misses = result.missing;
-        if (had_misses) misses.addRun(run.text[0..run.text_len]);
-
-        run.reset();
-        return had_misses;
+    fn rowMetrics(self: *const Renderer) row_build.Metrics {
+        return .{
+            .cell_width = self.cell_width,
+            .cell_height = self.cell_height,
+            .font_size = self.font_size,
+        };
     }
 
     /// Build the row's TextBlob and rect set. Y coordinates are local to the
@@ -394,129 +344,21 @@ pub const Renderer = struct {
         had_misses: bool,
     } {
         self.builder.reset();
-        var rect_count: usize = 0;
-        var had_misses = false;
-
-        const default_fg = snapshot.header.default_fg;
-        const default_bg = snapshot.header.default_bg;
-
-        var bg_span_start: u16 = 0;
-        var bg_span_color: ?Rgb = null;
-        var bg_span_len: u16 = 0;
-
-        var run = RunAccumulator{};
-
-        var col_idx: u16 = 0;
-        while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
-            col_idx += 1;
-            cell_index.* += 1;
-        }) {
-            const cell = snapshot.cells[cell_index.*];
-            const flags: render_snapshot.CellFlags = @bitCast(cell.flags);
-            const resolved = render_common.resolveCellColors(
-                default_fg,
-                default_bg,
-                if (flags.has_fg) cell.fg else null,
-                if (flags.has_bg) cell.bg else null,
-                flags.inverse,
-                flags.faint,
-            );
-            const fg = resolved.fg;
-            const cell_bg = resolved.bg;
-
-            const bg_matches = if (cell_bg) |cbg|
-                if (bg_span_color) |sc| sc.r == cbg.r and sc.g == cbg.g and sc.b == cbg.b else false
-            else
-                false;
-            if (cell_bg != null and bg_matches) {
-                bg_span_len += 1;
-            } else {
-                if (bg_span_len > 0) {
-                    if (bg_span_color) |sc| {
-                        if (rect_count < self.scratch_rects.len) {
-                            self.scratch_rects[rect_count] = .{
-                                .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                                .y = 0,
-                                .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                                .h = self.cell_height,
-                                .color = self.color4(sc, 1.0),
-                            };
-                            rect_count += 1;
-                        }
-                    }
-                }
-                if (cell_bg) |cbg| {
-                    bg_span_start = col_idx;
-                    bg_span_color = cbg;
-                    bg_span_len = 1;
-                } else {
-                    bg_span_color = null;
-                    bg_span_len = 0;
-                }
-            }
-
-            const has_renderable_text = flags.has_text and cell.codepoint > 0x20 and cell.codepoint < 0x110000;
-            // A run breaks on: non-text cell, fg color change, or any cell
-            // with underline/strikethrough (so decorations don't bleed across
-            // a ligature glyph that spans cells).
-            const break_run = !has_renderable_text or flags.underline or flags.strikethrough or
-                (run.fg != null and !run.fgMatches(fg));
-            if (break_run and !run.isEmpty()) {
-                if (try self.flushRun(&run, misses)) had_misses = true;
-            }
-
-            if (has_renderable_text) {
-                run.appendCell(cell.codepoint, col_idx, fg);
-                // Cells with decorations don't ligate with neighbors.
-                if (flags.underline or flags.strikethrough) {
-                    if (try self.flushRun(&run, misses)) had_misses = true;
-                }
-            }
-
-            if (flags.underline and rect_count < self.scratch_rects.len) {
-                self.scratch_rects[rect_count] = .{
-                    .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                    .y = self.cell_height - 1,
-                    .w = self.cell_width,
-                    .h = 1,
-                    .color = self.color4(fg, 1.0),
-                };
-                rect_count += 1;
-            }
-            if (flags.strikethrough and rect_count < self.scratch_rects.len) {
-                self.scratch_rects[rect_count] = .{
-                    .x = @as(f32, @floatFromInt(col_idx)) * self.cell_width,
-                    .y = self.cell_height * 0.45,
-                    .w = self.cell_width,
-                    .h = 1,
-                    .color = self.color4(fg, 1.0),
-                };
-                rect_count += 1;
-            }
-        }
-
-        if (!run.isEmpty()) {
-            if (try self.flushRun(&run, misses)) had_misses = true;
-        }
-
-        if (bg_span_len > 0) {
-            if (bg_span_color) |sc| {
-                if (rect_count < self.scratch_rects.len) {
-                    self.scratch_rects[rect_count] = .{
-                        .x = @as(f32, @floatFromInt(bg_span_start)) * self.cell_width,
-                        .y = 0,
-                        .w = @as(f32, @floatFromInt(bg_span_len)) * self.cell_width,
-                        .h = self.cell_height,
-                        .color = self.color4(sc, 1.0),
-                    };
-                    rect_count += 1;
-                }
-            }
-        }
-
+        const built = try row_build.buildRow(
+            snapshot,
+            cell_index,
+            cols,
+            0,
+            self.scratch_rects,
+            &self.builder,
+            self.atlas_lease.get(),
+            self.allocator,
+            self.rowMetrics(),
+            misses,
+        );
         const blob = try self.builder.finish();
-        const rects = try self.allocator.dupe(ColoredRect, self.scratch_rects[0..rect_count]);
-        return .{ .blob = blob, .rects = rects, .had_misses = had_misses };
+        const rects = try self.allocator.dupe(ColoredRect, self.scratch_rects[0..built.rect_count]);
+        return .{ .blob = blob, .rects = rects, .had_misses = built.had_misses };
     }
 
     fn cacheRow(
