@@ -435,3 +435,217 @@ fn destroyRow(allocator: std.mem.Allocator, row: *Row) void {
     allocator.destroy(row.blob);
     allocator.free(row.rects);
 }
+
+/// Per-frame stash of heap-allocated `TextBlob`s that the scene records
+/// pointers to. Freed in bulk at end of frame; both backends own one.
+pub const EphemeralBlobs = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(*snail.TextBlob) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) EphemeralBlobs {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *EphemeralBlobs) void {
+        self.releaseAll();
+        self.items.deinit(self.allocator);
+    }
+
+    pub fn releaseAll(self: *EphemeralBlobs) void {
+        for (self.items.items) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+        }
+        self.items.clearRetainingCapacity();
+    }
+
+    pub fn stash(self: *EphemeralBlobs, blob: snail.TextBlob) ?*const snail.TextBlob {
+        const slot = self.allocator.create(snail.TextBlob) catch {
+            var b = blob;
+            b.deinit();
+            return null;
+        };
+        slot.* = blob;
+        self.items.append(self.allocator, slot) catch {
+            slot.deinit();
+            self.allocator.destroy(slot);
+            return null;
+        };
+        return slot;
+    }
+};
+
+/// Output of `buildSnapshot`: the per-row draw list (cached blob + row_y)
+/// and an optional cursor overlay. Backends iterate this to emit the four
+/// passes (clear → bg/decoration rects → cursor rect → text scene).
+pub const RowDraw = struct {
+    row: *Row,
+    row_y: f32,
+};
+
+pub const CursorOverlay = struct {
+    cell_x: u16,
+    cell_y: u16,
+    style: render_snapshot.CursorStyle,
+    color: Rgb,
+    /// Block-style cursor's inverted glyph, stashed in the per-frame
+    /// EphemeralBlobs. Null for non-block styles, empty cells, missing
+    /// glyphs, or stash-allocation failure.
+    inverted_glyph: ?*const snail.TextBlob = null,
+};
+
+pub const BuiltSnapshot = struct {
+    rows: []const RowDraw,
+    cursor: ?CursorOverlay,
+};
+
+/// Walk a snapshot row-by-row, hit the row cache, and capture cursor
+/// state in one pass. Backends own the four submit passes (see
+/// docs/row-render-design.md for the contract); this layer owns
+/// iteration, caching, and the per-frame inverted-glyph build.
+pub fn buildSnapshot(
+    snapshot: *const render_snapshot.SharedSnapshot,
+    allocator: std.mem.Allocator,
+    metrics: Metrics,
+    cache: *RowCache,
+    builder: *snail.TextBlobBuilder,
+    atlas: *const snail.TextAtlas,
+    atlas_identity: u64,
+    scratch_rects: []ColoredRect,
+    rows_out: []RowDraw,
+    blob_stash: *EphemeralBlobs,
+    misses: *glyph_misses.Set,
+) !BuiltSnapshot {
+    cache.beginFrame();
+
+    const header = snapshot.header;
+    const default_fg = header.default_fg;
+    const default_bg = header.default_bg;
+    const rows = @min(header.rows, render_snapshot.MaxRows);
+    const cols = @min(header.cols, render_snapshot.MaxCols);
+
+    var cell_index: usize = 0;
+    var cursor_cell: ?render_common.CursorCell = null;
+    var row_count: usize = 0;
+
+    var row_idx: u16 = 0;
+    while (row_idx < rows and row_count < rows_out.len) : (row_idx += 1) {
+        const row_y = @as(f32, @floatFromInt(row_idx)) * metrics.cell_height;
+        const row_start_index = cell_index;
+
+        if (header.cursor_visible != 0 and header.cursor_in_viewport != 0 and row_idx == header.cursor_y) {
+            const cursor_col = header.cursor_x;
+            if (cursor_col < cols and row_start_index + cursor_col < header.cell_count) {
+                const cell = snapshot.cells[row_start_index + cursor_col];
+                const flags: render_snapshot.CellFlags = @bitCast(cell.flags);
+                const resolved = render_common.resolveCellColors(
+                    default_fg,
+                    default_bg,
+                    if (flags.has_fg) cell.fg else null,
+                    if (flags.has_bg) cell.bg else null,
+                    flags.inverse,
+                    flags.faint,
+                );
+                cursor_cell = render_common.captureCursorCell(default_bg, cell.codepoint, cell.glyph_id, flags.has_text, resolved);
+            }
+        }
+
+        const content_hash = hashSnapshotRow(snapshot, row_start_index, cols);
+        const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
+
+        var entry: ?*Row = null;
+        if (cache.get(content_hash)) |row| {
+            if (!row.had_misses and row.atlas_identity == atlas_identity) {
+                entry = row;
+            }
+        }
+        if (entry == null) {
+            builder.reset();
+            const built = try buildRow(
+                snapshot,
+                &cell_index,
+                cols,
+                0,
+                scratch_rects,
+                builder,
+                atlas,
+                allocator,
+                metrics,
+                misses,
+            );
+            const blob = try builder.finish();
+            const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
+            entry = cache.store(content_hash, blob, rects, atlas_identity, built.had_misses);
+        }
+        cell_index = next_index;
+
+        if (entry) |row| {
+            rows_out[row_count] = .{ .row = row, .row_y = row_y };
+            row_count += 1;
+        }
+    }
+
+    var cursor: ?CursorOverlay = null;
+    if (header.cursor_visible != 0 and header.cursor_in_viewport != 0) {
+        const cursor_color = if (header.cursor_has_color != 0) header.cursor_color else default_fg;
+        var overlay: CursorOverlay = .{
+            .cell_x = header.cursor_x,
+            .cell_y = header.cursor_y,
+            .style = header.cursor_style,
+            .color = cursor_color,
+        };
+        if (header.cursor_style == .block) {
+            if (cursor_cell) |cell| {
+                if (cell.has_text and cell.glyph_id != 0) {
+                    overlay.inverted_glyph = buildInvertedGlyph(
+                        atlas,
+                        allocator,
+                        metrics,
+                        cell,
+                        header.cursor_x,
+                        header.cursor_y,
+                        blob_stash,
+                        misses,
+                    ) catch null;
+                }
+            }
+        }
+        cursor = overlay;
+    }
+
+    return .{ .rows = rows_out[0..row_count], .cursor = cursor };
+}
+
+fn buildInvertedGlyph(
+    atlas: *const snail.TextAtlas,
+    allocator: std.mem.Allocator,
+    metrics: Metrics,
+    cell: render_common.CursorCell,
+    cursor_x: u16,
+    cursor_y: u16,
+    blob_stash: *EphemeralBlobs,
+    misses: *glyph_misses.Set,
+) !?*const snail.TextBlob {
+    var inv_builder = snail.TextBlobBuilder.init(allocator, atlas);
+    defer inv_builder.deinit();
+    var tmp: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &tmp) catch return null;
+    var shaped = try atlas.shapeText(allocator, .{}, tmp[0..n]);
+    defer shaped.deinit();
+    const cx = @as(f32, @floatFromInt(cursor_x)) * metrics.cell_width;
+    const cy = @as(f32, @floatFromInt(cursor_y)) * metrics.cell_height;
+    const result = try inv_builder.append(.{
+        .shaped = &shaped,
+        .placement = .{
+            .baseline = .{ .x = cx, .y = cy + metrics.baseline() },
+            .em = metrics.font_size,
+        },
+        .fill = .{ .solid = cell.bg.toFloat4(1.0) },
+    });
+    if (result.missing) {
+        misses.addRun(tmp[0..n]);
+        return null;
+    }
+    const blob = try inv_builder.finish();
+    return blob_stash.stash(blob);
+}
