@@ -16,6 +16,7 @@ const startup_mod = @import("bench_startup.zig");
 const stream_mod = @import("bench_stream.zig");
 const latency_mod = @import("bench_input_latency.zig");
 const memory_mod = @import("bench_memory.zig");
+const screenshot_mod = @import("bench_screenshot.zig");
 
 fn envOrNull(name: [*:0]const u8) ?[]const u8 {
     const p = posix.getenv(name) orelse return null;
@@ -29,9 +30,9 @@ fn requireEnv(name: [*:0]const u8) []const u8 {
     };
 }
 
-const Scenario = enum { startup, stream, @"input-latency", memory };
+const Scenario = enum { startup, stream, @"input-latency", memory, screenshots };
 
-const all_scenarios = [_]Scenario{ .startup, .stream, .@"input-latency", .memory };
+const all_scenarios = [_]Scenario{ .startup, .stream, .@"input-latency", .memory, .screenshots };
 
 const Args = struct {
     scenarios: []const Scenario = &all_scenarios,
@@ -42,6 +43,7 @@ const Args = struct {
     memory_runs: u32 = 5,
     latency_samples: u32 = 30,
     stream_deadline_ms: f64 = 30_000,
+    screenshots_out: []const u8 = "/tmp",
 };
 
 fn parseScenarios(allocator: std.mem.Allocator, csv: []const u8) ![]const Scenario {
@@ -91,6 +93,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
             args.latency_samples = try std.fmt.parseInt(u32, a[18..], 10);
         } else if (std.mem.startsWith(u8, a, "--stream-deadline-ms=")) {
             args.stream_deadline_ms = try std.fmt.parseFloat(f64, a[21..]);
+        } else if (std.mem.startsWith(u8, a, "--screenshots-out=")) {
+            args.screenshots_out = a[18..];
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print(
                 \\Usage: scrgo-bench-suite [options]
@@ -104,6 +108,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
                 \\  --startup-warmup=N       unmeasured warmup runs for startup (default: 5)
                 \\  --memory-runs=N          runs per terminal for memory (default: 5)
                 \\  --latency-samples=N      keys per terminal for input-latency (default: 30)
+                \\  --screenshots-out=DIR    where to dump bench-<label>.ppm (default: /tmp)
                 \\
                 \\Env vars (supplied by the nix wrapper):
                 \\  WAYLAND_DISPLAY   nested compositor socket
@@ -265,6 +270,27 @@ fn runMemory(args: Args) !void {
     }
 }
 
+fn runScreenshots(harness: *h.Harness, args: Args) !void {
+    const sh = requireEnv("BENCH_SH");
+    const opts: screenshot_mod.Options = .{
+        .sh_bin = sh,
+        .out_dir = args.screenshots_out,
+    };
+    printHeader(
+        "screenshots (one frame after a fixed payload)",
+        "terminal     path",
+    );
+    for (args.terminals) |spec| {
+        const bin = binFor(spec) orelse {
+            std.debug.print("{s:<10} skipped (${s} not set)\n", .{ spec.label, spec.env_var });
+            continue;
+        };
+        screenshot_mod.captureOne(harness, spec, bin, opts) catch |err| {
+            std.debug.print("{s:<10} error: {}\n", .{ spec.label, err });
+        };
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -281,13 +307,17 @@ pub fn main(init: std.process.Init) !void {
         switch (scenario) {
             .startup => try runStartup(args),
             .memory => try runMemory(args),
-            .stream, .@"input-latency" => {
+            .stream, .@"input-latency", .screenshots => {
                 if (!harness_inited) {
                     try harness.init();
                     harness_inited = true;
                 }
-                if (scenario == .stream) try runStream(&harness, args);
-                if (scenario == .@"input-latency") try runLatency(&harness, args);
+                switch (scenario) {
+                    .stream => try runStream(&harness, args),
+                    .@"input-latency" => try runLatency(&harness, args),
+                    .screenshots => try runScreenshots(&harness, args),
+                    else => unreachable,
+                }
             },
         }
     }
