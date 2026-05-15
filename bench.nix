@@ -1,3 +1,14 @@
+# Unified terminal-comparison bench. One driver, one nested compositor
+# instance, one set of shared per-terminal configs. Drives the
+# scrgo-bench-suite binary built by build.zig.
+#
+# Usage:
+#   nix-build -A bench && ./result/bin/bench [--scenarios=...] [--terminals=...]
+#
+# See `bench --help` for the full flag list. The wrapper supplies
+# WAYLAND_DISPLAY, the bench payload, and the per-terminal binary paths
+# via env vars; the driver handles compositor coordination, settling,
+# per-scenario instrumentation, and reporting.
 { writeShellApplication
 , coreutils
 , sway
@@ -12,7 +23,7 @@ let
   termCfg = import ./bench-term-config.nix { };
 in
 writeShellApplication {
-  name = "bench-stream";
+  name = "bench";
 
   runtimeInputs = [
     coreutils
@@ -25,23 +36,25 @@ writeShellApplication {
   ];
 
   text = ''
+    # shell.nix sets LD_LIBRARY_PATH for `zig build` dev runs; it points
+    # at the unslimmed harfbuzz (and friends) which overrides the nix-
+    # built binary's RUNPATH. Drop it so the bench reflects what an end
+    # user running the installed binary actually loads.
     unset LD_LIBRARY_PATH
-
-    RUNS="''${BENCH_RUNS:-3}"
-    DEADLINE_MS="''${BENCH_DEADLINE_MS:-30000}"
 
     ${termCfg.setup}
 
-    # Build the payload: ~7 MB of mixed-length numbered lines. Varied
-    # widths so the terminal exercises wrapping/scrolling code paths.
-    PAYLOAD="$(mktemp -t bench-stream.XXXXXX.txt)"
+    # Shared payload: ~9 MB of mixed-length numbered lines. The stream
+    # and memory scenarios both consume this. ~7 MB of numeric lines
+    # plus 60k longer lines so we exercise wrap/scroll paths too.
+    PAYLOAD="$(mktemp -t bench-payload.XXXXXX.txt)"
     {
       seq 1 800000
       seq -f "line=%07.0f payload=lorem ipsum dolor sit amet consectetur" 1 60000
     } > "$PAYLOAD"
 
-    SWAY_LOG="$(mktemp -t sway-bench-stream.XXXXXX.log)"
-    CFG="$(mktemp -t sway-bench-stream.XXXXXX.cfg)"
+    SWAY_LOG="$(mktemp -t bench-sway.XXXXXX.log)"
+    CFG="$(mktemp -t bench-sway.XXXXXX.cfg)"
     cat >"$CFG" <<'EOF'
     default_border none
     gaps inner 0
@@ -63,6 +76,7 @@ writeShellApplication {
     }
     trap cleanup EXIT
 
+    # Wait for the nested sway socket to appear.
     for _ in $(seq 1 100); do
       WD=$(grep -oE "Running compositor on wayland display '[^']+'" "$SWAY_LOG" \
            | sed -E "s/.*'([^']+)'/\1/" | head -n1 || true)
@@ -82,9 +96,11 @@ writeShellApplication {
     unset DISPLAY
 
     SCRGO_BIN="$(command -v scrgo)"
-    BENCH_BIN="$(dirname "$SCRGO_BIN")/scrgo-bench-stream"
+    BENCH_BIN="$(dirname "$SCRGO_BIN")/scrgo-bench-suite"
 
     export BENCH_CAT="${coreutils}/bin/cat"
+    export BENCH_ECHO="${coreutils}/bin/echo"
+    export BENCH_SH="/bin/sh"
     export BENCH_PAYLOAD="$PAYLOAD"
     export SCRGO_BIN
     export FOOT_BIN="${foot}/bin/foot"
@@ -92,9 +108,10 @@ writeShellApplication {
     export KITTY_BIN="${kitty}/bin/kitty"
     export WEZTERM_BIN="${wezterm}/bin/wezterm"
 
-    echo "=== stream-under-load bench (sway nested, $WAYLAND_DISPLAY) ==="
+    echo "=== bench (sway nested, $WAYLAND_DISPLAY) ==="
     echo "payload: $PAYLOAD ($(stat -c %s "$PAYLOAD") bytes)"
     echo "sway log: $SWAY_LOG"
-    "$BENCH_BIN" "--runs=$RUNS" "--deadline-ms=$DEADLINE_MS"
+
+    exec "$BENCH_BIN" "$@"
   '';
 }

@@ -26,24 +26,12 @@ let
     harfbuzz = leanHarfbuzz;
   };
 
-  bench-startup = pkgs.callPackage ./bench-startup.nix {
-    inherit scrgo;
-  };
-
   integration-test = pkgs.callPackage ./integration-test.nix {
     inherit scrgo;
   };
 
-  bench-input-latency = pkgs.callPackage ./bench-input-latency.nix {
-    inherit scrgo;
-  };
-
-  bench-stream = pkgs.callPackage ./bench-stream.nix {
-    inherit scrgo;
-  };
-
-  bench-memory = pkgs.callPackage ./bench-memory.nix {
+  bench = pkgs.callPackage ./bench.nix {
     inherit scrgo;
   };
 in
-scrgo // { inherit bench-startup integration-test bench-input-latency bench-stream bench-memory; }
+scrgo // { inherit integration-test bench; }
