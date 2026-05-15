@@ -20,6 +20,7 @@
 , kitty
 , wezterm
 , scrgo
+, scrgo-bench-suite
 }:
 
 let
@@ -39,6 +40,7 @@ writeShellApplication {
     kitty
     wezterm
     scrgo
+    scrgo-bench-suite
   ];
 
   text = ''
@@ -126,13 +128,11 @@ writeShellApplication {
     unset DISPLAY
 
     SCRGO_BIN="$(command -v scrgo)"
-    BENCH_BIN="$(dirname "$SCRGO_BIN")/scrgo-bench-suite"
-
+    export SCRGO_BIN
     export BENCH_CAT="${coreutils}/bin/cat"
     export BENCH_ECHO="${coreutils}/bin/echo"
     export BENCH_SH="/bin/sh"
     export BENCH_PAYLOAD="$PAYLOAD"
-    export SCRGO_BIN
     export FOOT_BIN="${foot}/bin/foot"
     export ALACRITTY_BIN="${alacritty}/bin/alacritty"
     export KITTY_BIN="${kitty}/bin/kitty"
@@ -146,7 +146,7 @@ writeShellApplication {
     # which means sway leaks if the bench is interrupted or crashes.
     # Run the bench as a child so cleanup() always fires on the way out.
     rc=0
-    "$BENCH_BIN" "$@" || rc=$?
+    scrgo-bench-suite "$@" || rc=$?
     exit "$rc"
   '';
 }

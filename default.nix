@@ -20,18 +20,27 @@ let
     withIcu = false;
   };
 
-  scrgo = pkgs.callPackage ./nix/package.nix {
+  scrgo = pkgs.callPackage ./nix/scrgo.nix {
     inherit libghostty-vt;
     snail-src = sources.snail;
     harfbuzz = leanHarfbuzz;
   };
 
-  integration-test = pkgs.callPackage ./integration-test.nix {
-    inherit scrgo;
+  scrgo-bench-suite = pkgs.callPackage ./nix/scrgo-bench-suite.nix {
+    snail-src = sources.snail;
+  };
+  scrgo-integration-test = pkgs.callPackage ./nix/scrgo-integration-test.nix {
+    snail-src = sources.snail;
   };
 
   bench = pkgs.callPackage ./bench.nix {
-    inherit scrgo;
+    inherit scrgo scrgo-bench-suite;
+  };
+
+  integration-test = pkgs.callPackage ./integration-test.nix {
+    inherit scrgo scrgo-integration-test;
   };
 in
-scrgo // { inherit integration-test bench; }
+scrgo // {
+  inherit scrgo-bench-suite scrgo-integration-test bench integration-test;
+}

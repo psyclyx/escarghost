@@ -2,6 +2,7 @@
 , coreutils
 , sway
 , scrgo
+, scrgo-integration-test
 }:
 
 writeShellApplication {
@@ -11,6 +12,7 @@ writeShellApplication {
     coreutils
     sway
     scrgo
+    scrgo-integration-test
   ];
 
   text = ''
@@ -76,18 +78,11 @@ writeShellApplication {
 
     unset DISPLAY
 
-    SCRGO_BIN="$(command -v scrgo)"
-    TEST_BIN="$(dirname "$SCRGO_BIN")/scrgo-integration-test"
-    if [ ! -x "$TEST_BIN" ]; then
-      echo "scrgo-integration-test not found next to scrgo at $TEST_BIN" >&2
-      exit 1
-    fi
-
     echo "=== scrgo integration test (sway headless, $WAYLAND_DISPLAY) ==="
     echo "sway log: $SWAY_LOG"
     # scrgo uses execv which requires absolute paths, and NixOS has no
     # /bin/cat. Pass the resolved binary through to the harness.
     export SCRGO_IT_CAT="${coreutils}/bin/cat"
-    "$TEST_BIN" "$SCRGO_BIN"
+    scrgo-integration-test "$(command -v scrgo)"
   '';
 }

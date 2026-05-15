@@ -69,13 +69,5 @@ stdenv.mkDerivation {
   installPhase = ''
     mkdir -p $out/bin
     cp zig-out/bin/scrgo $out/bin/
-    # Bench + integration-test wrappers expect these next to scrgo.
-    # Headless tests are now Zig `test` blocks; run them with
-    # `zig build test` from a checkout, not from this derivation.
-    for t in scrgo-integration-test scrgo-bench-suite; do
-      if [ -f "zig-out/bin/$t" ]; then
-        cp "zig-out/bin/$t" "$out/bin/"
-      fi
-    done
   '';
 }
