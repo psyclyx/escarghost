@@ -249,3 +249,176 @@ pub fn buildRow(
 
     return .{ .rect_count = rect_count, .had_misses = had_misses };
 }
+
+/// One cached row's drawables. Y coordinates are row-local; the caller
+/// translates by row_y at submit. The blob is heap-allocated so the cache's
+/// underlying hashmap can rehash mid-frame without invalidating the
+/// `*const TextBlob` pointers that already live in the per-frame Scene.
+pub const Row = struct {
+    blob: *snail.TextBlob,
+    rects: []ColoredRect,
+    content_hash: u64,
+    atlas_identity: u64,
+    had_misses: bool,
+    last_used_frame: u64,
+    byte_size: usize,
+};
+
+/// Per-row TextBlob+rect cache shared between backends. One instance per
+/// renderer (no cross-thread sharing); each renderer's lock-free atlas
+/// snapshot identity is held alongside the content hash on each entry.
+///
+/// Atlas-snapshot bumps trigger `rebindAll`, not a wipe. Metrics changes
+/// (font size, DPI) invalidate the entire cache because each cached blob
+/// bakes `placement.em` into its per-instance `Transform2D`.
+pub const RowCache = struct {
+    allocator: std.mem.Allocator,
+    map: std.AutoHashMap(u64, Row),
+    cache_bytes: usize = 0,
+    cache_budget: usize,
+    frame_counter: u64 = 0,
+
+    pub const RebindStats = struct { rebound: usize, evicted: usize };
+
+    pub fn init(allocator: std.mem.Allocator, budget_bytes: usize) RowCache {
+        return .{
+            .allocator = allocator,
+            .map = std.AutoHashMap(u64, Row).init(allocator),
+            .cache_budget = budget_bytes,
+        };
+    }
+
+    pub fn deinit(self: *RowCache) void {
+        self.clear();
+        self.map.deinit();
+    }
+
+    pub fn clear(self: *RowCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |row| destroyRow(self.allocator, row);
+        self.map.clearRetainingCapacity();
+        self.cache_bytes = 0;
+    }
+
+    /// Begin a new frame; entries inherit this counter on `get` / `store` so
+    /// LRU eviction can find genuinely-old rows.
+    pub fn beginFrame(self: *RowCache) void {
+        self.frame_counter += 1;
+    }
+
+    /// Look up a row by content hash. Returns null on miss. On hit, marks
+    /// the row as used this frame so it survives the LRU sweep.
+    pub fn get(self: *RowCache, key: u64) ?*Row {
+        const row = self.map.getPtr(key) orelse return null;
+        row.last_used_frame = self.frame_counter;
+        return row;
+    }
+
+    /// Take ownership of a freshly-built blob+rects under `key`. Returns
+    /// the inserted entry, or null if the underlying allocation fails (in
+    /// which case `blob` and `rects` are deinit/freed before return so the
+    /// caller never has to clean up after a failed store).
+    pub fn store(
+        self: *RowCache,
+        key: u64,
+        blob: snail.TextBlob,
+        rects: []ColoredRect,
+        atlas_identity: u64,
+        had_misses: bool,
+    ) ?*Row {
+        if (self.map.fetchRemove(key)) |kv| {
+            var stale = kv.value;
+            self.cache_bytes -= stale.byte_size;
+            destroyRow(self.allocator, &stale);
+        }
+
+        const byte_size = rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
+        const blob_slot = self.allocator.create(snail.TextBlob) catch {
+            var b = blob;
+            b.deinit();
+            self.allocator.free(rects);
+            return null;
+        };
+        blob_slot.* = blob;
+        self.map.put(key, .{
+            .blob = blob_slot,
+            .rects = rects,
+            .content_hash = key,
+            .atlas_identity = atlas_identity,
+            .had_misses = had_misses,
+            .last_used_frame = self.frame_counter,
+            .byte_size = byte_size,
+        }) catch {
+            blob_slot.deinit();
+            self.allocator.destroy(blob_slot);
+            self.allocator.free(rects);
+            return null;
+        };
+        self.cache_bytes += byte_size;
+
+        var guard: usize = 0;
+        while (self.cache_bytes > self.cache_budget and guard < 32) : (guard += 1) {
+            self.evictLru();
+        }
+        return self.map.getPtr(key);
+    }
+
+    pub fn evict(self: *RowCache, key: u64) void {
+        if (self.map.fetchRemove(key)) |kv| {
+            var row = kv.value;
+            self.cache_bytes -= row.byte_size;
+            destroyRow(self.allocator, &row);
+        }
+    }
+
+    fn evictLru(self: *RowCache) void {
+        var oldest_key: ?u64 = null;
+        var oldest_frame: u64 = std.math.maxInt(u64);
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.last_used_frame < oldest_frame) {
+                oldest_frame = entry.value_ptr.last_used_frame;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |k| self.evict(k);
+    }
+
+    /// Walk the cache after an atlas-snapshot bump. Entries with
+    /// `had_misses == true` are evicted (their blob's glyph list omits the
+    /// missing GIDs and `rebound` would silently succeed with absent
+    /// glyphs); clean entries are rebound to the new atlas.
+    pub fn rebindAll(
+        self: *RowCache,
+        new_atlas: *const snail.TextAtlas,
+        new_identity: u64,
+    ) RebindStats {
+        var stale: std.ArrayList(u64) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.map.iterator();
+        var rebound: usize = 0;
+        while (it.next()) |entry| {
+            const row = entry.value_ptr;
+            if (row.had_misses) {
+                stale.append(self.allocator, entry.key_ptr.*) catch {};
+                continue;
+            }
+            const new_blob = row.blob.rebound(self.allocator, new_atlas) catch {
+                stale.append(self.allocator, entry.key_ptr.*) catch {};
+                continue;
+            };
+            row.blob.deinit();
+            row.blob.* = new_blob;
+            row.atlas_identity = new_identity;
+            rebound += 1;
+        }
+        for (stale.items) |k| self.evict(k);
+        return .{ .rebound = rebound, .evicted = stale.items.len };
+    }
+};
+
+fn destroyRow(allocator: std.mem.Allocator, row: *Row) void {
+    row.blob.deinit();
+    allocator.destroy(row.blob);
+    allocator.free(row.rects);
+}

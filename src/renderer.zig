@@ -53,18 +53,6 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
     };
 }
 
-const RowCache = struct {
-    // Heap-allocated so the pointer stays stable when row_cache rehashes
-    // mid-frame; the scene records `cache.blob` directly.
-    blob: *snail.TextBlob,
-    rects: []ColoredRect,
-    content_hash: u64,
-    atlas_identity: u64,
-    had_misses: bool,
-    last_used_frame: u64,
-    byte_size: usize,
-};
-
 fn hashSnapshotRow(snapshot: *const render_snapshot.SharedSnapshot, start_index: usize, cols: u16) u64 {
     var h: u64 = 0xcbf29ce484222325;
     const m: u64 = 0x100000001b3;
@@ -95,10 +83,7 @@ pub const Renderer = struct {
 
     rect_renderer: gl_rect.GlRectRenderer,
 
-    row_cache: std.AutoHashMap(u64, RowCache),
-    frame_counter: u64 = 0,
-    cache_bytes: usize = 0,
-    cache_budget: usize = 32 * 1024 * 1024,
+    row_cache: row_build.RowCache,
 
     draw_rects: []ColoredRect = &.{},
     scratch_rects: []ColoredRect = &.{},
@@ -161,7 +146,7 @@ pub const Renderer = struct {
             .last_atlas_gen = atlas_ref.loadGeneration(),
             .last_atlas_identity = atlas.snapshotIdentity(),
             .rect_renderer = rect_renderer,
-            .row_cache = std.AutoHashMap(u64, RowCache).init(allocator),
+            .row_cache = row_build.RowCache.init(allocator, 32 * 1024 * 1024),
             .cell_width = cell_width,
             .cell_height = cell_height,
             .font_size = font_size,
@@ -172,7 +157,6 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
-        self.clearCache();
         self.row_cache.deinit();
         self.releaseEphemeralBlobs();
         self.ephemeral_blobs.deinit(self.allocator);
@@ -196,17 +180,6 @@ pub const Renderer = struct {
         errdefer self.allocator.free(self.draw_rects);
         self.scratch_rects = try self.allocator.alloc(ColoredRect, MAX_RECTS_PER_ROW);
         self.draw_buffers_ready = true;
-    }
-
-    fn clearCache(self: *Renderer) void {
-        var it = self.row_cache.valueIterator();
-        while (it.next()) |e| {
-            e.blob.deinit();
-            self.allocator.destroy(e.blob);
-            self.allocator.free(e.rects);
-        }
-        self.row_cache.clearRetainingCapacity();
-        self.cache_bytes = 0;
     }
 
     pub fn setDebugResetAtlas(self: *Renderer, enabled: bool) void {
@@ -234,7 +207,7 @@ pub const Renderer = struct {
         self.font_size = font_size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
-        self.clearCache();
+        self.row_cache.clear();
     }
 
     /// Color for both gl_rect and snail text input. snail expects sRGB
@@ -274,56 +247,13 @@ pub const Renderer = struct {
         self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
 
-        // Rebind cached blobs (or evict the ones that can't migrate).
-        var stale: std.ArrayList(u64) = .empty;
-        defer stale.deinit(self.allocator);
-        var it = self.row_cache.iterator();
-        var rebound: usize = 0;
-        while (it.next()) |entry| {
-            const cache = entry.value_ptr;
-            if (cache.had_misses) {
-                stale.append(self.allocator, entry.key_ptr.*) catch {};
-                continue;
-            }
-            // 0.7.0 returns a new blob; replace in place.
-            const new_blob = cache.blob.rebound(self.allocator, atlas) catch {
-                stale.append(self.allocator, entry.key_ptr.*) catch {};
-                continue;
-            };
-            cache.blob.deinit();
-            cache.blob.* = new_blob;
-            cache.atlas_identity = identity;
-            rebound += 1;
-        }
-        for (stale.items) |k| self.evictRow(k);
+        const stats = self.row_cache.rebindAll(atlas, identity);
         if (self.debug_log_atlas) {
-            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (rebound={}, evicted={})\n", .{ identity, rebound, stale.items.len });
+            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (rebound={}, evicted={})\n", .{ identity, stats.rebound, stats.evicted });
         }
         self.atlas_lease.release();
         self.atlas_lease = next_lease;
         return atlas;
-    }
-
-    fn evictRow(self: *Renderer, key: u64) void {
-        if (self.row_cache.fetchRemove(key)) |kv| {
-            kv.value.blob.deinit();
-            self.allocator.destroy(kv.value.blob);
-            self.allocator.free(kv.value.rects);
-            self.cache_bytes -= kv.value.byte_size;
-        }
-    }
-
-    fn evictLru(self: *Renderer) void {
-        var oldest_key: ?u64 = null;
-        var oldest_frame: u64 = std.math.maxInt(u64);
-        var it = self.row_cache.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.last_used_frame < oldest_frame) {
-                oldest_frame = entry.value_ptr.last_used_frame;
-                oldest_key = entry.key_ptr.*;
-            }
-        }
-        if (oldest_key) |k| self.evictRow(k);
     }
 
     fn rowMetrics(self: *const Renderer) row_build.Metrics {
@@ -366,51 +296,6 @@ pub const Renderer = struct {
         return .{ .blob = blob, .rects = rects, .had_misses = built.had_misses };
     }
 
-    fn cacheRow(
-        self: *Renderer,
-        key: u64,
-        blob: snail.TextBlob,
-        rects: []ColoredRect,
-        had_misses: bool,
-    ) ?*RowCache {
-        if (self.row_cache.fetchRemove(key)) |kv| {
-            kv.value.blob.deinit();
-            self.allocator.destroy(kv.value.blob);
-            self.allocator.free(kv.value.rects);
-            self.cache_bytes -= kv.value.byte_size;
-        }
-
-        const byte_size = rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
-        const blob_slot = self.allocator.create(snail.TextBlob) catch {
-            var b = blob;
-            b.deinit();
-            self.allocator.free(rects);
-            return null;
-        };
-        blob_slot.* = blob;
-        self.row_cache.put(key, .{
-            .blob = blob_slot,
-            .rects = rects,
-            .content_hash = key,
-            .atlas_identity = self.last_atlas_identity,
-            .had_misses = had_misses,
-            .last_used_frame = self.frame_counter,
-            .byte_size = byte_size,
-        }) catch {
-            blob_slot.deinit();
-            self.allocator.destroy(blob_slot);
-            self.allocator.free(rects);
-            return null;
-        };
-        self.cache_bytes += byte_size;
-
-        var guard: usize = 0;
-        while (self.cache_bytes > self.cache_budget and guard < 32) : (guard += 1) {
-            self.evictLru();
-        }
-        return self.row_cache.getPtr(key);
-    }
-
     fn allocOverrideSlot(self: *Renderer, override_index: *usize, ty: f32) ?[]const snail.Override {
         if (override_index.* >= self.overrides.len) return null;
         self.overrides[override_index.*] = .{
@@ -424,15 +309,14 @@ pub const Renderer = struct {
 
     fn appendCachedRowDraw(
         self: *Renderer,
-        cache: *RowCache,
+        row: *row_build.Row,
         row_y: f32,
         override_index: *usize,
         rect_index: *usize,
     ) !void {
-        cache.last_used_frame = self.frame_counter;
         const ov = self.allocOverrideSlot(override_index, row_y) orelse return error.TooManyDraws;
-        try self.scene.addText(.{ .blob = cache.blob, .instances = ov });
-        for (cache.rects) |r| {
+        try self.scene.addText(.{ .blob = row.blob, .instances = ov });
+        for (row.rects) |r| {
             if (rect_index.* >= self.draw_rects.len) break;
             self.draw_rects[rect_index.*] = .{
                 .x = r.x,
@@ -581,7 +465,7 @@ pub const Renderer = struct {
 
     pub fn drawSnapshot(self: *Renderer, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
         const frame_timer = perf.Timer.now();
-        self.frame_counter += 1;
+        self.row_cache.beginFrame();
         _ = self.refreshAtlas();
         try self.ensureDrawBuffers();
         self.scene.reset();
@@ -624,9 +508,9 @@ pub const Renderer = struct {
             // Re-emit cell_index past this row regardless of whether we use the cache.
             const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
 
-            if (self.row_cache.getPtr(content_hash)) |cache| {
-                if (!cache.had_misses and cache.atlas_identity == self.last_atlas_identity) {
-                    try self.appendCachedRowDraw(cache, row_y, &override_index, &rect_index);
+            if (self.row_cache.get(content_hash)) |row| {
+                if (!row.had_misses and row.atlas_identity == self.last_atlas_identity) {
+                    try self.appendCachedRowDraw(row, row_y, &override_index, &rect_index);
                     cell_index = next_index;
                     continue;
                 }
@@ -634,8 +518,8 @@ pub const Renderer = struct {
 
             const built = try self.buildRowFromSnapshot(snapshot, &cell_index, cols, misses);
             cell_index = next_index;
-            if (self.cacheRow(content_hash, built.blob, built.rects, built.had_misses)) |cache| {
-                try self.appendCachedRowDraw(cache, row_y, &override_index, &rect_index);
+            if (self.row_cache.store(content_hash, built.blob, built.rects, self.last_atlas_identity, built.had_misses)) |row| {
+                try self.appendCachedRowDraw(row, row_y, &override_index, &rect_index);
             }
         }
 
