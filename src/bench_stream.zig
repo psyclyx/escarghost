@@ -53,10 +53,14 @@ pub fn runOnce(harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []const u8
 
     const t_spawn = perf.Timer.now();
     const pid = try h.spawnArgv(argv);
-    errdefer h.killChild(pid);
+    // Always drain CLOSED before the next iteration so the next run's
+    // pixel-hash probe doesn't read this run's leftover surface.
+    defer {
+        h.killChild(pid);
+        harness.waitAllToplevelsClosed(1000) catch {};
+    }
 
     if (!(try harness.waitForAppId(spec.app_id, 5000))) {
-        h.killChild(pid);
         return error.NoToplevel;
     }
 
@@ -92,7 +96,6 @@ pub fn runOnce(harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []const u8
             };
         }
     }
-    h.killChild(pid);
     return .{
         .wall_ms = t_spawn.elapsedMs(),
         .distinct_frames = distinct,

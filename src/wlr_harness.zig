@@ -364,6 +364,31 @@ pub const Harness = struct {
         }
     }
 
+    /// Pump dispatch until every announced toplevel is marked closed,
+    /// or the deadline hits. Use this between scenarios to make sure a
+    /// previous run's window has actually gone away before the next
+    /// terminal opens — otherwise the screencopy probe can read pixels
+    /// from a still-present old surface.
+    pub fn waitAllToplevelsClosed(self: *Harness, deadline_ms: u32) !void {
+        const start = nowNs();
+        const dl = start + @as(i128, deadline_ms) * 1_000_000;
+        while (true) {
+            var any_open = false;
+            var i: usize = 0;
+            while (i < self.toplevels_n) : (i += 1) {
+                if (!self.toplevels[i].closed) {
+                    any_open = true;
+                    break;
+                }
+            }
+            if (!any_open) return;
+            const left = dl - nowNs();
+            if (left <= 0) return;
+            const ms: c_int = @intCast(@max(@as(i128, 1), @divTrunc(left, 1_000_000)));
+            _ = try self.dispatchOnce(@min(ms, @as(c_int, 50)));
+        }
+    }
+
     /// Capture one frame from the configured output into self.cached_frame.
     /// Blocks until ready or fails. Returns the pixel buffer.
     pub fn captureFrame(self: *Harness) ![]const u8 {

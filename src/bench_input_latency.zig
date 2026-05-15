@@ -19,7 +19,14 @@ pub fn measureTerminal(harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []
     const argv = spec_mod.buildArgv(&argv_buf, bin, spec, &extras);
 
     const pid = try h.spawnArgv(argv);
-    defer h.killChild(pid);
+    // Tear down on every exit path. The wait-for-CLOSED is important
+    // because the next measureTerminal call's probe will sample from
+    // wherever the compositor draws — if this run's window is still up,
+    // the next run reads the old pixels.
+    defer {
+        h.killChild(pid);
+        harness.waitAllToplevelsClosed(1000) catch {};
+    }
 
     if (!(try harness.waitForAppId(spec.app_id, 5000))) {
         std.debug.print("[{s}] toplevel '{s}' did not appear within 5s\n", .{ spec.label, spec.app_id });
@@ -89,6 +96,5 @@ pub fn measureTerminal(harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []
         }
     }
 
-    _ = try harness.dispatchOnce(20);
     return stats_mod.summarize(lat.items, dropped);
 }

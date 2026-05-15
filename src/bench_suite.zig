@@ -235,29 +235,32 @@ fn runMemory(args: Args) !void {
     const sh = requireEnv("BENCH_SH");
     const cat = requireEnv("BENCH_CAT");
     const payload = requireEnv("BENCH_PAYLOAD");
+    // Hold the terminal alive ~1s after `cat` finishes so the poller
+    // thread catches the post-load peak (some terminals don't reach
+    // peak RSS until they finish ingesting and idle for a moment).
     var script_buf: [4096]u8 = undefined;
-    const script = try std.fmt.bufPrint(&script_buf, "{s} {s}; sleep 0.3", .{ cat, payload });
+    const script = try std.fmt.bufPrint(&script_buf, "{s} {s}; sleep 1.0", .{ cat, payload });
     const opts: memory_mod.Options = .{
         .runs = args.memory_runs,
         .sh_bin = sh,
         .script = script,
     };
     printHeader(
-        "memory (peak RSS after scrollback)",
-        "terminal      n  median   min      max      (KiB)",
+        "memory (peak after ~9 MB scrollback; KiB)",
+        "terminal      n   rss_med  rss_max  anon_med anon_max vram_med vram_max",
     );
     for (args.terminals) |spec| {
         const bin = binFor(spec) orelse {
             std.debug.print("{s:<10} skipped (${s} not set)\n", .{ spec.label, spec.env_var });
             continue;
         };
-        const s = memory_mod.measureTerminal(spec, bin, opts) catch |err| {
+        const a = memory_mod.measureTerminal(spec, bin, opts) catch |err| {
             std.debug.print("{s:<10} error: {}\n", .{ spec.label, err });
             continue;
         };
         std.debug.print(
-            "{s:<10}  {d:>3}  {d:>7.0}  {d:>7.0}  {d:>7.0}\n",
-            .{ spec.label, s.n, s.median, s.min, s.max },
+            "{s:<10}  {d:>3}  {d:>7.0} {d:>7.0}  {d:>7.0} {d:>7.0}  {d:>7.0} {d:>7.0}\n",
+            .{ spec.label, a.n, a.rss.median, a.rss.max, a.anon.median, a.anon.max, a.vram.median, a.vram.max },
         );
     }
 }
