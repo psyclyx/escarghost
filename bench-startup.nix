@@ -16,6 +16,11 @@ let
   # no-op like `true` you measure spawn + teardown only — with echo READY
   # the number reflects spawn-through-first-frame.
   echoBin = "${coreutils}/bin/echo";
+  # Pin everyone to monospace:size=11 so we're not measuring font-init
+  # cost at five different sizes. Foot's default is size=8 (~10.7 px-em),
+  # alacritty/kitty/wezterm/scrgo all default to 11+ pt — without a
+  # shared config they spawn with visibly different cell sizes.
+  termCfg = import ./bench-term-config.nix { };
 in
 
 writeShellApplication {
@@ -43,6 +48,8 @@ writeShellApplication {
     NESTED_SOCKET="wayland-bench-$$"
     WESTON_LOG="$(mktemp -t weston-bench.XXXXXX.log)"
 
+    ${termCfg.setup}
+
     weston \
       --backend=wayland \
       --socket="$NESTED_SOCKET" \
@@ -57,6 +64,7 @@ writeShellApplication {
         kill "$WESTON_PID" 2>/dev/null || true
         wait "$WESTON_PID" 2>/dev/null || true
       fi
+      ${termCfg.cleanup}
     }
     trap cleanup EXIT
 
