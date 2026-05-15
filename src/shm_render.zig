@@ -280,7 +280,11 @@ pub const SnapshotRenderer = struct {
         }
         var rs = snail.ResourceSet.init(self.resource_entries[0..]);
         try rs.addScene(&self.scene);
-        self.prepared = try self.cpu.uploadResourcesBlocking(self.allocator, &rs);
+        const allocators: snail.UploadAllocators = .{
+            .persistent = self.allocator,
+            .scratch = self.allocator,
+        };
+        self.prepared = try self.cpu.uploadResourcesBlocking(allocators, &rs);
         self.prepared_atlas_identity = atlas_identity;
         return &self.prepared.?;
     }
@@ -452,14 +456,14 @@ pub const SnapshotRenderer = struct {
         const fg = run.fg.?;
 
         const opts_x = @as(f32, @floatFromInt(run.start_col)) * cell_width;
-        const result = try self.builder.addText(
-            .{},
-            run.text[0..run.text_len],
-            opts_x,
-            cell_y + baseline,
-            font_size,
-            fg.toFloat4(1.0),
-        );
+        const atlas = self.atlas_lease.?.get();
+        var shaped = try atlas.shapeText(self.allocator, .{}, run.text[0..run.text_len]);
+        defer shaped.deinit();
+        const result = try self.builder.append(.{
+            .shaped = &shaped,
+            .placement = .{ .baseline = .{ .x = opts_x, .y = cell_y + baseline }, .em = font_size },
+            .fill = .{ .solid = fg.toFloat4(1.0) },
+        });
 
         if (result.missing) misses.addRun(run.text[0..run.text_len]);
         run.reset();
@@ -631,14 +635,14 @@ pub const SnapshotRenderer = struct {
         self.builder.reset();
         var tmp: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &tmp) catch return;
-        const result = try self.builder.addText(
-            .{},
-            tmp[0..n],
-            cx,
-            cy + baseline,
-            font_size,
-            cell.bg.toFloat4(1.0),
-        );
+        const atlas = self.atlas_lease.?.get();
+        var shaped = try atlas.shapeText(self.allocator, .{}, tmp[0..n]);
+        defer shaped.deinit();
+        const result = try self.builder.append(.{
+            .shaped = &shaped,
+            .placement = .{ .baseline = .{ .x = cx, .y = cy + baseline }, .em = font_size },
+            .fill = .{ .solid = cell.bg.toFloat4(1.0) },
+        });
         if (result.missing) {
             misses.addRun(tmp[0..n]);
             return;

@@ -279,10 +279,13 @@ pub const Renderer = struct {
                 stale.append(self.allocator, entry.key_ptr.*) catch {};
                 continue;
             }
-            cache.blob.rebind(atlas) catch {
+            // 0.7.0 returns a new blob; replace in place.
+            const new_blob = cache.blob.rebound(self.allocator, atlas) catch {
                 stale.append(self.allocator, entry.key_ptr.*) catch {};
                 continue;
             };
+            cache.blob.deinit();
+            cache.blob.* = new_blob;
             cache.atlas_identity = identity;
             rebound += 1;
         }
@@ -361,14 +364,13 @@ pub const Renderer = struct {
         const fg = run.fg.?;
 
         const opts_x = @as(f32, @floatFromInt(run.start_col)) * self.cell_width;
-        const result = try self.builder.addText(
-            .{},
-            run.text[0..run.text_len],
-            opts_x,
-            self.baseline(),
-            self.font_size,
-            self.color4(fg, 1.0),
-        );
+        var shaped = try self.atlas_lease.get().shapeText(self.allocator, .{}, run.text[0..run.text_len]);
+        defer shaped.deinit();
+        const result = try self.builder.append(.{
+            .shaped = &shaped,
+            .placement = .{ .baseline = .{ .x = opts_x, .y = self.baseline() }, .em = self.font_size },
+            .fill = .{ .solid = self.color4(fg, 1.0) },
+        });
 
         const had_misses = result.missing;
         if (had_misses) misses.addRun(run.text[0..run.text_len]);
@@ -634,14 +636,13 @@ pub const Renderer = struct {
         defer inv_builder.deinit();
         var tmp_buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &tmp_buf) catch return;
-        const result = inv_builder.addText(
-            .{},
-            tmp_buf[0..n],
-            cx,
-            cy + self.baseline(),
-            self.font_size,
-            self.color4(cell.bg, 1.0),
-        ) catch return;
+        var shaped = self.atlas_lease.get().shapeText(self.allocator, .{}, tmp_buf[0..n]) catch return;
+        defer shaped.deinit();
+        const result = inv_builder.append(.{
+            .shaped = &shaped,
+            .placement = .{ .baseline = .{ .x = cx, .y = cy + self.baseline() }, .em = self.font_size },
+            .fill = .{ .solid = self.color4(cell.bg, 1.0) },
+        }) catch return;
         if (result.missing) return;
         const blob = inv_builder.finish() catch return;
         const blob_ptr = self.stashEphemeralBlob(blob) orelse return;
@@ -700,7 +701,11 @@ pub const Renderer = struct {
         }
         var rs = snail.ResourceSet.init(self.resource_entries[0..]);
         try rs.addScene(&self.scene);
-        self.prepared = try self.gl_renderer.uploadResourcesBlocking(self.allocator, &rs);
+        const allocators: snail.UploadAllocators = .{
+            .persistent = self.allocator,
+            .scratch = self.allocator,
+        };
+        self.prepared = try self.gl_renderer.uploadResourcesBlocking(allocators, &rs);
         self.prepared_atlas_identity = self.last_atlas_identity;
         return &self.prepared.?;
     }
