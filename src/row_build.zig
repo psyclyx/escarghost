@@ -41,6 +41,19 @@ pub const BuildResult = struct {
     had_misses: bool,
 };
 
+/// FNV-1a over the row's cells. Stable per cell-content; the cache key.
+pub fn hashSnapshotRow(snapshot: *const render_snapshot.SharedSnapshot, start_index: usize, cols: u16) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const m: u64 = 0x100000001b3;
+    var i: usize = 0;
+    while (i < cols and start_index + i < snapshot.header.cell_count) : (i += 1) {
+        const cell = snapshot.cells[start_index + i];
+        const bytes = std.mem.asBytes(&cell);
+        for (bytes) |b| h = (h ^ b) *% m;
+    }
+    return h;
+}
+
 /// Accumulates a same-color text run so HB can shape it as a unit
 /// (ligatures form across cells inside the run, but never across a
 /// color change or a decorated cell).

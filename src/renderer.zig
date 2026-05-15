@@ -53,17 +53,7 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
     };
 }
 
-fn hashSnapshotRow(snapshot: *const render_snapshot.SharedSnapshot, start_index: usize, cols: u16) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    const m: u64 = 0x100000001b3;
-    var i: usize = 0;
-    while (i < cols and start_index + i < snapshot.header.cell_count) : (i += 1) {
-        const cell = snapshot.cells[start_index + i];
-        const bytes = std.mem.asBytes(&cell);
-        for (bytes) |b| h = (h ^ b) *% m;
-    }
-    return h;
-}
+const hashSnapshotRow = row_build.hashSnapshotRow;
 
 /// GPU renderer state. Owned exclusively by the GPU renderer thread.
 /// Reads the shared atlas (via AtlasRef, lock-free).

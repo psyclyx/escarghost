@@ -191,6 +191,11 @@ pub const SnapshotRenderer = struct {
     scratch_rects: []row_build.ColoredRect,
     config: render_config.RenderConfig,
 
+    row_cache: row_build.RowCache,
+    /// Last metrics applied to the cache. Any change invalidates every
+    /// cached blob because `placement.em` is baked per-glyph.
+    cached_metrics: ?row_build.Metrics = null,
+
     pub fn init(allocator: std.mem.Allocator) !SnapshotRenderer {
         const config = render_config.loadFromEnv();
         const subpixel = render_config.effectiveSubpixelOrder(config);
@@ -219,10 +224,12 @@ pub const SnapshotRenderer = struct {
             .builder = builder,
             .scratch_rects = scratch_rects,
             .config = config,
+            .row_cache = row_build.RowCache.init(allocator, 32 * 1024 * 1024),
         };
     }
 
     pub fn deinit(self: *SnapshotRenderer) void {
+        self.row_cache.deinit();
         for (self.blobs.items) |b| {
             b.deinit();
             self.allocator.destroy(b);
@@ -238,7 +245,8 @@ pub const SnapshotRenderer = struct {
     }
 
     fn ensureBuilderForAtlas(self: *SnapshotRenderer, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
-        const id = atlas_lease.get().snapshotIdentity();
+        const atlas = atlas_lease.get();
+        const id = atlas.snapshotIdentity();
         if (id == self.builder_atlas_identity) return;
         if (self.prepared) |*p| {
             p.deinit();
@@ -246,9 +254,16 @@ pub const SnapshotRenderer = struct {
             self.prepared_atlas_identity = 0;
         }
         if (self.builder_atlas_identity != 0) self.builder.deinit();
-        if (self.atlas_lease) |*lease| lease.release();
+        self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
+        // Migrate cached row blobs onto the new atlas snapshot. Dirty
+        // (had_misses) entries get evicted; clean entries are rebound.
+        // The old lease must outlive this call: blob.rebound's
+        // validateRebindAtlas dereferences the blob's atlas pointer (the
+        // old snapshot). First-time install (builder_atlas_identity == 0)
+        // has no cache yet, so this is a cheap no-op then.
+        _ = self.row_cache.rebindAll(atlas, id);
+        if (self.atlas_lease) |*old_lease| old_lease.release();
         self.atlas_lease = atlas_lease.clone();
-        self.builder = snail.TextBlobBuilder.init(self.allocator, self.atlas_lease.?.get());
         self.builder_atlas_identity = id;
     }
 
@@ -326,9 +341,27 @@ pub const SnapshotRenderer = struct {
         // Project-owned background clear.
         clearBuffer(map_ptr, width, height, stride, argbPixel(default_bg.r, default_bg.g, default_bg.b, 255));
 
-        // Atlas snapshot may have advanced since the last frame.
+        // Atlas snapshot may have advanced since the last frame. Order
+        // matters: stale-prepared check first so the rebind inside
+        // ensureBuilderForAtlas doesn't see a half-torn-down state.
         self.invalidatePreparedIfStale(atlas_lease.get().snapshotIdentity());
         self.ensureBuilderForAtlas(atlas_lease);
+
+        self.row_cache.beginFrame();
+        const metrics: row_build.Metrics = .{
+            .cell_width = cell_width,
+            .cell_height = cell_height,
+            .font_size = font_size,
+        };
+        if (self.cached_metrics) |prev| {
+            if (prev.cell_width != metrics.cell_width or
+                prev.cell_height != metrics.cell_height or
+                prev.font_size != metrics.font_size)
+            {
+                self.row_cache.clear();
+            }
+        }
+        self.cached_metrics = metrics;
 
         self.scene.reset();
         self.releaseBlobs();
@@ -342,7 +375,7 @@ pub const SnapshotRenderer = struct {
 
         var row_idx: u16 = 0;
         while (row_idx < rows) : (row_idx += 1) {
-            const cell_y = @as(f32, @floatFromInt(row_idx)) * cell_height;
+            const row_y = @as(f32, @floatFromInt(row_idx)) * cell_height;
             const row_start_index = cell_index;
 
             // Capture cursor cell on this row.
@@ -363,21 +396,22 @@ pub const SnapshotRenderer = struct {
                 }
             }
 
-            try self.appendRow(
-                snapshot,
-                &cell_index,
-                cols,
-                cell_y,
-                cell_width,
-                cell_height,
-                font_size,
-                map_ptr,
-                width,
-                height,
-                stride,
-                &override_index,
-                &misses,
-            );
+            const content_hash = row_build.hashSnapshotRow(snapshot, row_start_index, cols);
+            const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
+
+            if (self.row_cache.get(content_hash)) |row| {
+                if (!row.had_misses and row.atlas_identity == self.builder_atlas_identity) {
+                    try self.appendCachedRow(row, row_y, map_ptr, width, height, stride, &override_index);
+                    cell_index = next_index;
+                    continue;
+                }
+            }
+
+            const built = try self.buildRowToBlob(snapshot, &cell_index, cols, metrics, &misses);
+            cell_index = next_index;
+            if (self.row_cache.store(content_hash, built.blob, built.rects, self.builder_atlas_identity, built.had_misses)) |row| {
+                try self.appendCachedRow(row, row_y, map_ptr, width, height, stride, &override_index);
+            }
         }
 
         // Cursor: solid rect + (block style only) inverted glyph.
@@ -426,66 +460,75 @@ pub const SnapshotRenderer = struct {
         return misses;
     }
 
-    fn appendRow(
+    /// Build the row at row-local coordinates (Y = 0). Caller takes
+    /// ownership of the returned blob+rects and is expected to hand them
+    /// to RowCache.store.
+    fn buildRowToBlob(
         self: *SnapshotRenderer,
         snapshot: *const render_snapshot.SharedSnapshot,
         cell_index: *usize,
         cols: u16,
-        cell_y: f32,
-        cell_width: f32,
-        cell_height: f32,
-        font_size: f32,
-        map_ptr: *anyopaque,
-        width: u32,
-        height: u32,
-        stride: u32,
-        override_index: *usize,
+        metrics: row_build.Metrics,
         misses: *glyph_misses.Set,
-    ) !void {
+    ) !struct {
+        blob: snail.TextBlob,
+        rects: []row_build.ColoredRect,
+        had_misses: bool,
+    } {
         self.builder.reset();
         const built = try row_build.buildRow(
             snapshot,
             cell_index,
             cols,
-            cell_y,
+            0,
             self.scratch_rects,
             &self.builder,
             self.atlas_lease.?.get(),
             self.allocator,
-            .{
-                .cell_width = cell_width,
-                .cell_height = cell_height,
-                .font_size = font_size,
-            },
+            metrics,
             misses,
         );
+        const blob = try self.builder.finish();
+        const rects = try self.allocator.dupe(row_build.ColoredRect, self.scratch_rects[0..built.rect_count]);
+        return .{ .blob = blob, .rects = rects, .had_misses = built.had_misses };
+    }
 
-        for (self.scratch_rects[0..built.rect_count]) |r| {
+    /// Submit a cached row: rects via fillRectArgb (row_y added at submit
+    /// time so a row-local cache entry serves any Y), and the blob into
+    /// the scene via Override.transform = translate(0, row_y).
+    fn appendCachedRow(
+        self: *SnapshotRenderer,
+        row: *row_build.Row,
+        row_y: f32,
+        map_ptr: *anyopaque,
+        width: u32,
+        height: u32,
+        stride: u32,
+        override_index: *usize,
+    ) !void {
+        for (row.rects) |r| {
             fillRectArgb(
                 map_ptr,
                 width,
                 height,
                 stride,
                 @intFromFloat(r.x),
-                @intFromFloat(r.y),
+                @intFromFloat(r.y + row_y),
                 @intFromFloat(r.w),
                 @intFromFloat(r.h),
                 colorToArgb(r.color),
             );
         }
 
-        if (self.builder.glyphCount() == 0) return;
-        const blob = try self.builder.finish();
-        const blob_ptr = self.stashBlob(blob) orelse return;
-
+        if (row.blob.glyphCount() == 0) return;
         if (override_index.* >= self.overrides.len) return;
         self.overrides[override_index.*] = .{
-            .transform = .identity,
+            .transform = snail.Transform2D.translate(0, row_y),
             .tint = .{ 1, 1, 1, 1 },
         };
         const slot = self.overrides[override_index.* .. override_index.* + 1];
         override_index.* += 1;
-        try self.scene.addText(.{ .blob = blob_ptr, .instances = slot });
+        try self.scene.addText(.{ .blob = row.blob, .instances = slot });
     }
 
     fn appendCursorGlyph(
