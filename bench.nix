@@ -11,6 +11,8 @@
 # per-scenario instrumentation, and reporting.
 { writeShellApplication
 , coreutils
+, util-linux
+, procps
 , sway
 , foot
 , alacritty
@@ -27,6 +29,8 @@ writeShellApplication {
 
   runtimeInputs = [
     coreutils
+    util-linux # setsid
+    procps # pkill
     sway
     foot
     alacritty
@@ -66,15 +70,28 @@ writeShellApplication {
     export WLR_LIBINPUT_NO_DEVICES=1
     export WLR_RENDERER_ALLOW_SOFTWARE=1
 
-    sway --config "$CFG" --unsupported-gpu --debug >"$SWAY_LOG" 2>&1 &
+    # setsid so sway + its swaybg helper share a process group we can
+    # signal as a unit. Killing the group is what catches swaybg
+    # (sway usually doesn't reap it cleanly on SIGTERM).
+    setsid sway --config "$CFG" --unsupported-gpu --debug >"$SWAY_LOG" 2>&1 &
     SWAY_PID=$!
+    # shellcheck disable=SC2329  # invoked indirectly via trap.
     cleanup() {
-      kill "$SWAY_PID" 2>/dev/null || true
+      # Negative pid = kill the process group, catches swaybg too.
+      kill -TERM -- "-$SWAY_PID" 2>/dev/null || true
       wait "$SWAY_PID" 2>/dev/null || true
+      # Belt + suspenders: a process group leader respawning into a
+      # new pgid would escape -TERM. pkill -P catches direct
+      # descendants by ppid as a fallback.
+      pkill -P "$SWAY_PID" 2>/dev/null || true
       rm -f "$PAYLOAD" "$CFG"
       ${termCfg.cleanup}
     }
+    # EXIT covers normal exit + most signals. INT/TERM explicit so a
+    # Ctrl-C reliably triggers cleanup before the shell tears down.
     trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     # Wait for the nested sway socket to appear.
     for _ in $(seq 1 100); do
@@ -112,6 +129,11 @@ writeShellApplication {
     echo "payload: $PAYLOAD ($(stat -c %s "$PAYLOAD") bytes)"
     echo "sway log: $SWAY_LOG"
 
-    exec "$BENCH_BIN" "$@"
+    # NOT `exec` — exec replaces this shell and drops the EXIT trap,
+    # which means sway leaks if the bench is interrupted or crashes.
+    # Run the bench as a child so cleanup() always fires on the way out.
+    rc=0
+    "$BENCH_BIN" "$@" || rc=$?
+    exit "$rc"
   '';
 }
