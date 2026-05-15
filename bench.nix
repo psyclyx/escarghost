@@ -13,6 +13,7 @@
 , coreutils
 , util-linux
 , procps
+, fontconfig # fc-match for the bench-term-config setup
 , sway
 , foot
 , alacritty
@@ -31,6 +32,7 @@ writeShellApplication {
     coreutils
     util-linux # setsid
     procps # pkill
+    fontconfig # fc-match
     sway
     foot
     alacritty
@@ -45,6 +47,16 @@ writeShellApplication {
     # built binary's RUNPATH. Drop it so the bench reflects what an end
     # user running the installed binary actually loads.
     unset LD_LIBRARY_PATH
+
+    # Sandbox the bench's cache dir. Without this, scrgo's persistent
+    # font-path cache (~/.cache/scrgo/font-path) shadows the bench's
+    # fontconfig setup and scrgo ends up rendering with whatever
+    # "monospace" resolved to LAST time the user ran scrgo outside the
+    # bench — e.g. a condensed proprietary font from home-manager. The
+    # other terminals get the bench env's fontconfig "monospace"
+    # (DejaVu on stock NixOS), so they look ~30 % wider per cell.
+    BENCH_CACHE="$(mktemp -d -t bench-cache.XXXXXX)"
+    export XDG_CACHE_HOME="$BENCH_CACHE"
 
     ${termCfg.setup}
 
@@ -85,6 +97,7 @@ writeShellApplication {
       # descendants by ppid as a fallback.
       pkill -P "$SWAY_PID" 2>/dev/null || true
       rm -f "$PAYLOAD" "$CFG"
+      rm -rf "$BENCH_CACHE"
       ${termCfg.cleanup}
     }
     # EXIT covers normal exit + most signals. INT/TERM explicit so a
