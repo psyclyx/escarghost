@@ -62,6 +62,10 @@ pub const Frontend = struct {
     request_pending: bool = false,
     stop_requested: bool = false,
     active: bool = false,
+    /// Optional speculative atlas warming. Disabled with
+    /// `SCRGO_ATLAS_PREFETCH=0`. Misses are still resolved synchronously
+    /// on the render thread either way (see AtlasRef.extend).
+    prefetch_enabled: bool = true,
 
     // Bootstrap state — set by thread, read by main after responses.
     bootstrap_config: ?BootstrapConfig = null,
@@ -77,6 +81,7 @@ pub const Frontend = struct {
         const timer = perf.Timer.now();
         self.* = .{
             .atlas_ref = ref,
+            .prefetch_enabled = prefetchEnabled(),
         };
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
@@ -102,6 +107,7 @@ pub const Frontend = struct {
         const timer = perf.Timer.now();
         self.* = .{
             .bootstrap_config = config,
+            .prefetch_enabled = prefetchEnabled(),
         };
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
@@ -146,7 +152,7 @@ pub const Frontend = struct {
     }
 
     pub fn requestMany(self: *Frontend, misses: *const glyph_misses.Set) void {
-        if (!self.active or misses.isEmpty()) return;
+        if (!self.active or !self.prefetch_enabled or misses.isEmpty()) return;
         const timer = perf.Timer.now();
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
@@ -179,7 +185,16 @@ pub const Frontend = struct {
             writeResponse(self.response_fds[1], .{ .tag = .bootstrap_ready });
         }
 
-        const allocator = self.atlas_ref.allocator;
+        // Misses now resolve synchronously on the render thread (see
+        // AtlasRef.extend). Without prefetch, this thread has nothing
+        // left to do post-bootstrap; exit so we don't burn an OS thread
+        // on a permanently parked cond_wait.
+        if (!self.prefetch_enabled) {
+            if (atlasDebugEnabled()) {
+                std.debug.print("scrgo[atlas-owner] prefetch disabled; thread exiting\n", .{});
+            }
+            return;
+        }
 
         while (true) {
             var local_pending: glyph_misses.Set = .{};
@@ -202,62 +217,39 @@ pub const Frontend = struct {
             var current_lease = self.atlas_ref.acquire();
             defer current_lease.release();
             const current = current_lease.get();
-            const before_pages = current.pageCount();
             const pending_text = local_pending.text();
 
-            const maybe_next = current.ensureText(.{}, pending_text) catch {
-                atlasDebug(timer, "ensureText failed for {} bytes", .{pending_text.len});
+            // Goes through AtlasRef.extension_lock so a concurrent sync
+            // extend on the render thread doesn't race the publish.
+            const result = self.atlas_ref.extend(current, pending_text) catch {
+                atlasDebug(timer, "extend failed for {} bytes", .{pending_text.len});
                 writeResponse(self.response_fds[1], .{
                     .tag = .failed,
                     .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
                 });
                 continue;
             };
-
-            if (maybe_next) |next_atlas| {
-                const heap_atlas = allocator.create(snail.TextAtlas) catch {
-                    atlasDebug(timer, "alloc failed for atlas", .{});
-                    var discard = next_atlas;
-                    discard.deinit();
-                    writeResponse(self.response_fds[1], .{
-                        .tag = .failed,
-                        .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
-                    });
-                    continue;
-                };
-                heap_atlas.* = next_atlas;
-
-                const after_pages = heap_atlas.pageCount();
-                self.atlas_ref.publish(heap_atlas) catch {
-                    atlasDebug(timer, "publish failed for atlas", .{});
-                    heap_atlas.deinit();
-                    allocator.destroy(heap_atlas);
-                    writeResponse(self.response_fds[1], .{
-                        .tag = .failed,
-                        .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
-                    });
-                    continue;
-                };
-
-                atlasDebug(timer, "extended ({} bytes) pages {}->{}", .{
-                    pending_text.len,
-                    before_pages,
-                    after_pages,
-                });
-                writeResponse(self.response_fds[1], .{
-                    .tag = .updated,
-                    .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
-                    .added_pages = @intCast(@min(after_pages - before_pages, std.math.maxInt(u8))),
-                });
-            } else {
-                atlasDebug(timer, "noop for {} bytes", .{pending_text.len});
-                writeResponse(self.response_fds[1], .{
-                    .tag = .updated,
-                    .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
-                    .added_pages = 0,
-                });
-            }
+            const tag: ResponseTag = switch (result) {
+                .extended => .updated,
+                .missing => .updated,
+            };
+            atlasDebug(timer, "{s} for {} bytes", .{ @tagName(result), pending_text.len });
+            writeResponse(self.response_fds[1], .{
+                .tag = tag,
+                .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
+                .added_pages = 0,
+            });
         }
+    }
+
+    fn prefetchEnabled() bool {
+        const value = c.getenv("SCRGO_ATLAS_PREFETCH") orelse return true;
+        const slice = std.mem.sliceTo(value, 0);
+        if (slice.len == 0) return true;
+        if (std.mem.eql(u8, slice, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(slice, "false")) return false;
+        if (std.ascii.eqlIgnoreCase(slice, "off")) return false;
+        return true;
     }
 
     fn runBootstrap(self: *Frontend, config: BootstrapConfig) !void {
