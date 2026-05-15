@@ -518,6 +518,12 @@ pub const Wayland = struct {
                 if (self.egl_window != null) self.resizeEgl(w, h);
                 if (self.on_resize) |cb| cb(w, h);
             }
+            // The bg commit attached a 1px buffer scaled via wp_viewport
+            // to (initial_width, initial_height). Once the compositor
+            // gives us the real size we want our render buffers (always
+            // sized to surface) composited 1:1; clear the viewport
+            // destination so it doesn't downscale them.
+            self.clearSurfaceScaling();
         }
     }
 
