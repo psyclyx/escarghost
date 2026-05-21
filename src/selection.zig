@@ -326,3 +326,51 @@ test "word expansion treats path-like chars as a single word" {
     try std.testing.expectEqual(@as(u16, 0), w.start);
     try std.testing.expectEqual(@as(u16, 11), w.end);
 }
+
+test "trimSpanRight strips trailing spaces" {
+    const text = [_]u32{ 'h', 'i', ' ', ' ', ' ' };
+    const span = trimSpanRight(&text, .{ .row = 0, .start_col = 0, .end_col = 4 });
+    try std.testing.expectEqual(@as(u16, 0), span.start_col);
+    try std.testing.expectEqual(@as(u16, 1), span.end_col);
+}
+
+test "trimSpanRight leaves non-whitespace alone" {
+    const text = [_]u32{ 'a', 'b', 'c', 'd', 'e' };
+    const span = trimSpanRight(&text, .{ .row = 0, .start_col = 1, .end_col = 3 });
+    try std.testing.expectEqual(@as(u16, 1), span.start_col);
+    try std.testing.expectEqual(@as(u16, 3), span.end_col);
+}
+
+test "trimSpanRight refuses to trim past start_col" {
+    const text = [_]u32{ ' ', ' ', ' ' };
+    const span = trimSpanRight(&text, .{ .row = 0, .start_col = 0, .end_col = 2 });
+    // All whitespace: end never drops below start.
+    try std.testing.expectEqual(@as(u16, 0), span.start_col);
+    try std.testing.expectEqual(@as(u16, 0), span.end_col);
+}
+
+test "Snapshot.ordered swaps when head precedes anchor" {
+    const snap = Snapshot{
+        .anchor = .{ .row = 5, .col = 10 },
+        .head = .{ .row = 2, .col = 4 },
+        .mode = .char,
+    };
+    const ord = snap.ordered();
+    try std.testing.expect(Cell.eql(ord.start, .{ .row = 2, .col = 4 }));
+    try std.testing.expect(Cell.eql(ord.end, .{ .row = 5, .col = 10 }));
+}
+
+test "State.toSnapshot returns null on rest state" {
+    const s = State{};
+    try std.testing.expect(s.toSnapshot() == null);
+}
+
+test "State.toSnapshot returns a populated snapshot after a drag" {
+    var s = State{};
+    s.beginPrimary(.{ .row = 1, .col = 2 }, false, 0);
+    s.updateDrag(.{ .row = 3, .col = 5 });
+    const snap = s.toSnapshot() orelse return error.NoSnapshot;
+    try std.testing.expect(snap.mode == .char);
+    try std.testing.expect(Cell.eql(snap.anchor, .{ .row = 1, .col = 2 }));
+    try std.testing.expect(Cell.eql(snap.head, .{ .row = 3, .col = 5 }));
+}

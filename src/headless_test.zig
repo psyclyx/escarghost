@@ -165,3 +165,86 @@ test "inverse / bold / italic style flags propagate through render state" {
     try testing.expect(found_bold);
     try testing.expect(found_italic);
 }
+
+// ── clipboard / scrollbar / encodePaste ──────────────────────────────
+
+test "encodePaste round-trips ascii unchanged when bracketed-paste is off" {
+    const allocator = testing.allocator;
+    var cfg = try loadConfig(allocator);
+    defer cfg.deinit(allocator);
+
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    try testing.expect(!term.isBracketedPaste());
+    const out = (try term.encodePaste(allocator, "hello world")) orelse return error.NoOutput;
+    defer allocator.free(out);
+    try testing.expectEqualSlices(u8, "hello world", out);
+}
+
+test "encodePaste wraps bracketed paste markers when 2004h is set" {
+    const allocator = testing.allocator;
+    var cfg = try loadConfig(allocator);
+    defer cfg.deinit(allocator);
+
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    term.feedData("\x1b[?2004h");
+    try term.updateRenderState();
+    try testing.expect(term.isBracketedPaste());
+
+    const out = (try term.encodePaste(allocator, "ab")) orelse return error.NoOutput;
+    defer allocator.free(out);
+    // The encoded buffer must contain the bracketed-paste start
+    // (\e[200~) before "ab" and the end (\e[201~) after.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[200~") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[201~") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "ab") != null);
+}
+
+test "scrollbar getter reports total/offset/len once content overflows" {
+    const allocator = testing.allocator;
+    var cfg = try loadConfig(allocator);
+    defer cfg.deinit(allocator);
+
+    const cols: u16 = 40;
+    const rows: u16 = 5;
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(cols, rows, 200, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    // Empty terminal: total == len, no scrollback to show.
+    const sb0 = term.scrollbar();
+    try testing.expectEqual(@as(u64, rows), sb0.len);
+    try testing.expectEqual(@as(u64, rows), sb0.total);
+
+    // Feed a bunch of lines so scrollback grows past the viewport.
+    var i: usize = 0;
+    while (i < 50) : (i += 1) term.feedData("line\r\n");
+    try term.updateRenderState();
+    const sb1 = term.scrollbar();
+    try testing.expectEqual(@as(u64, rows), sb1.len);
+    try testing.expect(sb1.total > sb1.len);
+    // At bottom, offset = total - len.
+    try testing.expectEqual(sb1.total - sb1.len, sb1.offset);
+}
+
+test "colCount / rowCount mirror the configured grid" {
+    const allocator = testing.allocator;
+    var cfg = try loadConfig(allocator);
+    defer cfg.deinit(allocator);
+
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    try testing.expectEqual(@as(u16, 80), term.colCount());
+    try testing.expectEqual(@as(u16, 24), term.rowCount());
+
+    try term.resize(50, 10, 9, 17);
+    try testing.expectEqual(@as(u16, 50), term.colCount());
+    try testing.expectEqual(@as(u16, 10), term.rowCount());
+}
