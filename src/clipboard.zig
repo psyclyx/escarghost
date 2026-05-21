@@ -149,6 +149,25 @@ pub const Manager = struct {
     /// no offer is present or the read times out. The returned slice
     /// is owned by `allocator`.
     pub fn getText(self: *Manager, kind: Kind, allocator: std.mem.Allocator, timeout_ms: u32) !?[]u8 {
+        // Self-paste short-circuit: when we own the source, the
+        // compositor echoes our own offer back, but calling
+        // wl_data_offer_receive on it would deadlock — the source's
+        // .send event fires via the wayland socket and writes to the
+        // pipe, but we're blocked in read() and never dispatch the
+        // event. Just return a copy of our local buffer instead.
+        switch (kind) {
+            .clipboard => if (self.clipboard_source != null) {
+                const t = self.clipboard_text orelse return null;
+                if (t.len == 0) return null;
+                return try allocator.dupe(u8, t);
+            },
+            .primary => if (self.primary_source != null) {
+                const t = self.primary_text orelse return null;
+                if (t.len == 0) return null;
+                return try allocator.dupe(u8, t);
+            },
+        }
+
         var fds: [2]c_int = undefined;
         if (c.pipe(&fds) != 0) return error.PipeFailed;
         const read_fd = fds[0];
