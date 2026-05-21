@@ -151,6 +151,7 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     addStableProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "viewporter");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "staging/single-pixel-buffer/single-pixel-buffer-v1.xml", "single-pixel-buffer-v1-client-protocol.h", "single-pixel-buffer-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml", "linux-dmabuf-unstable-v1-client-protocol.h", "linux-dmabuf-unstable-v1-protocol.c");
+    addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/primary-selection/primary-selection-unstable-v1.xml", "primary-selection-unstable-v1-client-protocol.h", "primary-selection-unstable-v1-protocol.c");
 
     return mod;
 }

@@ -9,6 +9,7 @@ const wl = @cImport({
     @cInclude("viewporter-client-protocol.h");
     @cInclude("single-pixel-buffer-v1-client-protocol.h");
     @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
+    @cInclude("primary-selection-unstable-v1-client-protocol.h");
 });
 
 const egl = @cImport({
@@ -77,6 +78,15 @@ pub const Wayland = struct {
     viewporter: ?*wl.wp_viewporter = null,
     single_pixel_buffer_manager: ?*wl.wp_single_pixel_buffer_manager_v1 = null,
     linux_dmabuf: ?*wl.zwp_linux_dmabuf_v1 = null,
+    data_device_manager: ?*wl.wl_data_device_manager = null,
+    data_device: ?*wl.wl_data_device = null,
+    primary_selection_manager: ?*wl.zwp_primary_selection_device_manager_v1 = null,
+    primary_selection_device: ?*wl.zwp_primary_selection_device_v1 = null,
+    /// Most-recent serial we received from a pointer or keyboard event.
+    /// wl_data_device_manager_set_selection (and the primary variant)
+    /// require a serial from a compositor-visible input event, so we
+    /// cache the latest one here. Zero = no input yet.
+    last_input_serial: u32 = 0,
 
     shm: ?*wl.wl_shm = null,
     surface: ?*wl.wl_surface = null,
@@ -134,6 +144,11 @@ pub const Wayland = struct {
         self.viewporter = null;
         self.single_pixel_buffer_manager = null;
         self.linux_dmabuf = null;
+        self.data_device_manager = null;
+        self.data_device = null;
+        self.primary_selection_manager = null;
+        self.primary_selection_device = null;
+        self.last_input_serial = 0;
         self.decoration = null;
         self.frame_callback = null;
         self.surface = null;
@@ -209,6 +224,12 @@ pub const Wayland = struct {
         while (!self.configured) {
             if (wl.wl_display_roundtrip(self.display) < 0) return error.DispatchFailed;
         }
+
+        // Both managers and the seat have been bound by now; attach the
+        // per-seat clipboard / primary devices. Compositors that don't
+        // advertise either manager get a no-op; copy/paste falls back
+        // to internal-only.
+        self.ensureClipboardDevices();
     }
 
     /// EGL Phase 1: display + context. Kept separate from initEglSurface()
@@ -297,6 +318,10 @@ pub const Wayland = struct {
         if (self.single_pixel_buffer_manager) |mgr| wl.wp_single_pixel_buffer_manager_v1_destroy(mgr);
         if (self.linux_dmabuf) |linux_dmabuf| wl.zwp_linux_dmabuf_v1_destroy(linux_dmabuf);
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
+        if (self.primary_selection_device) |d| wl.zwp_primary_selection_device_v1_destroy(d);
+        if (self.primary_selection_manager) |mgr| wl.zwp_primary_selection_device_manager_v1_destroy(mgr);
+        if (self.data_device) |d| wl.wl_data_device_destroy(d);
+        if (self.data_device_manager) |mgr| wl.wl_data_device_manager_destroy(mgr);
         if (self.pointer) |p| wl.wl_pointer_destroy(p);
         if (self.keyboard) |k| wl.wl_keyboard_destroy(k);
 
@@ -485,6 +510,28 @@ pub const Wayland = struct {
             self.single_pixel_buffer_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_single_pixel_buffer_manager_v1_interface, 1));
         } else if (std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
             self.linux_dmabuf = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_linux_dmabuf_v1_interface, @min(version, 3)));
+        } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+            self.data_device_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wl_data_device_manager_interface, @min(version, 3)));
+        } else if (std.mem.eql(u8, iface, "zwp_primary_selection_device_manager_v1")) {
+            self.primary_selection_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_primary_selection_device_manager_v1_interface, 1));
+        }
+    }
+
+    /// Attach the per-seat data/primary devices after the seat has been
+    /// bound. Safe to call repeatedly; only the first call wires the
+    /// devices up. Returns false if a manager was missing — the
+    /// compositor doesn't support that clipboard channel.
+    fn ensureClipboardDevices(self: *Wayland) void {
+        const seat = self.seat orelse return;
+        if (self.data_device == null) {
+            if (self.data_device_manager) |mgr| {
+                self.data_device = wl.wl_data_device_manager_get_data_device(mgr, seat);
+            }
+        }
+        if (self.primary_selection_device == null) {
+            if (self.primary_selection_manager) |mgr| {
+                self.primary_selection_device = wl.zwp_primary_selection_device_manager_v1_get_device(mgr, seat);
+            }
         }
     }
 
@@ -652,8 +699,9 @@ pub const Wayland = struct {
         if (self.on_focus) |cb| cb(false);
     }
 
-    fn keyboardKey(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
+    fn keyboardKey(data: ?*anyopaque, _: ?*wl.wl_keyboard, serial: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
+        self.last_input_serial = serial;
         if (!self.ensureKeymapParsed()) return;
         const xkb_state = self.xkb_state orelse return;
 
@@ -748,8 +796,9 @@ pub const Wayland = struct {
         });
     }
 
-    fn pointerButton(data: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, _: u32, button: u32, state: u32) callconv(.c) void {
+    fn pointerButton(data: ?*anyopaque, _: ?*wl.wl_pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
+        self.last_input_serial = serial;
         if (self.on_mouse) |cb| cb(.{
             .kind = if (state == wl.WL_POINTER_BUTTON_STATE_PRESSED) .button_press else .button_release,
             .button = button,
