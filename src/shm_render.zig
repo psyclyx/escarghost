@@ -388,6 +388,7 @@ pub const SnapshotRenderer = struct {
             &self.row_cache,
             &self.builder,
             self.currentAtlas(),
+            atlas_lease.ref,
             self.builder_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
@@ -416,6 +417,7 @@ pub const SnapshotRenderer = struct {
                     &self.row_cache,
                     &self.builder,
                     self.currentAtlas(),
+                    atlas_lease.ref,
                     self.builder_atlas_identity,
                     self.scratch_rects,
                     rows_buf[0..],
@@ -502,18 +504,21 @@ pub const SnapshotRenderer = struct {
             try paintScrollbar(&picture_builder, sb, @floatFromInt(viewport_w), @floatFromInt(viewport_h), default_fg);
         }
 
-        var picture = try picture_builder.freeze(.{
+        // Glyph-only frames leave the builder empty; `freeze` would
+        // error with EmptyPicture. Skip the picture path entirely in
+        // that case — `backdrop = .clear` below still seeds the buffer
+        // to default_bg and the text scene paints on top.
+        var maybe_picture: ?snail.PathPicture = if (picture_builder.shapeCount() > 0) try picture_builder.freeze(.{
             .persistent_allocator = self.allocator,
             .scratch_allocator = self.allocator,
-        });
-        defer picture.deinit();
+        }) else null;
+        defer if (maybe_picture) |*p| p.deinit();
         phase_picture_ns += picture_t0.elapsedNs();
 
         var manifest = snail.ResourceManifest.init(self.manifest_entries[0..]);
-        try manifest.putPathPicture(PICTURE_KEY, &picture);
-
-        if (picture.shapeCount() > 0) {
-            try self.scene.addPath(.{ .picture = &picture, .resource_key = PICTURE_KEY });
+        if (maybe_picture) |*picture| {
+            try manifest.putPathPicture(PICTURE_KEY, picture);
+            try self.scene.addPath(.{ .picture = picture, .resource_key = PICTURE_KEY });
         }
 
         var override_index: usize = 0;

@@ -387,7 +387,7 @@ pub const Renderer = struct {
         // Text blob: shape & lay out one glyph → compiles text shader
         // and forces the atlas to be uploaded to the GPU. We pick 'a'
         // because atlas_owner's bootstrap populates ASCII.
-        var shaped = atlas.shapeText(self.allocator, .{}, "a") catch null;
+        var shaped = self.atlas_ref.shape(atlas, self.allocator, .{}, "a") catch null;
         var blob_opt: ?snail.TextBlob = null;
         defer if (blob_opt) |*b| b.deinit();
         if (shaped) |*s| {
@@ -627,6 +627,7 @@ pub const Renderer = struct {
             &self.row_cache,
             &self.builder,
             atlas,
+            self.atlas_ref,
             self.last_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
@@ -658,6 +659,7 @@ pub const Renderer = struct {
                     &self.row_cache,
                     &self.builder,
                     atlas,
+                    self.atlas_ref,
                     self.last_atlas_identity,
                     self.scratch_rects,
                     rows_buf[0..],
@@ -901,18 +903,23 @@ pub const Renderer = struct {
             );
         }
 
-        var picture = try picture_builder.freeze(.{
+        // Picture is optional: a frame that paints only glyphs (no bg
+        // rects, no cursor, no scrollbar) leaves the builder empty and
+        // `freeze` errors with EmptyPicture. The text-only path still
+        // works — backdrop=.clear handles the bg seed when the buffer
+        // isn't yet seeded, and target.seeded frames hit the `dirty.len
+        // == 0` early-return above.
+        var maybe_picture: ?snail.PathPicture = if (picture_builder.shapeCount() > 0) try picture_builder.freeze(.{
             .persistent_allocator = self.allocator,
             .scratch_allocator = self.allocator,
-        });
-        defer picture.deinit();
+        }) else null;
+        defer if (maybe_picture) |*p| p.deinit();
         phase_picture_ns += picture_t0.elapsedNs();
 
         var manifest = snail.ResourceManifest.init(self.manifest_entries[0..]);
-        try manifest.putPathPicture(PICTURE_KEY, &picture);
-
-        if (picture.shapeCount() > 0) {
-            try self.scene.addPath(.{ .picture = &picture, .resource_key = PICTURE_KEY });
+        if (maybe_picture) |*picture| {
+            try manifest.putPathPicture(PICTURE_KEY, picture);
+            try self.scene.addPath(.{ .picture = picture, .resource_key = PICTURE_KEY });
         }
 
         var override_index: usize = 0;
@@ -1009,7 +1016,7 @@ pub const Renderer = struct {
         if (built.cursor) |cursor| {
             if (cursor.inverted_glyph) |blob| total_glyphs += blob.glyphCount();
         }
-        const scene_shapes = picture.shapeCount();
+        const scene_shapes: usize = if (maybe_picture) |*p| p.shapeCount() else 0;
         const scene_text_blobs = self.scene.commandCount();
 
         const draw_t0 = perf.Timer.now();

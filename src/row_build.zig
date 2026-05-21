@@ -14,6 +14,7 @@ const render_common = @import("render_common.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const color = @import("color.zig");
 const selection_mod = @import("selection.zig");
+const atlas_ref_mod = @import("atlas_ref.zig");
 const Rgb = color.Rgb;
 
 pub const baseline_factor: f32 = 0.8;
@@ -117,13 +118,14 @@ fn flushRow(
     row: *RowAccumulator,
     builder: *snail.TextBlobBuilder,
     atlas: *const snail.TextAtlas,
+    atlas_ref: *atlas_ref_mod.AtlasRef,
     allocator: std.mem.Allocator,
     metrics: Metrics,
     row_y: f32,
     misses: *glyph_misses.Set,
 ) !bool {
     if (row.isEmpty()) return false;
-    var shaped = try atlas.shapeText(allocator, .{}, row.text[0..row.text_len]);
+    var shaped = try atlas_ref.shape(atlas, allocator, .{}, row.text[0..row.text_len]);
     defer shaped.deinit();
     if (shaped.glyphs.len == 0) {
         row.reset();
@@ -191,6 +193,7 @@ pub fn buildRow(
     scratch_rects: []ColoredRect,
     builder: *snail.TextBlobBuilder,
     atlas: *const snail.TextAtlas,
+    atlas_ref: *atlas_ref_mod.AtlasRef,
     allocator: std.mem.Allocator,
     metrics: Metrics,
     misses: *glyph_misses.Set,
@@ -283,7 +286,7 @@ pub fn buildRow(
         }
     }
 
-    if (try flushRow(&row, builder, atlas, allocator, metrics, row_y, misses)) had_misses = true;
+    if (try flushRow(&row, builder, atlas, atlas_ref, allocator, metrics, row_y, misses)) had_misses = true;
 
     if (bg_span_len > 0) {
         if (bg_span_color) |sc| {
@@ -692,6 +695,7 @@ pub fn buildSnapshot(
     cache: *RowCache,
     builder: *snail.TextBlobBuilder,
     atlas: *const snail.TextAtlas,
+    atlas_ref: *atlas_ref_mod.AtlasRef,
     atlas_identity: u64,
     scratch_rects: []ColoredRect,
     rows_out: []RowDraw,
@@ -745,6 +749,7 @@ pub fn buildSnapshot(
                 scratch_rects,
                 builder,
                 atlas,
+                atlas_ref,
                 allocator,
                 metrics,
                 misses,
@@ -779,6 +784,7 @@ pub fn buildSnapshot(
                 if (cell.has_text and cell.glyph_id != 0) {
                     overlay.inverted_glyph = buildInvertedGlyph(
                         atlas,
+                        atlas_ref,
                         allocator,
                         metrics,
                         cell,
@@ -937,6 +943,7 @@ fn packSelectionId(snapshot: ?selection_mod.Snapshot, spans: []const SelectionSp
 
 fn buildInvertedGlyph(
     atlas: *const snail.TextAtlas,
+    atlas_ref: *atlas_ref_mod.AtlasRef,
     allocator: std.mem.Allocator,
     metrics: Metrics,
     cell: render_common.CursorCell,
@@ -949,7 +956,7 @@ fn buildInvertedGlyph(
     defer inv_builder.deinit();
     var tmp: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &tmp) catch return null;
-    var shaped = try atlas.shapeText(allocator, .{}, tmp[0..n]);
+    var shaped = try atlas_ref.shape(atlas, allocator, .{}, tmp[0..n]);
     defer shaped.deinit();
     const cx = @as(f32, @floatFromInt(cursor_x)) * metrics.cell_width;
     const cy = @as(f32, @floatFromInt(cursor_y)) * metrics.cell_height;

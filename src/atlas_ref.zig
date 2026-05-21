@@ -13,13 +13,21 @@ const c = @cImport({
 /// cached TextBlobs cannot race atlas publication.
 pub const AtlasRef = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    /// Serializes `ensureText + publish` pairs. Two concurrent extenders
-    /// (render thread doing sync extension; the optional prefetch worker)
-    /// otherwise race against the same baseline, with the loser's work
-    /// silently overwritten on publish. pthread_mutex (blocking) instead
-    /// of the spin `mutex` above because ensureText is an O(ms) shaping
-    /// + page-build operation; spinning on it would burn CPU.
-    extension_lock: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
+    /// Serializes every HarfBuzz shape operation against any snapshot
+    /// in this ref. snail's TextAtlas keeps one `hb_buffer_t` per
+    /// snapshot, and all our threads share that buffer when they call
+    /// `shapeText` / `ensureText`: a render thread shaping a row, the
+    /// atlas-owner prefetch thread extending coverage, the CPU worker
+    /// at startup. Concurrent users tripped HarfBuzz internal asserts
+    /// (`have_output`, `assert_unicode`, `replace_glyphs`) in dense
+    /// workloads.
+    ///
+    /// Also covers `ensureText + publish` in `extend`, replacing the
+    /// old `extension_lock` — two extenders against the same baseline
+    /// would otherwise overwrite each other on publish. pthread_mutex
+    /// (blocking) instead of the spin `mutex` above because shape can
+    /// take milliseconds; spinning would burn CPU.
+    shape_lock: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
     current: ?*Snapshot = null,
     retired: ?*Snapshot = null,
     generation: std.atomic.Value(u64) = .init(0),
@@ -51,6 +59,23 @@ pub const AtlasRef = struct {
         }
     };
 
+    /// Shape `text` against `atlas` with the cross-thread shape lock
+    /// held. All HarfBuzz work funnels through here so concurrent
+    /// renderers + the atlas-owner thread don't race the snapshot's
+    /// shared `hb_buffer_t`. Caller takes ownership of the returned
+    /// ShapedText.
+    pub fn shape(
+        self: *AtlasRef,
+        atlas: *const snail.TextAtlas,
+        allocator: std.mem.Allocator,
+        style: snail.FontStyle,
+        text: []const u8,
+    ) !snail.ShapedText {
+        _ = c.pthread_mutex_lock(&self.shape_lock);
+        defer _ = c.pthread_mutex_unlock(&self.shape_lock);
+        return atlas.shapeText(allocator, style, text);
+    }
+
     /// Create an AtlasRef with the given snapshot moved to the heap.
     /// The caller must not use `initial` after this call.
     pub fn init(allocator: std.mem.Allocator, initial: snail.TextAtlas) !AtlasRef {
@@ -65,7 +90,7 @@ pub const AtlasRef = struct {
             .generation = .init(1),
             .allocator = allocator,
         };
-        if (c.pthread_mutex_init(&ref.extension_lock, null) != 0) return error.MutexInitFailed;
+        if (c.pthread_mutex_init(&ref.shape_lock, null) != 0) return error.MutexInitFailed;
         return ref;
     }
 
@@ -95,15 +120,15 @@ pub const AtlasRef = struct {
     };
 
     /// Synchronously extend the atlas snapshot to cover `miss_text`. Holds
-    /// `extension_lock` across the `ensureText + publish` pair to keep two
+    /// `shape_lock` across the `ensureText + publish` pair to keep two
     /// concurrent extenders from clobbering each other.
     pub fn extend(
         self: *AtlasRef,
         baseline: *const snail.TextAtlas,
         miss_text: []const u8,
     ) !ExtendResult {
-        _ = c.pthread_mutex_lock(&self.extension_lock);
-        defer _ = c.pthread_mutex_unlock(&self.extension_lock);
+        _ = c.pthread_mutex_lock(&self.shape_lock);
+        defer _ = c.pthread_mutex_unlock(&self.shape_lock);
 
         var next = (try baseline.ensureText(.{}, miss_text)) orelse return .missing;
         const heap = self.allocator.create(snail.TextAtlas) catch |err| {
@@ -151,7 +176,7 @@ pub const AtlasRef = struct {
                 self.current = null;
             }
         }
-        _ = c.pthread_mutex_destroy(&self.extension_lock);
+        _ = c.pthread_mutex_destroy(&self.shape_lock);
     }
 
     fn retain(self: *AtlasRef, snapshot: *Snapshot) Lease {
