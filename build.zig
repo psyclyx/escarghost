@@ -146,10 +146,16 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
 
     mod.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });
     mod.addCSourceFile(.{ .file = b.path("protocol/xdg-decoration-protocol.c") });
+    // cursor-shape-v1's wl_message tables reference zwp_tablet_tool_v2_interface
+    // for the get_tablet_tool_v2 request. We never call that request — pointer
+    // input only — but the symbol must resolve at link time, so we ship a
+    // minimal interface struct in lieu of pulling in all of tablet-v2.
+    mod.addCSourceFile(.{ .file = b.path("protocol/tablet-v2-stub.c") });
     mod.addIncludePath(b.path("protocol"));
 
     addStableProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "viewporter");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "staging/single-pixel-buffer/single-pixel-buffer-v1.xml", "single-pixel-buffer-v1-client-protocol.h", "single-pixel-buffer-v1-protocol.c");
+    addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "staging/cursor-shape/cursor-shape-v1.xml", "cursor-shape-v1-client-protocol.h", "cursor-shape-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml", "linux-dmabuf-unstable-v1-client-protocol.h", "linux-dmabuf-unstable-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/primary-selection/primary-selection-unstable-v1.xml", "primary-selection-unstable-v1-client-protocol.h", "primary-selection-unstable-v1-protocol.c");
 

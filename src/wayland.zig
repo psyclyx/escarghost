@@ -8,6 +8,7 @@ const wl = @cImport({
     @cInclude("xdg-decoration-client-protocol.h");
     @cInclude("viewporter-client-protocol.h");
     @cInclude("single-pixel-buffer-v1-client-protocol.h");
+    @cInclude("cursor-shape-v1-client-protocol.h");
     @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
     @cInclude("primary-selection-unstable-v1-client-protocol.h");
 });
@@ -81,6 +82,8 @@ pub const Wayland = struct {
     decoration_manager: ?*wl.zxdg_decoration_manager_v1 = null,
     viewporter: ?*wl.wp_viewporter = null,
     single_pixel_buffer_manager: ?*wl.wp_single_pixel_buffer_manager_v1 = null,
+    cursor_shape_manager: ?*wl.wp_cursor_shape_manager_v1 = null,
+    cursor_shape_device: ?*wl.wp_cursor_shape_device_v1 = null,
     linux_dmabuf: ?*wl.zwp_linux_dmabuf_v1 = null,
     data_device_manager: ?*wl.wl_data_device_manager = null,
     data_device: ?*wl.wl_data_device = null,
@@ -154,6 +157,8 @@ pub const Wayland = struct {
         self.decoration_manager = null;
         self.viewporter = null;
         self.single_pixel_buffer_manager = null;
+        self.cursor_shape_manager = null;
+        self.cursor_shape_device = null;
         self.linux_dmabuf = null;
         self.data_device_manager = null;
         self.data_device = null;
@@ -326,6 +331,8 @@ pub const Wayland = struct {
         if (self.xdg_toplevel) |tl| wl.xdg_toplevel_destroy(tl);
         if (self.xdg_surface) |xs| wl.xdg_surface_destroy(xs);
         if (self.surface) |s| wl.wl_surface_destroy(s);
+        if (self.cursor_shape_device) |d| wl.wp_cursor_shape_device_v1_destroy(d);
+        if (self.cursor_shape_manager) |mgr| wl.wp_cursor_shape_manager_v1_destroy(mgr);
         if (self.single_pixel_buffer_manager) |mgr| wl.wp_single_pixel_buffer_manager_v1_destroy(mgr);
         if (self.linux_dmabuf) |linux_dmabuf| wl.zwp_linux_dmabuf_v1_destroy(linux_dmabuf);
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
@@ -519,6 +526,8 @@ pub const Wayland = struct {
             self.viewporter = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_viewporter_interface, 1));
         } else if (std.mem.eql(u8, iface, "wp_single_pixel_buffer_manager_v1")) {
             self.single_pixel_buffer_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_single_pixel_buffer_manager_v1_interface, 1));
+        } else if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
+            self.cursor_shape_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_cursor_shape_manager_v1_interface, @min(version, 1)));
         } else if (std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
             self.linux_dmabuf = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_linux_dmabuf_v1_interface, @min(version, 3)));
         } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
@@ -630,6 +639,9 @@ pub const Wayland = struct {
             self.pointer = wl.wl_seat_get_pointer(seat);
             if (self.pointer) |ptr| {
                 _ = wl.wl_pointer_add_listener(ptr, &pointer_listener, @ptrCast(self));
+                if (self.cursor_shape_manager) |mgr| {
+                    self.cursor_shape_device = wl.wp_cursor_shape_manager_v1_get_pointer(mgr, ptr);
+                }
             }
         }
     }
@@ -801,6 +813,12 @@ pub const Wayland = struct {
         self.pointer_x = @as(f64, @floatFromInt(sx)) / 256.0;
         self.pointer_y = @as(f64, @floatFromInt(sy)) / 256.0;
         self.pointer_in_surface = true;
+        // The compositor expects every client to set a cursor image on each
+        // enter — leaving it unset is undefined behavior and shows whatever
+        // image the previous surface left behind.
+        if (self.cursor_shape_device) |device| {
+            wl.wp_cursor_shape_device_v1_set_shape(device, serial, wl.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
+        }
         if (self.on_mouse) |cb| cb(.{
             .kind = .enter,
             .x = self.pointer_x,
