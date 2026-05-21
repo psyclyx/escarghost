@@ -14,6 +14,7 @@ const perf = @import("perf.zig");
 const selection_mod = @import("selection.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const clipboard_mod = @import("clipboard.zig");
+const diagnostics = @import("diagnostics.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -38,59 +39,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(ptr, 0);
 }
 
-fn monotonicNowNs() u64 {
-    var ts: c.struct_timespec = undefined;
-    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
-}
-
-/// Measure the time between fork()/exec() and our `main()` getting
-/// control — i.e. ld.so + library `.init_array` + libc init + Zig's
-/// `_start`. Reads /proc/self/stat field 22 (process start time in
-/// jiffies since boot) and /proc/uptime (current uptime in seconds);
-/// returns the delta in ns, or null if anything failed.
-fn premainAgeNs() ?u64 {
-    var stat_buf: [4096]u8 = undefined;
-    const stat_fd = c.open("/proc/self/stat", c.O_RDONLY);
-    if (stat_fd < 0) return null;
-    const stat_n = c.read(stat_fd, &stat_buf, stat_buf.len - 1);
-    _ = c.close(stat_fd);
-    if (stat_n <= 0) return null;
-    stat_buf[@intCast(stat_n)] = 0;
-    const stat_str = stat_buf[0..@intCast(stat_n)];
-
-    // Skip past "comm" (which can contain spaces and parens), find the
-    // closing ')'; everything after it is space-separated fields. We
-    // want field 22 (starttime, counted from the field after ')').
-    const close_paren = std.mem.lastIndexOfScalar(u8, stat_str, ')') orelse return null;
-    var it = std.mem.tokenizeAny(u8, stat_str[close_paren + 1 ..], " \t\n");
-    // Fields after ')' start at index 3 (state, ppid, ...). starttime
-    // is field 22, i.e. 19 fields after ')'.
-    var i: usize = 0;
-    while (i < 19) : (i += 1) {
-        if (it.next() == null) return null;
-    }
-    const starttime_jiffies_str = it.next() orelse return null;
-    const starttime_jiffies = std.fmt.parseInt(u64, starttime_jiffies_str, 10) catch return null;
-
-    var uptime_buf: [128]u8 = undefined;
-    const uptime_fd = c.open("/proc/uptime", c.O_RDONLY);
-    if (uptime_fd < 0) return null;
-    const uptime_n = c.read(uptime_fd, &uptime_buf, uptime_buf.len - 1);
-    _ = c.close(uptime_fd);
-    if (uptime_n <= 0) return null;
-    uptime_buf[@intCast(uptime_n)] = 0;
-    const uptime_str = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&uptime_buf)), 0);
-    const space = std.mem.indexOfScalar(u8, uptime_str, ' ') orelse uptime_str.len;
-    const uptime_secs = std.fmt.parseFloat(f64, uptime_str[0..space]) catch return null;
-
-    const clk_tck: f64 = @floatFromInt(c.sysconf(c._SC_CLK_TCK));
-    if (clk_tck <= 0) return null;
-    const starttime_secs = @as(f64, @floatFromInt(starttime_jiffies)) / clk_tck;
-    const age_secs = uptime_secs - starttime_secs;
-    if (age_secs < 0) return null;
-    return @intFromFloat(age_secs * @as(f64, std.time.ns_per_s));
-}
+const monotonicNowNs = diagnostics.monotonicNowNs;
 
 fn setCloseOnExec(fd: c_int) void {
     if (fd < 0) return;
@@ -149,130 +98,11 @@ var g_scrollbar_was_visible: bool = false;
 var g_first_pty_data_seen: bool = false;
 var g_first_content_painted: bool = false;
 
-// Commit timing trace. Enabled via `SCRGO_LOG=commits`. Records the
-// monotonic millis (relative to startup_timer) of every surface commit
-// plus the render path used; dumped at exit so we can see how commits
-// cluster across a run.
-const CommitTrace = struct {
-    t_ms: f32,
-    path: u8, // 'g' = gpu, 'c' = cpu, 'b' = bootstrap bg
-};
-var g_commit_trace: [4096]CommitTrace = undefined;
-var g_commit_trace_len: usize = 0;
-var g_commit_trace_start_ns: u64 = 0;
-
-fn recordCommit(path_tag: u8) void {
-    if (!g_renderer_debug.commits) return;
-    if (g_commit_trace_len >= g_commit_trace.len) return;
-    const now = monotonicNowNs();
-    const dt: f32 = @floatFromInt(now - g_commit_trace_start_ns);
-    g_commit_trace[g_commit_trace_len] = .{
-        .t_ms = dt / @as(f32, std.time.ns_per_ms),
-        .path = path_tag,
-    };
-    g_commit_trace_len += 1;
-}
-
-fn elapsedSinceStartupMs() f64 {
-    return @as(f64, @floatFromInt(monotonicNowNs() - g_commit_trace_start_ns)) / @as(f64, std.time.ns_per_ms);
-}
-
-// Phase timing accumulators. Populated when SCRGO_LOG=commits.
-var g_phase_pty_read_ns: u64 = 0;
-var g_phase_feed_data_ns: u64 = 0;
-var g_phase_snapshot_ns: u64 = 0;
-var g_phase_bytes_read: u64 = 0;
-var g_phase_snapshots: u64 = 0;
-var g_phase_feed_calls: u64 = 0;
-var g_phase_poll_ns: u64 = 0;
-var g_phase_poll_calls: u64 = 0;
-
-// Self-sampled memory peaks. Updated by a background thread that polls
-// /proc/self/status at ~5ms intervals while the process is alive, then
-// dumped at exit. Lets us verify bench reports against scrgo's own
-// view of its memory.
-var g_peak_vmrss_kib: u64 = 0;
-var g_peak_rss_anon_kib: u64 = 0;
-var g_mem_poll_stop: std.atomic.Value(bool) = .init(false);
-
-fn readProcStatus(key: []const u8) u64 {
-    const fd = c.open("/proc/self/status", c.O_RDONLY | c.O_CLOEXEC);
-    if (fd < 0) return 0;
-    defer _ = c.close(fd);
-    var buf: [16384]u8 = undefined;
-    const n = c.read(fd, &buf, buf.len);
-    if (n <= 0) return 0;
-    var it = std.mem.tokenizeScalar(u8, buf[0..@intCast(n)], '\n');
-    while (it.next()) |line| {
-        if (!std.mem.startsWith(u8, line, key)) continue;
-        var tok = std.mem.tokenizeAny(u8, line[key.len..], " \t");
-        const val_s = tok.next() orelse return 0;
-        return std.fmt.parseInt(u64, val_s, 10) catch 0;
-    }
-    return 0;
-}
-
-fn memPollLoop() void {
-    while (!g_mem_poll_stop.load(.acquire)) {
-        const rss = readProcStatus("VmRSS:");
-        const anon = readProcStatus("RssAnon:");
-        if (rss > g_peak_vmrss_kib) g_peak_vmrss_kib = rss;
-        if (anon > g_peak_rss_anon_kib) g_peak_rss_anon_kib = anon;
-        var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 5 * std.time.ns_per_ms };
-        _ = c.nanosleep(&ts, null);
-    }
-}
-
-// Lifecycle milestone timestamps (ns since g_commit_trace_start_ns).
-var g_t_first_pty_ns: u64 = 0;
-var g_t_child_exited_ns: u64 = 0;
-var g_t_main_loop_exit_ns: u64 = 0;
-var g_t_before_exit_ns: u64 = 0;
-
-// Stale-frame diagnostic state. Per-commit we log whether the snapshot we
-// just committed was already behind the latest markRenderDirty serial; at
-// exit we log whether the *final* committed frame was caught up. Together
-// these answer "is the last frame the user sees actually up-to-date?"
-var g_last_commit_serial: u32 = 0;
-var g_last_commit_latest_at_commit: u32 = 0;
-var g_last_commit_ns: u64 = 0;
-var g_total_stale_commits: u64 = 0;
-var g_total_throttled_skips: u64 = 0;
-
-fn recordCommitSerial(path: u8, committed_serial: u32) void {
-    if (!debugFramesEnabled()) return;
-    const latest = g_render_serial;
-    const stale = committed_serial != latest;
-    if (stale) g_total_stale_commits += 1;
-    g_last_commit_serial = committed_serial;
-    g_last_commit_latest_at_commit = latest;
-    g_last_commit_ns = monotonicNowNs();
-    const tag: []const u8 = switch (path) {
-        'g' => "gpu",
-        'c' => "cpu",
-        else => "?",
-    };
-    if (stale) {
-        std.debug.print("scrgo: {s} commit serial={} latest={} STALE (gap={}, dirty={}) ({d:.1}ms)\n", .{
-            tag,
-            committed_serial,
-            latest,
-            latest - committed_serial,
-            g_gpu_snapshot_dirty or g_needs_redraw,
-            elapsedSinceStartupMs(),
-        });
-    } else {
-        std.debug.print("scrgo: {s} commit serial={} latest={} caught-up ({d:.1}ms)\n", .{
-            tag,
-            committed_serial,
-            latest,
-            elapsedSinceStartupMs(),
-        });
-    }
-}
-// Time between fork()/exec() and main() getting control (ld.so + libc
-// init + Zig _start). Sampled once at main entry.
-var g_t_premain_ns: u64 = 0;
+// All diagnostics state — commit trace, phase timers, mem peaks, stale
+// frame stats, lifecycle timestamps. Mostly active only under
+// SCRGO_LOG=commits / SCRGO_LOG=frames. Configured once in main after
+// debug flags are parsed.
+var diag: diagnostics.Diagnostics = .{};
 
 fn markFirstContentPaint() void {
     if (g_first_content_painted or !g_first_pty_data_seen) return;
@@ -991,7 +821,7 @@ fn renderActivePath(
         };
         g_needs_redraw = false;
         if (debugFramesEnabled()) {
-            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, elapsedSinceStartupMs() });
+            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, diag.elapsedMs() });
         }
         return;
     }
@@ -1016,8 +846,7 @@ fn noteGpuUnavailable(
 
 pub fn main(init: std.process.Init) !void {
     const startup_timer = perf.Timer.now();
-    g_commit_trace_start_ns = monotonicNowNs();
-    if (premainAgeNs()) |age| g_t_premain_ns = age;
+    diag.markStart();
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
@@ -1070,16 +899,11 @@ pub fn main(init: std.process.Init) !void {
     g_renderer_debug = rendererDebugOptions();
     g_warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
     wayland_mod.Wayland.log_frame_events = g_renderer_debug.frames;
+    diag.debug = g_renderer_debug;
     // Background memory poller (SCRGO_LOG=commits). Mirrors what the
     // bench's poller thread sees from outside the process.
-    var mem_thread: ?std.Thread = null;
-    if (g_renderer_debug.commits) {
-        mem_thread = std.Thread.spawn(.{}, memPollLoop, .{}) catch null;
-    }
-    defer {
-        g_mem_poll_stop.store(true, .release);
-        if (mem_thread) |t| t.join();
-    }
+    const mem_thread = diag.startMemPollThread();
+    defer diag.stopMemPollThread(mem_thread);
     const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
     const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
     if (debugStartupEnabled()) {
@@ -1145,7 +969,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpu.stop(); // must run before wl.deinit() to destroy wayland buffers first
 
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
-        recordCommit('b');
+        diag.recordCommit('b');
         if (debugStartupEnabled()) {
             std.debug.print("scrgo: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
@@ -1154,7 +978,7 @@ pub fn main(init: std.process.Init) !void {
         if (bg_frame) |*frame| {
             frame.fillBackground(cfg.background);
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-            recordCommit('b');
+            diag.recordCommit('b');
             if (debugStartupEnabled()) {
                 std.debug.print("scrgo: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
@@ -1295,8 +1119,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     main_loop: while (!wl.closed) {
-        if (g_renderer_debug.commits and child_exited and g_t_child_exited_ns == 0) {
-            g_t_child_exited_ns = monotonicNowNs() - g_commit_trace_start_ns;
+        if (g_renderer_debug.commits and child_exited and diag.t_child_exited_ns == 0) {
+            diag.t_child_exited_ns = monotonicNowNs() - diag.commit_trace_start_ns;
         }
         if (child_exited and !draining) {
             // Slurp any bytes still buffered on the master before the kernel
@@ -1389,8 +1213,8 @@ pub fn main(init: std.process.Init) !void {
         const poll_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
         const poll_rc = c.poll(&pollfds, 5, poll_timeout);
         if (g_renderer_debug.commits) {
-            g_phase_poll_ns += monotonicNowNs() - poll_t0;
-            g_phase_poll_calls += 1;
+            diag.phase_poll_ns += monotonicNowNs() - poll_t0;
+            diag.phase_poll_calls += 1;
         }
         if (poll_rc < 0) {
             wl.cancelRead();
@@ -1448,7 +1272,7 @@ pub fn main(init: std.process.Init) !void {
                     .frame => {
                         if (g_target_render_path != .gpu) {
                             // Target switched away from gpu; drop this frame.
-                            recordCommit('d');
+                            diag.recordCommit('d');
                         } else {
                             if (debugRenderersEnabled()) {
                                 std.debug.print("scrgo: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
@@ -1465,8 +1289,8 @@ pub fn main(init: std.process.Init) !void {
                                 // there's no latency penalty for the
                                 // newer content.
                                 gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                                recordCommit('g');
-                                recordCommitSerial('g', resp.serial);
+                                diag.recordCommit('g');
+                                diag.recordCommitSerial('g', resp.serial, g_render_serial, g_gpu_snapshot_dirty or g_needs_redraw);
                                 if (!wl.frame_pending) wl.requestFrame();
                                 if (active_render_path != .gpu) {
                                     if (debugFramesEnabled()) {
@@ -1517,13 +1341,13 @@ pub fn main(init: std.process.Init) !void {
                         const size_ok = cpu.width == wl.width and cpu.height == wl.height;
                         if (buffer_ok and path_ok and size_ok) {
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                            recordCommit('c');
-                            recordCommitSerial('c', resp.serial);
+                            diag.recordCommit('c');
+                            diag.recordCommitSerial('c', resp.serial, g_render_serial, g_gpu_snapshot_dirty or g_needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
                             if (debugFramesEnabled()) {
                                 std.debug.print("scrgo: cpu renderer frame committed buffer={} ({d:.1}ms)\n", .{
                                     resp.buffer_index,
-                                    elapsedSinceStartupMs(),
+                                    diag.elapsedMs(),
                                 });
                             }
                             markFirstContentPaint();
@@ -1537,7 +1361,7 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.print("scrgo: cpu renderer frame dropped buffer={} ({s}) ({d:.1}ms)\n", .{
                                 resp.buffer_index,
                                 reason,
-                                elapsedSinceStartupMs(),
+                                diag.elapsedMs(),
                             });
                         }
                         // Only clear dirty if no new PTY data arrived
@@ -1611,20 +1435,20 @@ pub fn main(init: std.process.Init) !void {
                     break;
                 }
                 if (debugPtyEnabled()) {
-                    std.debug.print("scrgo: PTY read {} bytes ({d:.1}ms)\n", .{ n, elapsedSinceStartupMs() });
+                    std.debug.print("scrgo: PTY read {} bytes ({d:.1}ms)\n", .{ n, diag.elapsedMs() });
                 }
                 if (g_renderer_debug.commits) {
-                    g_phase_pty_read_ns += monotonicNowNs() - read_t0;
-                    g_phase_bytes_read += @intCast(n);
+                    diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
+                    diag.phase_bytes_read += @intCast(n);
                 }
                 const feed_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
                 term.feedData(pty_buf[0..n]);
                 if (g_renderer_debug.commits) {
-                    g_phase_feed_data_ns += monotonicNowNs() - feed_t0;
-                    g_phase_feed_calls += 1;
+                    diag.phase_feed_data_ns += monotonicNowNs() - feed_t0;
+                    diag.phase_feed_calls += 1;
                 }
-                if (g_renderer_debug.commits and g_t_first_pty_ns == 0) {
-                    g_t_first_pty_ns = monotonicNowNs() - g_commit_trace_start_ns;
+                if (g_renderer_debug.commits and diag.t_first_pty_ns == 0) {
+                    diag.t_first_pty_ns = monotonicNowNs() - diag.commit_trace_start_ns;
                 }
                 g_first_pty_data_seen = true;
                 markRenderDirty();
@@ -1638,8 +1462,8 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
                 }
                 child_exited = true;
-                if (g_renderer_debug.commits and g_t_child_exited_ns == 0) {
-                    g_t_child_exited_ns = monotonicNowNs() - g_commit_trace_start_ns;
+                if (g_renderer_debug.commits and diag.t_child_exited_ns == 0) {
+                    diag.t_child_exited_ns = monotonicNowNs() - diag.commit_trace_start_ns;
                 }
             }
         }
@@ -1651,165 +1475,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (g_renderer_debug.commits) {
-        g_t_main_loop_exit_ns = monotonicNowNs() - g_commit_trace_start_ns;
+        diag.t_main_loop_exit_ns = monotonicNowNs() - diag.commit_trace_start_ns;
     }
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
-    // Stale-last-frame diagnostic. If the final committed frame's serial is
-    // behind the latest dirty-serial, the user's last visible frame doesn't
-    // reflect the last PTY data we received — that's the "stale last frame"
-    // symptom. If they match, the pipeline caught up and any visible
-    // staleness is somewhere else (rendering, snapshot, or compositor).
-    if (debugFramesEnabled() and g_last_commit_serial != 0) {
-        const final_latest = g_render_serial;
-        const final_dirty = g_gpu_snapshot_dirty or g_needs_redraw;
-        const verdict: []const u8 = if (g_last_commit_serial == final_latest and !final_dirty)
-            "caught-up"
-        else
-            "STALE";
-        std.debug.print(
-            "scrgo: final commit serial={} latest={} dirty={} → {s}  (stale commits={}, throttle skips={})\n",
-            .{
-                g_last_commit_serial,
-                final_latest,
-                final_dirty,
-                verdict,
-                g_total_stale_commits,
-                g_total_throttled_skips,
-            },
-        );
-        // Wayland-side counters. If frame_done_count > request_frame_count,
-        // the compositor is firing extra callbacks (possibly from the second
-        // wl_surface_commit inside requestFrame). If frame_done_count <
-        // request_frame_count, callbacks are getting lost. If max
-        // frame-done dt is much larger than 1 vsync, the compositor is
-        // throttling our callbacks unexpectedly.
-        const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
-        std.debug.print(
-            "scrgo: wayland  requestFrame={} (skipped={}, commits={})  frameDone={}  max_dt={d:.1}ms\n",
-            .{
-                wayland_mod.Wayland.request_frame_count,
-                wayland_mod.Wayland.request_frame_skipped,
-                wayland_mod.Wayland.request_frame_commit_count,
-                wayland_mod.Wayland.frame_done_count,
-                @as(f64, @floatFromInt(wayland_mod.Wayland.last_frame_done_dt_max_ns)) / ms,
-            },
-        );
-    }
-    renderer_mod.Renderer.frame_stats.log("frame");
-    if (g_renderer_debug.commits) {
-        const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
-        std.debug.print(
-            "scrgo: phases  poll={d:.1}ms({})  pty_read={d:.1}ms  feed_data={d:.1}ms  prepare={d:.1}ms  worker_cells={d:.1}ms  bytes={}  feed_calls={}  snapshots={}\n",
-            .{
-                @as(f64, @floatFromInt(g_phase_poll_ns)) / ms,
-                g_phase_poll_calls,
-                @as(f64, @floatFromInt(g_phase_pty_read_ns)) / ms,
-                @as(f64, @floatFromInt(g_phase_feed_data_ns)) / ms,
-                @as(f64, @floatFromInt(gpu_renderer.snapshotPhaseAccumNs)) / ms,
-                @as(f64, @floatFromInt(gpu_renderer.captureCellsAccumNs)) / ms,
-                g_phase_bytes_read,
-                g_phase_feed_calls,
-                gpu_renderer.snapshotPhaseCount,
-            },
-        );
-        std.debug.print(
-            "scrgo: gpu sched  worker_wait={d:.1}ms({})  buf_starvation={d:.1}ms({})\n",
-            .{
-                @as(f64, @floatFromInt(gpu_renderer.workerWaitAccumNs)) / ms,
-                gpu_renderer.workerWaitCount,
-                @as(f64, @floatFromInt(gpu_renderer.bufferStarvationAccumNs)) / ms,
-                gpu_renderer.bufferStarvationCount,
-            },
-        );
-        std.debug.print(
-            "scrgo: memory  peak_rss={d}MiB  peak_anon={d}MiB  final_rss={d}MiB  final_anon={d}MiB\n",
-            .{
-                g_peak_vmrss_kib / 1024,
-                g_peak_rss_anon_kib / 1024,
-                readProcStatus("VmRSS:") / 1024,
-                readProcStatus("RssAnon:") / 1024,
-            },
-        );
-        // Per-backend snail-pipeline breakdown. Each line covers the work
-        // done inside one drawSnapshot/renderToMemory call: row build (cache
-        // lookup + cold-row shaping), path picture build+freeze, snail
-        // resource upload, draw-list assembly, drawPass rasterization.
-        // Totals are cumulative across the run; divide by `frames` for
-        // average per-frame ms.
-        if (renderer_mod.Renderer.phase_frame_count > 0) {
-            std.debug.print(
-                "scrgo: gpu pipeline  frames={}  row_build={d:.1}ms  picture={d:.1}ms  upload={d:.1}ms  drawlist={d:.1}ms  draw={d:.1}ms\n",
-                .{
-                    renderer_mod.Renderer.phase_frame_count,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_row_build_ns)) / ms,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_picture_ns)) / ms,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_upload_ns)) / ms,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_drawlist_ns)) / ms,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_draw_ns)) / ms,
-                },
-            );
-        }
-        if (shm_render.phase_frame_count > 0) {
-            std.debug.print(
-                "scrgo: cpu pipeline  frames={}  row_build={d:.1}ms  picture={d:.1}ms  upload={d:.1}ms  drawlist={d:.1}ms  draw={d:.1}ms\n",
-                .{
-                    shm_render.phase_frame_count,
-                    @as(f64, @floatFromInt(shm_render.phase_row_build_ns)) / ms,
-                    @as(f64, @floatFromInt(shm_render.phase_picture_ns)) / ms,
-                    @as(f64, @floatFromInt(shm_render.phase_upload_ns)) / ms,
-                    @as(f64, @floatFromInt(shm_render.phase_drawlist_ns)) / ms,
-                    @as(f64, @floatFromInt(shm_render.phase_draw_ns)) / ms,
-                },
-            );
-        }
-    }
-    if (g_renderer_debug.commits and g_commit_trace_len > 0) {
-        std.debug.print("scrgo: commit trace ({} commits):\n", .{g_commit_trace_len});
-        var prev_ms: f32 = 0;
-        for (g_commit_trace[0..g_commit_trace_len], 0..) |entry, i| {
-            const path_str: []const u8 = switch (entry.path) {
-                'g' => "gpu",
-                'c' => "cpu",
-                'b' => "bg ",
-                'd' => "dis",
-                else => "?  ",
-            };
-            std.debug.print("  [{:>3}] {s} t={d:>7.2}ms  +{d:>6.2}ms\n", .{
-                i, path_str, entry.t_ms, entry.t_ms - prev_ms,
-            });
-            prev_ms = entry.t_ms;
-        }
-    }
-    if (g_renderer_debug.anyLogs()) {
-        if (wl.closed) {
-            std.debug.print("scrgo: compositor requested close, exiting\n", .{});
-        } else if (child_exited) {
-            std.debug.print("scrgo: child exit path reached, exiting\n", .{});
-        }
-        std.debug.print("scrgo: exiting\n", .{});
-    }
-
-    if (g_renderer_debug.commits) {
-        g_t_before_exit_ns = monotonicNowNs() - g_commit_trace_start_ns;
-        const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
-        const last_commit_ms: f32 = if (g_commit_trace_len > 0)
-            g_commit_trace[g_commit_trace_len - 1].t_ms
-        else
-            0;
-        std.debug.print(
-            "scrgo: timeline  pre_main={d:.1}ms  first_pty={d:.1}ms  last_commit={d:.1}ms  child_exited={d:.1}ms  main_loop_exit={d:.1}ms  before__exit={d:.1}ms\n",
-            .{
-                @as(f64, @floatFromInt(g_t_premain_ns)) / ms,
-                @as(f64, @floatFromInt(g_t_first_pty_ns)) / ms,
-                last_commit_ms,
-                @as(f64, @floatFromInt(g_t_child_exited_ns)) / ms,
-                @as(f64, @floatFromInt(g_t_main_loop_exit_ns)) / ms,
-                @as(f64, @floatFromInt(g_t_before_exit_ns)) / ms,
-            },
-        );
-    }
+    diag.dumpExitReport(.{
+        .wl_closed = wl.closed,
+        .child_exited = child_exited,
+        .render_serial = g_render_serial,
+        .pipeline_dirty = g_gpu_snapshot_dirty or g_needs_redraw,
+    });
 
     // Skip the defer chain (cpu/atlas/gpu thread joins, wl_display_disconnect,
     // buffer/surface destroys, allocator frees). Wayland is designed so the
