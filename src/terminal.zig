@@ -76,21 +76,35 @@ pub const Terminal = struct {
     on_bell: ?*const fn () void = null,
     on_title_changed: ?*const fn ([]const u8) void = null,
 
+    /// Approximate bytes-per-row used to translate the caller's
+    /// line-oriented scrollback budget into ghostty's byte-oriented
+    /// `max_scrollback` field. Ghostty's own default of 10 MB
+    /// corresponds to ~10k rows at this ratio, so 1 KB/row matches
+    /// upstream's implied baseline. Worst-case (215-col rows packed
+    /// with graphemes and per-cell styles) is denser than this;
+    /// callers that need a guaranteed line count should size their
+    /// `max_scrollback_lines` input with that in mind.
+    pub const BYTES_PER_SCROLLBACK_LINE: usize = 1024;
+
     pub fn init(
         self: *Terminal,
         cols: u16,
         rows: u16,
-        max_scrollback: usize,
+        max_scrollback_lines: usize,
         palette: [256]Rgb,
         fg: Rgb,
         bg: Rgb,
     ) !void {
 
-        // Create terminal
+        // Create terminal. Ghostty's `max_scrollback` is documented in
+        // its C header as "lines" but is actually bytes (its own
+        // default is 10 MB). We convert at this single boundary so the
+        // rest of scrgo can stay in line-units.
+        const max_scrollback_bytes = max_scrollback_lines *| BYTES_PER_SCROLLBACK_LINE;
         const opts: c.GhosttyTerminalOptions = .{
             .cols = cols,
             .rows = rows,
-            .max_scrollback = max_scrollback,
+            .max_scrollback = max_scrollback_bytes,
         };
         if (c.ghostty_terminal_new(null, &self.handle, opts) != c.GHOSTTY_SUCCESS)
             return error.TerminalInitFailed;

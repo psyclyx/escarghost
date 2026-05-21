@@ -27,6 +27,12 @@ pub const Config = struct {
     font_size: f32,
     cols: u16,
     rows: u16,
+    /// Maximum scrollback in lines. Translated to a byte budget when
+    /// handed to ghostty (see Terminal.BYTES_PER_SCROLLBACK_LINE) —
+    /// rows wider than the 215-cell page width or containing many
+    /// grapheme clusters may take more bytes, so the practical line
+    /// count can come in slightly below this number under heavy
+    /// content.
     max_scrollback: usize,
     shell: []const u8,
     generate_256: bool,

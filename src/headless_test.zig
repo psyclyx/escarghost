@@ -232,6 +232,33 @@ test "scrollbar getter reports total/offset/len once content overflows" {
     try testing.expectEqual(sb1.total - sb1.len, sb1.offset);
 }
 
+test "max_scrollback config in lines actually yields ~that many lines" {
+    // Regression: ghostty's `max_scrollback` field is bytes, not lines
+    // (its C header docstring lies). terminal.init now converts the
+    // line budget to bytes via BYTES_PER_SCROLLBACK_LINE; pre-fix,
+    // requesting 5000 lines gave us the 2-page floor (~430 rows).
+    const allocator = testing.allocator;
+    var cfg = try loadConfig(allocator);
+    defer cfg.deinit(allocator);
+
+    const cols: u16 = 40;
+    const rows: u16 = 5;
+    const requested_lines: usize = 5000;
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(cols, rows, requested_lines, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    // Feed more lines than we ask the floor would give us. The post-
+    // fix line budget should comfortably exceed 1000 rows of
+    // scrollback; pre-fix this would cap at ~430.
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) term.feedData("line\r\n");
+    try term.updateRenderState();
+
+    const sb = term.scrollbar();
+    try testing.expect(sb.total > 1000);
+}
+
 test "colCount / rowCount mirror the configured grid" {
     const allocator = testing.allocator;
     var cfg = try loadConfig(allocator);
