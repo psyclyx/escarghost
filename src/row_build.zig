@@ -55,47 +55,66 @@ pub fn hashSnapshotRow(snapshot: *const render_snapshot.SharedSnapshot, start_in
     return h;
 }
 
-/// Accumulates a same-color text run so HB can shape it as a unit
-/// (ligatures form across cells inside the run, but never across a
-/// color change or a decorated cell).
-const RunAccumulator = struct {
+/// Accumulates an entire row's renderable text in one HB-shapeable
+/// buffer along with the per-byte mapping back to the source cell
+/// column. After the cell walk completes, `flushRow` calls HB once to
+/// shape the lot — ligatures still form because shaping spans the full
+/// row — and then emits builder.append calls per same-fg sub-range of
+/// the resulting glyph stream. Cells whose text isn't renderable (or
+/// blank) contribute nothing; the per-cell x grid (`placement.baseline.x
+/// = first_cell_col * cell_width`) anchors each sub-range absolutely so
+/// the blanks just stay blank — they're not part of the shape.
+const RowAccumulator = struct {
+    /// UTF-8 buffer of renderable text from the row, in column order.
+    /// Cap matches MAX_RECTS_PER_ROW's intent: well over the worst-case
+    /// 167 cols × 4 bytes.
     text: [2048]u8 = undefined,
     text_len: usize = 0,
-    start_col: u16 = 0,
-    fg: ?Rgb = null,
+    /// Per-byte index into `text`, the source column that contributed
+    /// it. Used after shaping to map glyph.source_start back to its
+    /// originating cell so we can pick up that cell's fg color.
+    byte_to_col: [2048]u16 = undefined,
+    /// Per-column fg. Sparse — only columns with renderable text get
+    /// written, but downstream lookups index by column so the array is
+    /// sized to MaxCols.
+    col_fg: [render_snapshot.MaxCols]Rgb = undefined,
 
-    fn reset(self: *RunAccumulator) void {
+    fn reset(self: *RowAccumulator) void {
         self.text_len = 0;
-        self.fg = null;
     }
 
-    fn isEmpty(self: *const RunAccumulator) bool {
+    fn isEmpty(self: *const RowAccumulator) bool {
         return self.text_len == 0;
     }
 
-    fn appendCell(self: *RunAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
-        if (self.fg == null) {
-            self.start_col = col;
-            self.fg = fg;
-        }
+    fn appendCell(self: *RowAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
         if (self.text_len + 4 > self.text.len) return;
+        if (col >= self.col_fg.len) return;
         const n = std.unicode.utf8Encode(@intCast(codepoint), self.text[self.text_len..]) catch 0;
         if (n == 0) return;
+        self.col_fg[col] = fg;
+        for (0..n) |i| self.byte_to_col[self.text_len + i] = col;
         self.text_len += n;
-    }
-
-    fn fgMatches(self: *const RunAccumulator, fg: Rgb) bool {
-        const cur = self.fg orelse return false;
-        return cur.r == fg.r and cur.g == fg.g and cur.b == fg.b;
     }
 };
 
-/// Shape the run via HB so ligatures form, then let HB's natural glyph
-/// advances do placement. Cell width matches the font's natural advance,
-/// so a well-behaved monospace font's ligatures span exactly the right
-/// number of cells.
-fn flushRun(
-    run: *RunAccumulator,
+fn rgbEq(a: Rgb, b: Rgb) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b;
+}
+
+/// Shape the whole row in one HB call, then walk the shaped glyphs
+/// and emit `builder.append` ranges grouped by fg color. The fg color
+/// for each glyph comes from the cell its `source_start` byte falls in
+/// — that's why the accumulator tracks a byte→column index.
+///
+/// `placement.baseline.x` for each sub-range is anchored to the first
+/// glyph's cell column on the absolute grid, so cells with no
+/// renderable text (which contributed nothing to the shape) leave gaps
+/// in exactly the right places. Cell width matches the font's natural
+/// advance, so ligatures across cells still span the correct number of
+/// columns.
+fn flushRow(
+    row: *RowAccumulator,
     builder: *snail.TextBlobBuilder,
     atlas: *const snail.TextAtlas,
     allocator: std.mem.Allocator,
@@ -103,23 +122,58 @@ fn flushRun(
     row_y: f32,
     misses: *glyph_misses.Set,
 ) !bool {
-    if (run.isEmpty()) return false;
-    const fg = run.fg.?;
-    const opts_x = @as(f32, @floatFromInt(run.start_col)) * metrics.cell_width;
-    var shaped = try atlas.shapeText(allocator, .{}, run.text[0..run.text_len]);
+    if (row.isEmpty()) return false;
+    var shaped = try atlas.shapeText(allocator, .{}, row.text[0..row.text_len]);
     defer shaped.deinit();
-    const result = try builder.append(.{
-        .shaped = &shaped,
-        .placement = .{
-            .baseline = .{ .x = opts_x, .y = row_y + metrics.baseline() },
-            .em = metrics.font_size,
-        },
-        .fill = .{ .solid = fg.toFloat4(1.0) },
-    });
-    const had_misses = result.missing;
-    if (had_misses) misses.addRun(run.text[0..run.text_len]);
-    run.reset();
+    if (shaped.glyphs.len == 0) {
+        row.reset();
+        return false;
+    }
+
+    const baseline_y = row_y + metrics.baseline();
+    var had_misses = false;
+    var group_start: usize = 0;
+    var group_col: u16 = colForGlyph(row, &shaped.glyphs[0]);
+    var group_fg: Rgb = row.col_fg[group_col];
+
+    var i: usize = 1;
+    while (i <= shaped.glyphs.len) : (i += 1) {
+        const at_end = i == shaped.glyphs.len;
+        const next_fg = if (at_end) group_fg else row.col_fg[colForGlyph(row, &shaped.glyphs[i])];
+        if (at_end or !rgbEq(next_fg, group_fg)) {
+            const result = try builder.append(.{
+                .shaped = &shaped,
+                .glyphs = .{ .start = group_start, .count = i - group_start },
+                .placement = .{
+                    .baseline = .{
+                        .x = @as(f32, @floatFromInt(group_col)) * metrics.cell_width,
+                        .y = baseline_y,
+                    },
+                    .em = metrics.font_size,
+                },
+                .fill = .{ .solid = group_fg.toFloat4(1.0) },
+            });
+            if (result.missing) had_misses = true;
+            if (!at_end) {
+                group_start = i;
+                group_col = colForGlyph(row, &shaped.glyphs[i]);
+                group_fg = next_fg;
+            }
+        }
+    }
+
+    // If any sub-range had a missing glyph, the atlas thread needs to
+    // see the entire row's text so it can extend coverage for whatever
+    // codepoint produced the .notdef. Sub-range granularity is wasted
+    // here — the miss set is deduped anyway.
+    if (had_misses) misses.addRun(row.text[0..row.text_len]);
+    row.reset();
     return had_misses;
+}
+
+fn colForGlyph(row: *const RowAccumulator, glyph: *const snail.ShapedText.Glyph) u16 {
+    const start = @min(glyph.source_start, @as(u32, @intCast(row.text_len -| 1)));
+    return row.byte_to_col[start];
 }
 
 /// Build one row of glyphs (into `builder`) and rects (into `scratch_rects`).
@@ -151,7 +205,7 @@ pub fn buildRow(
     var bg_span_color: ?Rgb = null;
     var bg_span_len: u16 = 0;
 
-    var run = RunAccumulator{};
+    var row = RowAccumulator{};
 
     var col_idx: u16 = 0;
     while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
@@ -203,21 +257,8 @@ pub fn buildRow(
         }
 
         const has_renderable_text = flags.has_text and snail.isRenderableTextCodepoint(cell.codepoint);
-        // Break the run on: non-text cell, fg color change, or any cell with
-        // underline/strikethrough (so decorations don't bleed across a
-        // ligature glyph that spans cells).
-        const break_run = !has_renderable_text or flags.underline or flags.strikethrough or
-            (run.fg != null and !run.fgMatches(fg));
-        if (break_run and !run.isEmpty()) {
-            if (try flushRun(&run, builder, atlas, allocator, metrics, row_y, misses)) had_misses = true;
-        }
-
         if (has_renderable_text) {
-            run.appendCell(cell.codepoint, col_idx, fg);
-            // Cells with decorations don't ligate with neighbors.
-            if (flags.underline or flags.strikethrough) {
-                if (try flushRun(&run, builder, atlas, allocator, metrics, row_y, misses)) had_misses = true;
-            }
+            row.appendCell(cell.codepoint, col_idx, fg);
         }
 
         if (flags.underline and rect_count < scratch_rects.len) {
@@ -242,9 +283,7 @@ pub fn buildRow(
         }
     }
 
-    if (!run.isEmpty()) {
-        if (try flushRun(&run, builder, atlas, allocator, metrics, row_y, misses)) had_misses = true;
-    }
+    if (try flushRow(&row, builder, atlas, allocator, metrics, row_y, misses)) had_misses = true;
 
     if (bg_span_len > 0) {
         if (bg_span_color) |sc| {
