@@ -50,3 +50,19 @@ pub fn captureCursorCell(default_bg: Rgb, codepoint: u32, glyph_id: u16, has_tex
         .bg = colors.bg orelse default_bg,
     };
 }
+
+/// Translucent overlay color for the text selection band. Both render
+/// paths use this so the highlight looks identical regardless of which
+/// renderer is active. Picks a fixed neutral blue (#4f8cff) on dark
+/// backgrounds and a darker version on light backgrounds so the
+/// highlight stays visible without obscuring the underlying glyph.
+pub fn selectionFillColor(default_bg: Rgb) [4]f32 {
+    const luminance = (@as(u32, default_bg.r) * 30 + @as(u32, default_bg.g) * 59 + @as(u32, default_bg.b) * 11) / 100;
+    if (luminance < 128) {
+        // Dark bg → light cool-blue tint.
+        return .{ 79.0 / 255.0, 140.0 / 255.0, 255.0 / 255.0, 0.45 };
+    } else {
+        // Light bg → deeper blue so glyphs remain legible.
+        return .{ 31.0 / 255.0, 87.0 / 255.0, 184.0 / 255.0, 0.40 };
+    }
+}

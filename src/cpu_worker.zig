@@ -191,6 +191,7 @@ pub const Frontend = struct {
         cell_width: f32,
         cell_height: f32,
         serial: u32,
+        selection: ?@import("selection.zig").Snapshot,
     ) !void {
         if (!self.active) return error.Inactive;
         if (self.render_in_flight or self.request_pending) return error.Busy;
@@ -200,7 +201,7 @@ pub const Frontend = struct {
 
         var atlas_lease = self.atlas_ref.acquire();
         defer atlas_lease.release();
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get());
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get(), selection);
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);

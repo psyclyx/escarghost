@@ -9,6 +9,7 @@ const atlas_ref_mod = @import("atlas_ref.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const render_config = @import("render_config.zig");
+const render_common = @import("render_common.zig");
 const row_build = @import("row_build.zig");
 const color = @import("color.zig");
 const perf = @import("perf.zig");
@@ -306,6 +307,7 @@ pub const SnapshotRenderer = struct {
         self.scene.reset();
 
         var rows_buf: [render_snapshot.MaxRows]row_build.RowDraw = undefined;
+        var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
         const row_build_t0 = perf.Timer.now();
         var built = try row_build.buildSnapshot(
             snapshot,
@@ -317,6 +319,7 @@ pub const SnapshotRenderer = struct {
             self.builder_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
+            sel_buf[0..],
             &self.ephemeral_blobs,
             &misses,
         );
@@ -344,6 +347,7 @@ pub const SnapshotRenderer = struct {
                     self.builder_atlas_identity,
                     self.scratch_rects,
                     rows_buf[0..],
+                    sel_buf[0..],
                     &self.ephemeral_blobs,
                     &misses,
                 );
@@ -393,6 +397,22 @@ pub const SnapshotRenderer = struct {
                     .identity,
                 );
             }
+        }
+        // Selection sits between cell backgrounds and the text run:
+        // the highlight covers cell bg but the glyphs draw on top of
+        // it. We use the default fg with a fixed alpha so the
+        // selection is visible on any theme; the linear-resolve pass
+        // blends it against whatever's beneath.
+        const sel_color = render_common.selectionFillColor(default_bg);
+        for (built.selection_spans) |span| {
+            const x0 = @as(f32, @floatFromInt(span.start_col)) * cell_width;
+            const y0 = @as(f32, @floatFromInt(span.row)) * cell_height;
+            const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * cell_width;
+            try picture_builder.addFilledRect(
+                .{ .x = x0, .y = y0, .w = w, .h = cell_height },
+                .{ .paint = .{ .solid = sel_color } },
+                .identity,
+            );
         }
         if (built.cursor) |cursor| try emitCursor(&picture_builder, cursor, cell_width, cell_height);
 

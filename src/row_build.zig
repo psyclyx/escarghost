@@ -13,6 +13,7 @@ const render_snapshot = @import("render_snapshot.zig");
 const render_common = @import("render_common.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const color = @import("color.zig");
+const selection_mod = @import("selection.zig");
 const Rgb = color.Rgb;
 
 pub const baseline_factor: f32 = 0.8;
@@ -518,15 +519,34 @@ pub const CursorOverlay = struct {
     inverted_glyph: ?*const snail.TextBlob = null,
 };
 
+/// Per-row span of selected columns, in viewport coordinates. Inclusive
+/// of both endpoints. Width-zero spans are skipped at build time. The
+/// renderer paints these as translucent overlays under the row's text.
+pub const SelectionSpan = struct {
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+};
+
+pub const MAX_SELECTION_SPANS: usize = render_snapshot.MaxRows;
+
 pub const BuiltSnapshot = struct {
     rows: []const RowDraw,
     cursor: ?CursorOverlay,
+    selection_spans: []const SelectionSpan,
+    /// Stable identity of the selection for dirty tracking. Two
+    /// selections that produce the same painted band hash to the same
+    /// value. Zero = no selection.
+    selection_id: u64,
 };
 
 /// Walk a snapshot row-by-row, hit the row cache, and capture cursor
 /// state in one pass. Backends own the four submit passes (see
 /// docs/row-render-design.md for the contract); this layer owns
 /// iteration, caching, and the per-frame inverted-glyph build.
+///
+/// `selection_spans_out` receives any selection rectangles produced
+/// from `snapshot.selection`. Cap is `MAX_SELECTION_SPANS`.
 pub fn buildSnapshot(
     snapshot: *const render_snapshot.SharedSnapshot,
     allocator: std.mem.Allocator,
@@ -537,6 +557,7 @@ pub fn buildSnapshot(
     atlas_identity: u64,
     scratch_rects: []ColoredRect,
     rows_out: []RowDraw,
+    selection_spans_out: []SelectionSpan,
     blob_stash: *EphemeralBlobs,
     misses: *glyph_misses.Set,
 ) !BuiltSnapshot {
@@ -641,7 +662,136 @@ pub fn buildSnapshot(
         cursor = overlay;
     }
 
-    return .{ .rows = rows_out[0..row_count], .cursor = cursor };
+    const spans = resolveSelectionSpans(snapshot, selection_spans_out, rows, cols);
+
+    return .{
+        .rows = rows_out[0..row_count],
+        .cursor = cursor,
+        .selection_spans = spans,
+        .selection_id = packSelectionId(snapshot.selection, spans),
+    };
+}
+
+/// Translate the snapshot's anchor/head + mode into the per-row column
+/// ranges the renderer paints. Char mode walks the band between the
+/// ordered endpoints; word mode expands each endpoint to a word
+/// boundary using the row's codepoints; line mode covers full rows.
+/// Returns a slice of `spans_out` populated up to its capacity.
+fn resolveSelectionSpans(
+    snapshot: *const render_snapshot.SharedSnapshot,
+    spans_out: []SelectionSpan,
+    rows: u16,
+    cols: u16,
+) []SelectionSpan {
+    const sel = snapshot.selection orelse return spans_out[0..0];
+    if (rows == 0 or cols == 0 or spans_out.len == 0) return spans_out[0..0];
+
+    var n: usize = 0;
+    switch (sel.mode) {
+        .char => {
+            const ord = sel.ordered();
+            const start = clampCell(ord.start, rows, cols);
+            const end = clampCell(ord.end, rows, cols);
+            var row: u16 = start.row;
+            while (row <= end.row and n < spans_out.len) : (row += 1) {
+                const start_col: u16 = if (row == start.row) start.col else 0;
+                const end_col: u16 = if (row == end.row) end.col else cols - 1;
+                if (end_col >= start_col) {
+                    spans_out[n] = .{ .row = row, .start_col = start_col, .end_col = end_col };
+                    n += 1;
+                }
+            }
+        },
+        .word => {
+            // Expand anchor / head independently to their word
+            // boundaries, then build the band using the expanded
+            // endpoints. This matches what xterm / kitty do: a
+            // double-click selects one word, a double-click-drag
+            // grows the selection word-by-word.
+            const anchor_word = expandSnapshotWord(snapshot, sel.anchor, cols);
+            const head_word = expandSnapshotWord(snapshot, sel.head, cols);
+            const start_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(anchor_word.start, head_word.start))
+                anchor_word.start
+            else
+                head_word.start;
+            const end_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(anchor_word.end, head_word.end))
+                head_word.end
+            else
+                anchor_word.end;
+            const start = clampCell(start_cell, rows, cols);
+            const end = clampCell(end_cell, rows, cols);
+            var row: u16 = start.row;
+            while (row <= end.row and n < spans_out.len) : (row += 1) {
+                const start_col: u16 = if (row == start.row) start.col else 0;
+                const end_col: u16 = if (row == end.row) end.col else cols - 1;
+                spans_out[n] = .{ .row = row, .start_col = start_col, .end_col = end_col };
+                n += 1;
+            }
+        },
+        .line => {
+            const ord = sel.ordered();
+            const start_row: u16 = @min(ord.start.row, rows - 1);
+            const end_row: u16 = @min(ord.end.row, rows - 1);
+            var row: u16 = start_row;
+            while (row <= end_row and n < spans_out.len) : (row += 1) {
+                spans_out[n] = .{ .row = row, .start_col = 0, .end_col = cols - 1 };
+                n += 1;
+            }
+        },
+    }
+    return spans_out[0..n];
+}
+
+fn clampCell(cell: selection_mod.Cell, rows: u16, cols: u16) selection_mod.Cell {
+    return .{
+        .row = @min(cell.row, rows - 1),
+        .col = @min(cell.col, cols - 1),
+    };
+}
+
+/// Expand `cell` to a word range using the snapshot's row codepoints.
+/// Falls back to a single-cell range when the row is out of bounds.
+fn expandSnapshotWord(
+    snapshot: *const render_snapshot.SharedSnapshot,
+    cell: selection_mod.Cell,
+    cols: u16,
+) struct { start: selection_mod.Cell, end: selection_mod.Cell } {
+    const row = cell.row;
+    if (row >= snapshot.header.rows) {
+        return .{
+            .start = .{ .row = row, .col = cell.col },
+            .end = .{ .row = row, .col = cell.col },
+        };
+    }
+    var row_codepoints: [render_snapshot.MaxCols]u32 = undefined;
+    const row_start: usize = @as(usize, row) * @as(usize, cols);
+    var col: u16 = 0;
+    while (col < cols and row_start + col < snapshot.header.cell_count) : (col += 1) {
+        row_codepoints[col] = snapshot.cells[row_start + col].codepoint;
+    }
+    const w = selection_mod.expandWord(row_codepoints[0..col], cell.col);
+    return .{
+        .start = .{ .row = row, .col = w.start },
+        .end = .{ .row = row, .col = w.end },
+    };
+}
+
+/// Pack the resolved selection into a u64 for fast equality checks.
+/// Renderers use this to detect "the highlight band hasn't moved" so
+/// they can skip repainting selection-covered rows. Hashes the span
+/// list so spans of different rows / extents always differ.
+fn packSelectionId(snapshot: ?selection_mod.Snapshot, spans: []const SelectionSpan) u64 {
+    if (snapshot == null or spans.len == 0) return 0;
+    var h: u64 = 0xcbf29ce484222325;
+    const m: u64 = 0x100000001b3;
+    h = (h ^ @intFromEnum(snapshot.?.mode)) *% m;
+    for (spans) |s| {
+        h = (h ^ @as(u64, s.row)) *% m;
+        h = (h ^ @as(u64, s.start_col)) *% m;
+        h = (h ^ @as(u64, s.end_col)) *% m;
+    }
+    // Reserve 0 for "no selection".
+    return if (h == 0) 1 else h;
 }
 
 fn buildInvertedGlyph(

@@ -643,7 +643,7 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mo
     // input-faster-than-render conditions (rare in a terminal), we
     // over-commit and the compositor discards intermediate buffers;
     // the wasted work is one render (~3ms) per redundant commit.
-    gpu.queueRender(term, g_render_serial) catch |err| switch (err) {
+    gpu.queueRender(term, g_render_serial, g_selection.toSnapshot()) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer
             // so we can see at exit whether compositor release
@@ -694,7 +694,7 @@ fn renderActivePath(
             error.Busy => return,
             else => return,
         };
-        cpu.queueRender(term, g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height, g_render_serial) catch |err| switch (err) {
+        cpu.queueRender(term, g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height, g_render_serial, g_selection.toSnapshot()) catch |err| switch (err) {
             error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,
         };

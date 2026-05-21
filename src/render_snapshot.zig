@@ -3,6 +3,7 @@ const snail = @import("snail");
 const terminal_mod = @import("terminal.zig");
 const render_common = @import("render_common.zig");
 const color = @import("color.zig");
+const selection_mod = @import("selection.zig");
 const Rgb = color.Rgb;
 
 pub const MaxCols: u16 = 400;
@@ -54,6 +55,9 @@ pub const Header = struct {
 pub const SharedSnapshot = struct {
     header: Header = .{},
     cells: [MaxCells]Cell = [_]Cell{.{}} ** MaxCells,
+    /// Active text selection at the time the snapshot was captured.
+    /// Null = no selection; renderers skip the highlight pass.
+    selection: ?selection_mod.Snapshot = null,
 };
 
 pub var updateRenderStateAccumNs: u64 = 0;
@@ -75,11 +79,17 @@ fn monotonicNs() u64 {
 /// Pair with `captureCells` to read the resulting render_state into a
 /// `SharedSnapshot` — `captureCells` only touches the render_state and
 /// can run on a worker thread.
-pub fn prepare(term: *terminal_mod.Terminal) !void {
+///
+/// `selection` is stamped onto `snapshot` here so it stays consistent
+/// across the prepare/captureCells split (the worker that runs
+/// captureCells won't see selection mutations that happened mid-frame).
+/// Pass null when there's no live selection.
+pub fn prepare(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, selection: ?selection_mod.Snapshot) !void {
     const t0 = monotonicNs();
     try term.updateRenderState();
     updateRenderStateAccumNs += monotonicNs() - t0;
     updateRenderStateCount += 1;
+    snapshot.selection = selection;
 }
 
 /// Walk the terminal's render_state (already populated by `prepare`) into
@@ -168,7 +178,12 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atl
 /// CPU worker path where snapshot capture already runs after the worker
 /// has been signalled. The GPU path splits the two so iteration can run
 /// off the main thread.
-pub fn capture(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *const snail.TextAtlas) !void {
-    try prepare(term);
+pub fn capture(
+    snapshot: *SharedSnapshot,
+    term: *terminal_mod.Terminal,
+    atlas: *const snail.TextAtlas,
+    selection: ?selection_mod.Snapshot,
+) !void {
+    try prepare(snapshot, term, selection);
     try captureCells(snapshot, term, atlas);
 }

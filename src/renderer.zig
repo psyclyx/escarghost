@@ -4,6 +4,7 @@ const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const render_config = @import("render_config.zig");
+const render_common = @import("render_common.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const row_build = @import("row_build.zig");
 const color = @import("color.zig");
@@ -75,12 +76,22 @@ const TargetState = struct {
     row_hashes: [MAX_SNAPSHOT_ROWS]u64 = [_]u64{0} ** MAX_SNAPSHOT_ROWS,
     /// Cursor identity painted onto this buffer; see `packCursorId`.
     cursor_id: u64 = 0,
+    /// Selection identity painted onto this buffer. Zero = no
+    /// selection was painted. See `packSelectionId` in row_build.
+    selection_id: u64 = 0,
+    /// Row indices that the most-recent painted selection covered.
+    /// Used to dirty those rows when the selection changes (so the
+    /// stale highlight gets repainted with no-selection cells).
+    selection_rows: [MAX_SNAPSHOT_ROWS]u16 = [_]u16{0} ** MAX_SNAPSHOT_ROWS,
+    selection_row_count: usize = 0,
 
     fn reset(self: *TargetState) void {
         self.seeded = false;
         @memset(&self.row_blobs, null);
         @memset(&self.row_hashes, 0);
         self.cursor_id = 0;
+        self.selection_id = 0;
+        self.selection_row_count = 0;
     }
 
     fn clearEvicted(self: *TargetState, evicted_hashes: []const u64) void {
@@ -538,6 +549,7 @@ pub const Renderer = struct {
         self.scene.reset();
 
         var rows_buf: [MAX_SNAPSHOT_ROWS]row_build.RowDraw = undefined;
+        var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
         const row_build_t0 = perf.Timer.now();
         var built = try row_build.buildSnapshot(
             snapshot,
@@ -549,6 +561,7 @@ pub const Renderer = struct {
             self.last_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
+            sel_buf[0..],
             &self.ephemeral_blobs,
             misses,
         );
@@ -579,6 +592,7 @@ pub const Renderer = struct {
                     self.last_atlas_identity,
                     self.scratch_rects,
                     rows_buf[0..],
+                    sel_buf[0..],
                     &self.ephemeral_blobs,
                     misses,
                 );
@@ -600,8 +614,9 @@ pub const Renderer = struct {
     /// frame. The canvas keeps prior pixels intact, so rows whose blob
     /// pointer is unchanged from the last paint already look right and
     /// can be skipped. Cursor moves dirty both the cell-it-left and
-    /// the cell-it-arrived-at. If the canvas isn't seeded yet we just
-    /// dirty everything.
+    /// the cell-it-arrived-at. Selection changes dirty every row that
+    /// was in the prior selection or is in the new one. If the canvas
+    /// isn't seeded yet we just dirty everything.
     fn computeDirty(self: *Renderer, built: row_build.BuiltSnapshot) []const usize {
         const row_count = built.rows.len;
         const target = &self.targets[self.active_target];
@@ -630,6 +645,26 @@ pub const Renderer = struct {
             }
             if (cursorRowFromId(new_cursor_id)) |r| {
                 if (r < row_count) marked[r] = true;
+            }
+        }
+
+        if (built.selection_id != target.selection_id) {
+            // Mark every row covered by the new selection. We also have
+            // to repaint rows that were covered by the *previous*
+            // selection so a stale band doesn't linger. The previous
+            // spans aren't stored, so we mark them via the cached
+            // row hash list: any row touched last time the selection
+            // was non-zero needs a fresh paint anyway, but since
+            // selection_id == 0 might be the new state too, fall back
+            // to marking all painted rows when the prior selection
+            // existed but we can't enumerate it.
+            for (built.selection_spans) |span| {
+                if (span.row < row_count) marked[span.row] = true;
+            }
+            if (target.selection_id != 0) {
+                for (target.selection_rows[0..@min(target.selection_row_count, row_count)]) |r| {
+                    if (r < row_count) marked[r] = true;
+                }
             }
         }
 
@@ -730,6 +765,25 @@ pub const Renderer = struct {
                 try picture_builder.addFilledRect(
                     .{ .x = r.x, .y = r.y + row_draw.row_y, .w = r.w, .h = r.h },
                     .{ .paint = .{ .solid = r.color } },
+                    .identity,
+                );
+            }
+        }
+        // Paint selection highlight on top of cell bgs but before
+        // glyphs, so the band covers the cell color and the text is
+        // legible over it. The dirty mask already includes every row
+        // the selection touches (see computeDirty), so we don't have
+        // to emit highlight rects for non-dirty rows.
+        if (built.selection_spans.len > 0) {
+            const sel_color = render_common.selectionFillColor(default_bg);
+            for (built.selection_spans) |span| {
+                if (!containsIndex(dirty, @intCast(span.row))) continue;
+                const x0 = @as(f32, @floatFromInt(span.start_col)) * self.cell_width;
+                const y0 = @as(f32, @floatFromInt(span.row)) * self.cell_height;
+                const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * self.cell_width;
+                try picture_builder.addFilledRect(
+                    .{ .x = x0, .y = y0, .w = w, .h = self.cell_height },
+                    .{ .paint = .{ .solid = sel_color } },
                     .identity,
                 );
             }
@@ -866,6 +920,13 @@ pub const Renderer = struct {
             target.row_hashes[i] = 0;
         }
         target.cursor_id = packCursorId(built.cursor);
+        target.selection_id = built.selection_id;
+        target.selection_row_count = 0;
+        for (built.selection_spans) |span| {
+            if (target.selection_row_count >= target.selection_rows.len) break;
+            target.selection_rows[target.selection_row_count] = span.row;
+            target.selection_row_count += 1;
+        }
 
         // Block on the GPU pipeline before reading back. glFlush alone is
         // fire-and-forget; for a readback we need the FBO to actually have

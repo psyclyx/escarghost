@@ -134,6 +134,15 @@ pub const State = struct {
         self.last_click_cell = null;
     }
 
+    /// Snapshot the current state for the renderer pipeline. Returns
+    /// null when there's no usable selection (rest state or a 0-width
+    /// drag that hasn't moved off the anchor yet).
+    pub fn toSnapshot(self: *const State) ?Snapshot {
+        const r = self.range orelse return null;
+        if (r.isEmpty()) return null;
+        return .{ .anchor = r.anchor, .head = r.head, .mode = r.mode };
+    }
+
     fn recordClick(self: *State, cell: Cell, now_ms: i64) u8 {
         const last_cell = self.last_click_cell;
         const dt = now_ms - self.last_click_ms;
@@ -152,6 +161,22 @@ pub const State = struct {
         return self.consecutive_clicks;
     }
 };
+
+/// Frozen selection passed through the snapshot pipeline to the
+/// renderers. Carries the raw anchor / head so word/line resolution can
+/// happen at render time with access to the grid codepoints.
+pub const Snapshot = struct {
+    anchor: Cell,
+    head: Cell,
+    mode: Mode,
+
+    pub fn ordered(self: Snapshot) struct { start: Cell, end: Cell } {
+        if (Cell.lessThan(self.anchor, self.head))
+            return .{ .start = self.anchor, .end = self.head };
+        return .{ .start = self.head, .end = self.anchor };
+    }
+};
+
 
 /// Classify a codepoint as a "word" character for word selection. Mirrors
 /// xterm's `charClass` philosophy: alphanumerics plus a few common
