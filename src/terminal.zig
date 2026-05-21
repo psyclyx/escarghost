@@ -201,6 +201,7 @@ pub const Terminal = struct {
         return .{ .total = sb.total, .offset = sb.offset, .len = sb.len };
     }
 
+
     pub fn updateRenderState(self: *Terminal) !void {
         if (c.ghostty_render_state_update(self.render_state, self.handle) != c.GHOSTTY_SUCCESS)
             return error.RenderStateUpdateFailed;
@@ -401,6 +402,47 @@ pub const Terminal = struct {
             .tag = c.GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
             .value = .{ .delta = 0 },
         });
+    }
+
+    pub fn isBracketedPaste(self: *Terminal) bool {
+        var v: bool = false;
+        // GHOSTTY_MODE_BRACKETED_PASTE is a non-ANSI mode (DEC 2004);
+        // Zig's C translator chokes on the macro because the header
+        // uses `false` from <stdbool.h> as a c_int. Encode it manually:
+        // low 15 bits = mode value, bit 15 = ansi flag (0 for DEC modes).
+        const mode_bracketed_paste: c.GhosttyMode = 2004;
+        _ = c.ghostty_terminal_mode_get(self.handle, mode_bracketed_paste, &v);
+        return v;
+    }
+
+    /// Encode `text` for paste into the PTY. Strips unsafe control
+    /// bytes and wraps in bracketed-paste markers when the terminal
+    /// has DEC mode 2004 set. Returns a freshly-allocated buffer the
+    /// caller owns.
+    pub fn encodePaste(self: *Terminal, allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+        const bracketed = self.isBracketedPaste();
+        const in_copy = try allocator.alloc(u8, text.len);
+        defer allocator.free(in_copy);
+        @memcpy(in_copy, text);
+
+        var needed: usize = 0;
+        const probe = c.ghostty_paste_encode(in_copy.ptr, in_copy.len, bracketed, null, 0, &needed);
+        if (probe != c.GHOSTTY_SUCCESS and probe != c.GHOSTTY_OUT_OF_SPACE) return null;
+        const out = try allocator.alloc(u8, needed);
+        errdefer allocator.free(out);
+        var written: usize = 0;
+        const result = c.ghostty_paste_encode(in_copy.ptr, in_copy.len, bracketed, out.ptr, out.len, &written);
+        if (result != c.GHOSTTY_SUCCESS) {
+            allocator.free(out);
+            return null;
+        }
+        // Trim to the actual encoded length (out may be larger than
+        // needed when no bracketing is added).
+        if (written < out.len) {
+            const trimmed = try allocator.realloc(out, written);
+            return trimmed;
+        }
+        return out;
     }
 
     // Persistent buffer for encoded key output (avoids dangling stack pointer)

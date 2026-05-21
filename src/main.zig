@@ -13,6 +13,7 @@ const gpu_renderer = @import("gpu_renderer.zig");
 const perf = @import("perf.zig");
 const selection_mod = @import("selection.zig");
 const render_snapshot = @import("render_snapshot.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -101,6 +102,7 @@ fn setCloseOnExec(fd: c_int) void {
 // Shared state for callbacks
 var g_term: *terminal_mod.Terminal = undefined;
 var g_pty: *pty_mod.Pty = undefined;
+var g_wayland: *wayland_mod.Wayland = undefined;
 var g_atlas_ref: *atlas_ref_mod.AtlasRef = undefined;
 var g_font_size: f32 = 14.0;
 var g_cell_width: f32 = 0;
@@ -132,6 +134,8 @@ const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 /// Hover detection: pointer is within this many pixels of the right edge.
 const SCROLLBAR_HOVER_WIDTH: f64 = 16.0;
 var g_scrollbar_visible_until_ns: u64 = 0;
+/// Global clipboard manager. Initialized once Wayland is bound.
+var g_clipboard: ?*clipboard_mod.Manager = null;
 /// Tracks whether the previous render observed a visible scrollbar.
 /// Used to decide whether the hide-timeout still needs to redirty the
 /// frame (otherwise we'd never repaint to clear the scrollbar after
@@ -465,6 +469,16 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
                 markRenderDirty();
                 return;
             },
+            // Copy: Ctrl+Shift+C
+            xkb_syms.XKB_KEY_C, xkb_syms.XKB_KEY_c => {
+                copySelectionToClipboard();
+                return;
+            },
+            // Paste: Ctrl+Shift+V
+            xkb_syms.XKB_KEY_V, xkb_syms.XKB_KEY_v => {
+                pasteFromClipboard(.clipboard);
+                return;
+            },
             // Debug: Ctrl+Shift+F1/F2/F3
             xkb_syms.XKB_KEY_F1 => {
                 debugKillActiveRenderer();
@@ -580,13 +594,25 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
                     g_selection.beginPrimary(cell, ev.mods.shift, nowMs());
                     markRenderDirty();
                 },
+                BTN_MIDDLE => {
+                    // Middle-click paste: read primary selection and
+                    // write to the pty. No-op when no primary owner.
+                    pasteFromClipboard(.primary);
+                },
                 else => {},
             }
         },
         .button_release => {
             switch (ev.button) {
                 BTN_LEFT => {
+                    const had_selection = g_selection.range != null;
                     g_selection.endDrag();
+                    // Drag finished with non-empty selection: claim
+                    // the primary selection so middle-click in
+                    // another app pastes our text.
+                    if (had_selection and g_selection.range != null) {
+                        copyToPrimary();
+                    }
                     markRenderDirty();
                 },
                 else => {},
@@ -609,6 +635,174 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
 
 fn bumpScrollbarVisibility() void {
     g_scrollbar_visible_until_ns = monotonicNowNs() + SCROLLBAR_HIDE_DELAY_NS;
+}
+
+/// Copy the current selection to the regular clipboard (Ctrl+Shift+C).
+/// Silent no-op when there's nothing selected or no Wayland clipboard
+/// support is available.
+fn copySelectionToClipboard() void {
+    const mgr = g_clipboard orelse return;
+    const allocator = std.heap.smp_allocator;
+    const text = extractSelectionText(allocator) catch return orelse return;
+    const serial = g_wayland.last_input_serial;
+    mgr.setText(.clipboard, text, serial) catch {
+        allocator.free(text);
+    };
+}
+
+/// Stamp the current selection onto the primary selection so middle-
+/// click paste in other apps works. Called when a drag ends with a
+/// non-empty range.
+fn copyToPrimary() void {
+    const mgr = g_clipboard orelse return;
+    const allocator = std.heap.smp_allocator;
+    const text = extractSelectionText(allocator) catch return orelse return;
+    const serial = g_wayland.last_input_serial;
+    mgr.setText(.primary, text, serial) catch {
+        allocator.free(text);
+    };
+}
+
+/// Read the named clipboard channel and write the bytes to the PTY,
+/// wrapped in bracketed-paste markers if the terminal asked for them.
+fn pasteFromClipboard(kind: clipboard_mod.Kind) void {
+    const mgr = g_clipboard orelse return;
+    const allocator = std.heap.smp_allocator;
+    const text = (mgr.getText(kind, allocator, 200) catch return) orelse return;
+    defer allocator.free(text);
+    writePasteToPty(text);
+}
+
+/// Forward a paste buffer to the PTY. Defers to terminal.encodePaste
+/// which strips unsafe bytes and applies bracketed-paste wrapping.
+fn writePasteToPty(text: []const u8) void {
+    const allocator = std.heap.smp_allocator;
+    const encoded = g_term.encodePaste(allocator, text) catch return orelse return;
+    defer allocator.free(encoded);
+    g_pty.write(encoded) catch {};
+    g_term.scrollToBottom();
+    markRenderDirty();
+}
+
+/// Read the current row's codepoints into `out` from the live terminal
+/// render state. Returns the column count actually read (≤ out.len).
+/// Used by selection extraction to expand word selections and to trim
+/// trailing whitespace at copy time.
+fn fetchRowCodepoints(target_row: u16, out: []u32) usize {
+    g_term.updateRenderState() catch return 0;
+    g_term.beginRowIteration();
+    var row_idx: u16 = 0;
+    while (g_term.nextRow()) : (row_idx += 1) {
+        if (row_idx != target_row) continue;
+        g_term.beginCellIteration();
+        var col: usize = 0;
+        while (g_term.nextCell() and col < out.len) : (col += 1) {
+            const info = g_term.getCellInfo();
+            out[col] = if (info.has_text) info.codepoint else ' ';
+        }
+        return col;
+    }
+    return 0;
+}
+
+/// Allocate and fill a UTF-8 buffer with the currently-selected text.
+/// Returns null when there's nothing to copy. Caller frees with the
+/// same allocator. Word and line modes are resolved live from the
+/// terminal's current render state (matches what's on screen).
+fn extractSelectionText(allocator: std.mem.Allocator) !?[]u8 {
+    const snap = g_selection.toSnapshot() orelse return null;
+    const cols = g_term.colCount();
+    const rows = g_term.rowCount();
+    if (cols == 0 or rows == 0) return null;
+
+    // Resolve the selection into per-row spans (inclusive end_col).
+    // Char mode uses the snapshot's raw anchor/head; word mode
+    // expands each endpoint to a word boundary using the row's
+    // codepoints; line mode covers full rows.
+    var spans_buf: [render_snapshot.MaxRows]selection_mod.RowSpan = undefined;
+    var n_spans: usize = 0;
+    var row_cp_buf: [render_snapshot.MaxCols]u32 = undefined;
+
+    switch (snap.mode) {
+        .char => {
+            const ord = snap.ordered();
+            const start = clampCell(ord.start, rows, cols);
+            const end = clampCell(ord.end, rows, cols);
+            var row: u16 = start.row;
+            while (row <= end.row and n_spans < spans_buf.len) : (row += 1) {
+                const sc: u16 = if (row == start.row) start.col else 0;
+                const ec: u16 = if (row == end.row) end.col else cols - 1;
+                if (ec >= sc) {
+                    spans_buf[n_spans] = .{ .row = row, .start_col = sc, .end_col = ec };
+                    n_spans += 1;
+                }
+            }
+        },
+        .word => {
+            const a_words = expandWordLive(snap.anchor, cols, &row_cp_buf);
+            const h_words = expandWordLive(snap.head, cols, &row_cp_buf);
+            const start_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(a_words.start, h_words.start)) a_words.start else h_words.start;
+            const end_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(a_words.end, h_words.end)) h_words.end else a_words.end;
+            const start = clampCell(start_cell, rows, cols);
+            const end = clampCell(end_cell, rows, cols);
+            var row: u16 = start.row;
+            while (row <= end.row and n_spans < spans_buf.len) : (row += 1) {
+                const sc: u16 = if (row == start.row) start.col else 0;
+                const ec: u16 = if (row == end.row) end.col else cols - 1;
+                spans_buf[n_spans] = .{ .row = row, .start_col = sc, .end_col = ec };
+                n_spans += 1;
+            }
+        },
+        .line => {
+            const ord = snap.ordered();
+            const start_row: u16 = @min(ord.start.row, rows - 1);
+            const end_row: u16 = @min(ord.end.row, rows - 1);
+            var row: u16 = start_row;
+            while (row <= end_row and n_spans < spans_buf.len) : (row += 1) {
+                spans_buf[n_spans] = .{ .row = row, .start_col = 0, .end_col = cols - 1 };
+                n_spans += 1;
+            }
+        },
+    }
+
+    if (n_spans == 0) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < n_spans) : (i += 1) {
+        const span_raw = spans_buf[i];
+        const row_n = fetchRowCodepoints(span_raw.row, row_cp_buf[0..cols]);
+        const span = selection_mod.trimSpanRight(row_cp_buf[0..row_n], span_raw);
+        var col: u16 = span.start_col;
+        while (col <= span.end_col) : (col += 1) {
+            const cp: u32 = if (col < row_n) row_cp_buf[col] else ' ';
+            var tmp: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch continue;
+            try out.appendSlice(allocator, tmp[0..n]);
+        }
+        if (i + 1 < n_spans) try out.append(allocator, '\n');
+    }
+
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(allocator);
+}
+
+fn clampCell(cell: selection_mod.Cell, rows: u16, cols: u16) selection_mod.Cell {
+    return .{ .row = @min(cell.row, rows - 1), .col = @min(cell.col, cols - 1) };
+}
+
+fn expandWordLive(cell: selection_mod.Cell, cols: u16, row_cp_buf: *[render_snapshot.MaxCols]u32) struct { start: selection_mod.Cell, end: selection_mod.Cell } {
+    const row_n = fetchRowCodepoints(cell.row, row_cp_buf[0..cols]);
+    if (row_n == 0 or cell.col >= row_n) {
+        return .{ .start = cell, .end = cell };
+    }
+    const w = selection_mod.expandWord(row_cp_buf[0..row_n], cell.col);
+    return .{
+        .start = .{ .row = cell.row, .col = w.start },
+        .end = .{ .row = cell.row, .col = w.end },
+    };
 }
 
 /// Compute the scrollbar overlay for this snapshot. Returns null when
@@ -1029,6 +1223,23 @@ pub fn main(init: std.process.Init) !void {
 
     g_term = &term;
     g_pty = &pty;
+    g_wayland = &wl;
+
+    // Bring up the clipboard manager now that the seat-bound
+    // data/primary devices exist. Use a stable address (declared on
+    // main's stack) so the listeners' raw data pointer survives
+    // every event for the program's lifetime.
+    var clipboard = clipboard_mod.Manager.init(
+        allocator,
+        @ptrCast(wl.display),
+        if (wl.data_device) |d| @ptrCast(d) else null,
+        if (wl.primary_selection_device) |d| @ptrCast(d) else null,
+        if (wl.data_device_manager) |m| @ptrCast(m) else null,
+        if (wl.primary_selection_manager) |m| @ptrCast(m) else null,
+    );
+    defer clipboard.deinit();
+    clipboard.bindListeners();
+    g_clipboard = &clipboard;
     wl.on_key = onKey;
     wl.on_mouse = onMouse;
     wl.on_resize = onResize;

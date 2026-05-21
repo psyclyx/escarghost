@@ -214,6 +214,27 @@ pub fn expandWord(row_codepoints: []const u32, col: u16) struct { start: u16, en
     return .{ .start = start, .end = end };
 }
 
+/// Per-row [start_col, end_col] (inclusive) span covering selected
+/// cells. Renderer and clipboard extractor both build a slice of
+/// these from the live snapshot + grid codepoints.
+pub const RowSpan = struct {
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+};
+
+/// Trim trailing whitespace columns from a span using the row's
+/// codepoints — copying a line should preserve trailing whitespace
+/// only when the user actively highlighted past EOL.
+pub fn trimSpanRight(row_codepoints: []const u32, span: RowSpan) RowSpan {
+    var end = span.end_col;
+    while (end > span.start_col) : (end -= 1) {
+        const cp = if (end < row_codepoints.len) row_codepoints[end] else ' ';
+        if (cp != ' ' and cp != '\t' and cp != 0) break;
+    }
+    return .{ .row = span.row, .start_col = span.start_col, .end_col = end };
+}
+
 // ── tests ──
 
 test "Cell.lessThan and ordered" {
