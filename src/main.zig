@@ -49,31 +49,14 @@ fn setCloseOnExec(fd: c_int) void {
     _ = c.fcntl(fd, c.F_SETFD, flags | c.FD_CLOEXEC);
 }
 
-// Shared state for callbacks
-var g_term: *terminal_mod.Terminal = undefined;
-var g_pty: *pty_mod.Pty = undefined;
-var g_wayland: *wayland_mod.Wayland = undefined;
-var g_atlas_ref: *atlas_ref_mod.AtlasRef = undefined;
-var g_font_size: f32 = 14.0;
-var g_cell_width: f32 = 0;
-var g_cell_height: f32 = 0;
-var g_viewport_w: u32 = 0;
-var g_viewport_h: u32 = 0;
+// Wayland callbacks (wayland.zig:145-148) are bare function pointers with
+// no userdata, so the four on_* handlers reach AppState via this static.
+// Bound in main() once `state` is fully populated. Migrates into
+// input.zig in the next refactor commit.
+var s_app: *app_state.AppState = undefined;
 
-var g_scroll_lines: u32 = 3;
-var g_needs_redraw: bool = false;
-var g_gpu_snapshot_dirty: bool = false;
-var g_gpu_reconfigure_requested: bool = false;
-var g_render_serial: u32 = 0;
-
-/// Mouse / selection state. Selection rendering and clipboard hooks
-/// consume this. `g_selection` is the live state machine; `g_pointer_x/y`
-/// is the latest known pointer position in surface pixels (already
-/// converted from Wayland's fixed-point form in wayland.zig).
-var g_selection: selection_mod.State = .{};
-var g_pointer_x: f64 = 0;
-var g_pointer_y: f64 = 0;
-var g_pointer_in_surface: bool = false;
+const RenderPath = app_state.RenderPath;
+const GpuRestartBackoff = app_state.GpuRestartBackoff;
 
 /// Scrollbar overlay state. The scrollbar is shown on scroll events
 /// and when the pointer hovers near the right edge; otherwise hidden
@@ -83,48 +66,11 @@ var g_pointer_in_surface: bool = false;
 const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 /// Hover detection: pointer is within this many pixels of the right edge.
 const SCROLLBAR_HOVER_WIDTH: f64 = 16.0;
-var g_scrollbar_visible_until_ns: u64 = 0;
-/// Global clipboard manager. Initialized once Wayland is bound.
-var g_clipboard: ?*clipboard_mod.Manager = null;
-/// Tracks whether the previous render observed a visible scrollbar.
-/// Used to decide whether the hide-timeout still needs to redirty the
-/// frame (otherwise we'd never repaint to clear the scrollbar after
-/// idle).
-var g_scrollbar_was_visible: bool = false;
-
-// Drain-phase tracking. After the PTY child exits we keep looping until a
-// frame containing its final output has been committed; these two flags
-// tell us when that has happened so we can exit instead of waiting on the
-// 250 ms watchdog.
-var g_first_pty_data_seen: bool = false;
-var g_first_content_painted: bool = false;
-
-// All diagnostics state — commit trace, phase timers, mem peaks, stale
-// frame stats, lifecycle timestamps. Mostly active only under
-// SCRGO_LOG=commits / SCRGO_LOG=frames. Configured once in main after
-// debug flags are parsed.
-var diag: diagnostics.Diagnostics = .{};
 
 fn markFirstContentPaint() void {
-    if (g_first_content_painted or !g_first_pty_data_seen) return;
-    g_first_content_painted = true;
+    if (s_app.lifecycle.first_content_painted or !s_app.lifecycle.first_pty_data_seen) return;
+    s_app.lifecycle.first_content_painted = true;
 }
-
-// Debug state (set in main, used by debug key handlers)
-var g_gpu: *gpu_renderer.Frontend = undefined;
-var g_cpu: *cpu_renderer_worker.Frontend = undefined;
-var g_active_render_path: *RenderPath = undefined;
-var g_gpu_restart: *GpuRestartBackoff = undefined;
-var g_atlas_thread: *atlas_owner.Frontend = undefined;
-var g_target_render_path: RenderPath = .gpu;
-
-const RenderPath = enum {
-    cpu,
-    gpu,
-};
-
-var g_renderer_debug: render_env.RendererDebug = .{};
-var g_warn_slow_budget_ms: ?u32 = null;
 
 fn rendererDebugOptions() render_env.RendererDebug {
     if (getenv("SCRGO_LOG")) |value|
@@ -133,110 +79,47 @@ fn rendererDebugOptions() render_env.RendererDebug {
 }
 
 fn debugStartupEnabled() bool {
-    return g_renderer_debug.startup;
+    return s_app.debug.renderer_debug.startup;
 }
 
 fn debugRenderersEnabled() bool {
-    return g_renderer_debug.renderers;
+    return s_app.debug.renderer_debug.renderers;
 }
 
 fn debugFramesEnabled() bool {
-    return g_renderer_debug.frames;
+    return s_app.debug.renderer_debug.frames;
 }
 
 fn debugPtyEnabled() bool {
-    return g_renderer_debug.pty;
+    return s_app.debug.renderer_debug.pty;
 }
 
 fn markRenderDirty() void {
-    g_render_serial +%= 1;
-    if (g_render_serial == 0) g_render_serial = 1;
-    g_needs_redraw = true;
-    g_gpu_snapshot_dirty = true;
+    s_app.render.render_serial +%= 1;
+    if (s_app.render.render_serial == 0) s_app.render.render_serial = 1;
+    s_app.render.needs_redraw = true;
+    s_app.render.gpu_snapshot_dirty = true;
 }
 
-const GpuRestartBackoff = struct {
-    initial_delay_ms: u32,
-    max_delay_ms: u32,
-    jitter_percent: u32,
-    deadline_ns: ?u64 = null,
-    attempts: u32 = 0,
-    prng: std.Random.DefaultPrng,
-
-    fn init(
-        initial_delay_ms: u32,
-        max_delay_ms: u32,
-        jitter_percent: u32,
-    ) GpuRestartBackoff {
-        return .{
-            .initial_delay_ms = initial_delay_ms,
-            .max_delay_ms = @max(initial_delay_ms, max_delay_ms),
-            .jitter_percent = jitter_percent,
-            .prng = std.Random.DefaultPrng.init(monotonicNowNs()),
-        };
-    }
-
-    fn clear(self: *GpuRestartBackoff) void {
-        self.deadline_ns = null;
-        self.attempts = 0;
-    }
-
-    fn scheduleImmediate(self: *GpuRestartBackoff) void {
-        self.deadline_ns = monotonicNowNs();
-    }
-
-    fn scheduleRetry(self: *GpuRestartBackoff) void {
-        const shift = @min(self.attempts, 31);
-        const scaled = (@as(u64, self.initial_delay_ms) << @intCast(shift));
-        const capped = @min(scaled, @as(u64, self.max_delay_ms));
-        const base_delay_ms: u32 = @intCast(capped);
-        const jitter_pct = @min(self.jitter_percent, 1000);
-        const jitter_span = @as(u64, base_delay_ms) * jitter_pct / 100;
-        const min_delay: u32 = @intCast(base_delay_ms -| @as(u32, @intCast(@min(jitter_span, base_delay_ms))));
-        const max_delay: u32 = @intCast(@min(@as(u64, self.max_delay_ms), @as(u64, base_delay_ms) + jitter_span));
-        const delay_ms = if (min_delay < max_delay)
-            self.prng.random().intRangeAtMost(u32, min_delay, max_delay)
-        else
-            min_delay;
-
-        self.deadline_ns = monotonicNowNs() + @as(u64, delay_ms) * std.time.ns_per_ms;
-        self.attempts +|= 1;
-    }
-
-    fn due(self: *const GpuRestartBackoff) bool {
-        const deadline_ns = self.deadline_ns orelse return false;
-        return monotonicNowNs() >= deadline_ns;
-    }
-
-    fn timeoutMs(self: *const GpuRestartBackoff) ?c_int {
-        const deadline_ns = self.deadline_ns orelse return null;
-        const now_ns = monotonicNowNs();
-        if (deadline_ns <= now_ns) return 0;
-        const delta_ns = deadline_ns - now_ns;
-        const delta_ms = @max(@as(u64, 1), delta_ns / std.time.ns_per_ms);
-        return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
-    }
-};
-
 fn debugKillActiveRenderer() void {
-    if (g_active_render_path.* == .gpu and g_gpu.active) {
-        noteGpuUnavailable(g_gpu, g_active_render_path, g_gpu_restart);
+    if (s_app.render.active_render_path == .gpu and s_app.refs.gpu.active) {
+        noteGpuUnavailable(s_app.refs.gpu, &s_app.render.active_render_path, &s_app.render.gpu_restart);
         std.debug.print("scrgo: debug: killed gpu renderer\n", .{});
-    } else if (g_cpu.active) {
-        g_cpu.stop();
+    } else if (s_app.refs.cpu.active) {
+        s_app.refs.cpu.stop();
         std.debug.print("scrgo: debug: killed cpu renderer\n", .{});
     }
 }
 
 fn debugSwapRenderer() void {
-    if (g_target_render_path == .gpu) {
-        g_target_render_path = .cpu;
-        g_active_render_path.* = .cpu;
-        g_needs_redraw = true;
+    if (s_app.render.target_render_path == .gpu) {
+        s_app.render.target_render_path = .cpu;
+        s_app.render.active_render_path = .cpu;
+        s_app.render.needs_redraw = true;
         std.debug.print("scrgo: debug: target renderer -> cpu\n", .{});
     } else {
-        g_target_render_path = .gpu;
-        g_gpu_snapshot_dirty = true;
+        s_app.render.target_render_path = .gpu;
+        s_app.render.gpu_snapshot_dirty = true;
         std.debug.print("scrgo: debug: target renderer -> gpu\n", .{});
     }
 }
@@ -272,32 +155,32 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
             },
             // Scroll: Ctrl+Shift+Up/Down/PageUp/PageDown/Home/End
             xkb_syms.XKB_KEY_Up => {
-                g_term.scrollViewport(-1);
+                s_app.refs.term.scrollViewport(-1);
                 markRenderDirty();
                 return;
             },
             xkb_syms.XKB_KEY_Down => {
-                g_term.scrollViewport(1);
+                s_app.refs.term.scrollViewport(1);
                 markRenderDirty();
                 return;
             },
             xkb_syms.XKB_KEY_Page_Up => {
-                g_term.scrollViewport(-@as(isize, g_scroll_lines * 10));
+                s_app.refs.term.scrollViewport(-@as(isize, s_app.metrics.scroll_lines * 10));
                 markRenderDirty();
                 return;
             },
             xkb_syms.XKB_KEY_Page_Down => {
-                g_term.scrollViewport(@as(isize, g_scroll_lines * 10));
+                s_app.refs.term.scrollViewport(@as(isize, s_app.metrics.scroll_lines * 10));
                 markRenderDirty();
                 return;
             },
             xkb_syms.XKB_KEY_Home => {
-                g_term.scrollToTop();
+                s_app.refs.term.scrollToTop();
                 markRenderDirty();
                 return;
             },
             xkb_syms.XKB_KEY_End => {
-                g_term.scrollToBottom();
+                s_app.refs.term.scrollToBottom();
                 markRenderDirty();
                 return;
             },
@@ -331,12 +214,12 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.mods.shift and !ev.mods.ctrl) {
         switch (ev.keysym) {
             xkb_syms.XKB_KEY_Page_Up => {
-                g_term.scrollViewport(-@as(isize, g_scroll_lines * 10));
+                s_app.refs.term.scrollViewport(-@as(isize, s_app.metrics.scroll_lines * 10));
                 markRenderDirty();
                 return;
             },
             xkb_syms.XKB_KEY_Page_Down => {
-                g_term.scrollViewport(@as(isize, g_scroll_lines * 10));
+                s_app.refs.term.scrollViewport(@as(isize, s_app.metrics.scroll_lines * 10));
                 markRenderDirty();
                 return;
             },
@@ -353,22 +236,22 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
         // actual content arrives. Marking dirty before the echo
         // triggers a wasted render of pre-keystroke state, costing one
         // vsync — measured as ~17ms of extra input latency.
-        g_term.scrollToBottom();
-        g_pty.write(text) catch {};
+        s_app.refs.term.scrollToBottom();
+        s_app.refs.pty.write(text) catch {};
         return;
     }
 
     const gkey = keysymToGhosttyKey(ev.keysym);
     if (gkey != 0) {
-        g_term.scrollToBottom();
-        const encoded = g_term.encodeKey(
+        s_app.refs.term.scrollToBottom();
+        const encoded = s_app.refs.term.encodeKey(
             gkey,
             ghostty_c.GHOSTTY_KEY_ACTION_PRESS,
             modsToGhostty(ev.mods),
             null,
         );
         if (encoded) |data| {
-            g_pty.write(data) catch {};
+            s_app.refs.pty.write(data) catch {};
         }
     }
 }
@@ -387,17 +270,17 @@ const BTN_MIDDLE: u32 = 0x112;
 /// produces a valid cell, then offsets by the current viewport top so
 /// the resulting Cell stays valid as the terminal scrolls.
 fn pixelToCell(x: f64, y: f64) ?selection_mod.Cell {
-    if (g_cell_width <= 0 or g_cell_height <= 0) return null;
-    const term_cols = g_term.colCount();
-    const term_rows = g_term.rowCount();
+    if (s_app.metrics.cell_width <= 0 or s_app.metrics.cell_height <= 0) return null;
+    const term_cols = s_app.refs.term.colCount();
+    const term_rows = s_app.refs.term.rowCount();
     if (term_cols == 0 or term_rows == 0) return null;
-    const col_f = @floor(x / g_cell_width);
-    const row_f = @floor(y / g_cell_height);
+    const col_f = @floor(x / s_app.metrics.cell_width);
+    const row_f = @floor(y / s_app.metrics.cell_height);
     const col_i = @as(i32, @intFromFloat(@max(0.0, col_f)));
     const row_i = @as(i32, @intFromFloat(@max(0.0, row_f)));
     const col: u16 = @intCast(@min(@as(i32, term_cols - 1), col_i));
     const view_row: u16 = @intCast(@min(@as(i32, term_rows - 1), row_i));
-    const sb = g_term.scrollbar();
+    const sb = s_app.refs.term.scrollbar();
     const screen_y: u32 = @intCast(@min(sb.offset + view_row, std.math.maxInt(u32)));
     return .{ .row = screen_y, .col = col };
 }
@@ -409,18 +292,18 @@ fn nowMs() i64 {
 }
 
 fn onMouse(ev: wayland_mod.MouseEvent) void {
-    g_pointer_x = ev.x;
-    g_pointer_y = ev.y;
+    s_app.input.pointer_x = ev.x;
+    s_app.input.pointer_y = ev.y;
     switch (ev.kind) {
-        .enter => g_pointer_in_surface = true,
+        .enter => s_app.input.pointer_in_surface = true,
         .leave => {
-            g_pointer_in_surface = false;
+            s_app.input.pointer_in_surface = false;
             // Leaving the surface also kills hover detection — fall
             // back to scroll-driven visibility only.
         },
         .scroll => {
-            const lines: isize = if (ev.scroll_dy > 0) @intCast(g_scroll_lines) else -@as(isize, @intCast(g_scroll_lines));
-            g_term.scrollViewport(lines);
+            const lines: isize = if (ev.scroll_dy > 0) @intCast(s_app.metrics.scroll_lines) else -@as(isize, @intCast(s_app.metrics.scroll_lines));
+            s_app.refs.term.scrollViewport(lines);
             bumpScrollbarVisibility();
             markRenderDirty();
         },
@@ -428,7 +311,7 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
             const cell = pixelToCell(ev.x, ev.y) orelse return;
             switch (ev.button) {
                 BTN_LEFT => {
-                    g_selection.beginPrimary(cell, ev.mods.shift, nowMs());
+                    s_app.input.selection.beginPrimary(cell, ev.mods.shift, nowMs());
                     markRenderDirty();
                 },
                 BTN_MIDDLE => {
@@ -442,12 +325,12 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
         .button_release => {
             switch (ev.button) {
                 BTN_LEFT => {
-                    const had_selection = g_selection.range != null;
-                    g_selection.endDrag();
+                    const had_selection = s_app.input.selection.range != null;
+                    s_app.input.selection.endDrag();
                     // Drag finished with non-empty selection: claim
                     // the primary selection so middle-click in
                     // another app pastes our text.
-                    if (had_selection and g_selection.range != null) {
+                    if (had_selection and s_app.input.selection.range != null) {
                         copyToPrimary();
                     }
                     markRenderDirty();
@@ -456,14 +339,14 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
             }
         },
         .motion => {
-            const near_right_edge = @as(f64, @floatFromInt(g_viewport_w)) - ev.x <= SCROLLBAR_HOVER_WIDTH;
+            const near_right_edge = @as(f64, @floatFromInt(s_app.metrics.viewport_w)) - ev.x <= SCROLLBAR_HOVER_WIDTH;
             if (near_right_edge) {
                 bumpScrollbarVisibility();
                 markRenderDirty();
             }
-            if (g_selection.dragging) {
+            if (s_app.input.selection.dragging) {
                 const cell = pixelToCell(ev.x, ev.y) orelse return;
-                g_selection.updateDrag(cell);
+                s_app.input.selection.updateDrag(cell);
                 markRenderDirty();
             }
         },
@@ -471,17 +354,17 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
 }
 
 fn bumpScrollbarVisibility() void {
-    g_scrollbar_visible_until_ns = monotonicNowNs() + SCROLLBAR_HIDE_DELAY_NS;
+    s_app.input.scrollbar_visible_until_ns = monotonicNowNs() + SCROLLBAR_HIDE_DELAY_NS;
 }
 
 /// Copy the current selection to the regular clipboard (Ctrl+Shift+C).
 /// Silent no-op when there's nothing selected or no Wayland clipboard
 /// support is available.
 fn copySelectionToClipboard() void {
-    const mgr = g_clipboard orelse return;
+    const mgr = s_app.refs.clipboard orelse return;
     const allocator = std.heap.smp_allocator;
     const text = extractSelectionText(allocator) catch return orelse return;
-    const serial = g_wayland.last_input_serial;
+    const serial = s_app.refs.wayland.last_input_serial;
     mgr.setText(.clipboard, text, serial) catch {
         allocator.free(text);
     };
@@ -491,10 +374,10 @@ fn copySelectionToClipboard() void {
 /// click paste in other apps works. Called when a drag ends with a
 /// non-empty range.
 fn copyToPrimary() void {
-    const mgr = g_clipboard orelse return;
+    const mgr = s_app.refs.clipboard orelse return;
     const allocator = std.heap.smp_allocator;
     const text = extractSelectionText(allocator) catch return orelse return;
-    const serial = g_wayland.last_input_serial;
+    const serial = s_app.refs.wayland.last_input_serial;
     mgr.setText(.primary, text, serial) catch {
         allocator.free(text);
     };
@@ -503,7 +386,7 @@ fn copyToPrimary() void {
 /// Read the named clipboard channel and write the bytes to the PTY,
 /// wrapped in bracketed-paste markers if the terminal asked for them.
 fn pasteFromClipboard(kind: clipboard_mod.Kind) void {
-    const mgr = g_clipboard orelse return;
+    const mgr = s_app.refs.clipboard orelse return;
     const allocator = std.heap.smp_allocator;
     const text = (mgr.getText(kind, allocator, 200) catch return) orelse return;
     defer allocator.free(text);
@@ -514,10 +397,10 @@ fn pasteFromClipboard(kind: clipboard_mod.Kind) void {
 /// which strips unsafe bytes and applies bracketed-paste wrapping.
 fn writePasteToPty(text: []const u8) void {
     const allocator = std.heap.smp_allocator;
-    const encoded = g_term.encodePaste(allocator, text) catch return orelse return;
+    const encoded = s_app.refs.term.encodePaste(allocator, text) catch return orelse return;
     defer allocator.free(encoded);
-    g_pty.write(encoded) catch {};
-    g_term.scrollToBottom();
+    s_app.refs.pty.write(encoded) catch {};
+    s_app.refs.term.scrollToBottom();
     markRenderDirty();
 }
 
@@ -527,20 +410,20 @@ fn writePasteToPty(text: []const u8) void {
 /// the viewport (fast path) and falls back to the grid_ref-based
 /// scrollback walker for rows above or below the visible viewport.
 fn fetchRowCodepoints(target_screen_y: u32, out: []u32) usize {
-    const sb = g_term.scrollbar();
+    const sb = s_app.refs.term.scrollbar();
     // Fast path: row is inside the viewport — iterate the render
     // state, which we already update once per frame.
     if (target_screen_y >= sb.offset and target_screen_y - sb.offset < sb.len) {
         const view_row: u16 = @intCast(target_screen_y - sb.offset);
-        g_term.updateRenderState() catch return 0;
-        g_term.beginRowIteration();
+        s_app.refs.term.updateRenderState() catch return 0;
+        s_app.refs.term.beginRowIteration();
         var row_idx: u16 = 0;
-        while (g_term.nextRow()) : (row_idx += 1) {
+        while (s_app.refs.term.nextRow()) : (row_idx += 1) {
             if (row_idx != view_row) continue;
-            g_term.beginCellIteration();
+            s_app.refs.term.beginCellIteration();
             var col: usize = 0;
-            while (g_term.nextCell() and col < out.len) : (col += 1) {
-                const info = g_term.getCellInfo();
+            while (s_app.refs.term.nextCell() and col < out.len) : (col += 1) {
+                const info = s_app.refs.term.getCellInfo();
                 out[col] = if (info.has_text) info.codepoint else ' ';
             }
             return col;
@@ -551,7 +434,7 @@ fn fetchRowCodepoints(target_screen_y: u32, out: []u32) usize {
     // Slow path: row is in scrollback (above viewport) or the
     // alternate-screen-but-history case (below viewport). Use the
     // grid_ref walker to reach it.
-    return g_term.fillRowFromScreen(target_screen_y, out);
+    return s_app.refs.term.fillRowFromScreen(target_screen_y, out);
 }
 
 /// Allocate and fill a UTF-8 buffer with the currently-selected text.
@@ -560,9 +443,9 @@ fn fetchRowCodepoints(target_screen_y: u32, out: []u32) usize {
 /// outside the viewport are fetched via the grid_ref walker
 /// (terminal.fillRowFromScreen) so copy works across scrollback.
 fn extractSelectionText(allocator: std.mem.Allocator) !?[]u8 {
-    const snap = g_selection.toSnapshot() orelse return null;
-    const cols = g_term.colCount();
-    const rows = g_term.rowCount();
+    const snap = s_app.input.selection.toSnapshot() orelse return null;
+    const cols = s_app.refs.term.colCount();
+    const rows = s_app.refs.term.rowCount();
     if (cols == 0 or rows == 0) return null;
 
     var row_cp_buf: [render_snapshot.MaxCols]u32 = undefined;
@@ -646,20 +529,20 @@ fn expandWordLive(cell: selection_mod.Cell, cols: u16, row_cp_buf: *[render_snap
 /// there's no scrollback or the visibility window has elapsed. The
 /// renderer paints the overlay as a thin band on the right edge.
 fn currentScrollbarOverlay() ?render_snapshot.ScrollbarOverlay {
-    const sb = g_term.scrollbar();
+    const sb = s_app.refs.term.scrollbar();
     if (sb.total == 0 or sb.len == 0 or sb.total <= sb.len) {
-        g_scrollbar_was_visible = false;
+        s_app.input.scrollbar_was_visible = false;
         return null;
     }
     const now = monotonicNowNs();
-    if (now >= g_scrollbar_visible_until_ns) {
-        g_scrollbar_was_visible = false;
+    if (now >= s_app.input.scrollbar_visible_until_ns) {
+        s_app.input.scrollbar_was_visible = false;
         return null;
     }
     const total_f: f32 = @floatFromInt(sb.total);
     const offset_f: f32 = @floatFromInt(sb.offset);
     const len_f: f32 = @floatFromInt(sb.len);
-    g_scrollbar_was_visible = true;
+    s_app.input.scrollbar_was_visible = true;
     return .{
         // Alpha is binary for the first cut — visible vs not. Fading
         // adds per-frame redraw cost that we can layer in later.
@@ -674,10 +557,10 @@ fn currentScrollbarOverlay() ?render_snapshot.ScrollbarOverlay {
 /// scrollbar gone. Returns null when the scrollbar is already hidden
 /// (no timer needed).
 fn scrollbarTimeoutMs() ?c_int {
-    if (!g_scrollbar_was_visible) return null;
+    if (!s_app.input.scrollbar_was_visible) return null;
     const now = monotonicNowNs();
-    if (now >= g_scrollbar_visible_until_ns) return 0;
-    const delta_ns = g_scrollbar_visible_until_ns - now;
+    if (now >= s_app.input.scrollbar_visible_until_ns) return 0;
+    const delta_ns = s_app.input.scrollbar_visible_until_ns - now;
     const delta_ms = delta_ns / std.time.ns_per_ms + 1;
     return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
 }
@@ -685,54 +568,52 @@ fn scrollbarTimeoutMs() ?c_int {
 /// Called once per loop iteration. Marks a redraw if the scrollbar
 /// hide timer has elapsed and the previous frame still showed it.
 fn maybeScheduleScrollbarHide() void {
-    if (!g_scrollbar_was_visible) return;
-    if (monotonicNowNs() < g_scrollbar_visible_until_ns) return;
+    if (!s_app.input.scrollbar_was_visible) return;
+    if (monotonicNowNs() < s_app.input.scrollbar_visible_until_ns) return;
     markRenderDirty();
 }
 
-var g_base_font_size: f32 = 14.0;
-
 fn zoomIn() void {
-    g_font_size = @min(g_font_size + 1.0, 72.0);
+    s_app.metrics.font_size = @min(s_app.metrics.font_size + 1.0, 72.0);
     applyZoom();
 }
 
 fn zoomOut() void {
-    g_font_size = @max(g_font_size - 1.0, 6.0);
+    s_app.metrics.font_size = @max(s_app.metrics.font_size - 1.0, 6.0);
     applyZoom();
 }
 
 fn zoomReset() void {
-    g_font_size = g_base_font_size;
+    s_app.metrics.font_size = s_app.metrics.base_font_size;
     applyZoom();
 }
 
 fn applyZoom() void {
-    var atlas_lease = g_atlas_ref.acquire();
+    var atlas_lease = s_app.refs.atlas_ref.acquire();
     defer atlas_lease.release();
-    const cm = renderer_mod.computeCellMetrics(atlas_lease.get(), g_font_size) catch return;
-    g_cell_width = cm.cell_width;
-    g_cell_height = cm.cell_height;
+    const cm = renderer_mod.computeCellMetrics(atlas_lease.get(), s_app.metrics.font_size) catch return;
+    s_app.metrics.cell_width = cm.cell_width;
+    s_app.metrics.cell_height = cm.cell_height;
 
-    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, g_viewport_w, g_viewport_h);
+    const grid = renderer_mod.computeGridSize(s_app.metrics.cell_width, s_app.metrics.cell_height, s_app.metrics.viewport_w, s_app.metrics.viewport_h);
     if (grid.cols > 0 and grid.rows > 0) {
-        g_term.resize(grid.cols, grid.rows, @intFromFloat(g_cell_width), @intFromFloat(g_cell_height)) catch {};
-        g_pty.resize(grid.cols, grid.rows, g_viewport_w, g_viewport_h);
+        s_app.refs.term.resize(grid.cols, grid.rows, @intFromFloat(s_app.metrics.cell_width), @intFromFloat(s_app.metrics.cell_height)) catch {};
+        s_app.refs.pty.resize(grid.cols, grid.rows, s_app.metrics.viewport_w, s_app.metrics.viewport_h);
     }
 
     markRenderDirty();
-    g_gpu_reconfigure_requested = true;
+    s_app.render.gpu_reconfigure_requested = true;
 }
 
 fn onResize(w: u32, h: u32) void {
-    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, w, h);
+    const grid = renderer_mod.computeGridSize(s_app.metrics.cell_width, s_app.metrics.cell_height, w, h);
     if (grid.cols == 0 or grid.rows == 0) return;
-    g_viewport_w = w;
-    g_viewport_h = h;
-    g_term.resize(grid.cols, grid.rows, @intFromFloat(g_cell_width), @intFromFloat(g_cell_height)) catch {};
-    g_pty.resize(grid.cols, grid.rows, w, h);
+    s_app.metrics.viewport_w = w;
+    s_app.metrics.viewport_h = h;
+    s_app.refs.term.resize(grid.cols, grid.rows, @intFromFloat(s_app.metrics.cell_width), @intFromFloat(s_app.metrics.cell_height)) catch {};
+    s_app.refs.pty.resize(grid.cols, grid.rows, w, h);
     markRenderDirty();
-    g_gpu_reconfigure_requested = true;
+    s_app.render.gpu_reconfigure_requested = true;
 }
 
 fn onFocus(focused: bool) void {
@@ -740,8 +621,8 @@ fn onFocus(focused: bool) void {
 }
 
 fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mod.Wayland, term: *terminal_mod.Terminal) void {
-    if (g_target_render_path != .gpu) return;
-    if (!gpu.active or !gpu.ready or gpu.render_in_flight or !g_gpu_snapshot_dirty) return;
+    if (s_app.render.target_render_path != .gpu) return;
+    if (!gpu.active or !gpu.ready or gpu.render_in_flight or !s_app.render.gpu_snapshot_dirty) return;
     // Vsync-gate the GPU render. Without this we'd kick off the
     // render whenever PTY produced fresh data — which lands at
     // arbitrary phase inside the vsync window. If the data arrives
@@ -753,27 +634,27 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mo
     // GPU path used to skip it for a marginal latency win that
     // turned out not to be worth the missed frames.)
     if (wl.frame_pending) return;
-    gpu.queueRender(term, g_render_serial, g_selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
+    gpu.queueRender(term, s_app.render.render_serial, s_app.input.selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer
             // so we can see at exit whether compositor release
             // latency is the throughput bottleneck.
-            if (g_renderer_debug.commits or g_warn_slow_budget_ms != null) {
+            if (s_app.debug.renderer_debug.commits or s_app.debug.warn_slow_budget_ms != null) {
                 const now = monotonicNowNs();
-                if (g_buffer_starvation_start_ns == 0) g_buffer_starvation_start_ns = now;
+                if (s_app.render.buffer_starvation_start_ns == 0) s_app.render.buffer_starvation_start_ns = now;
             }
             return;
         },
         error.NotReady, error.Busy, error.NoFreeSnapshot => return,
         else => return,
     };
-    if (g_buffer_starvation_start_ns != 0) {
-        const starvation_ns = monotonicNowNs() - g_buffer_starvation_start_ns;
-        if (g_renderer_debug.commits) {
+    if (s_app.render.buffer_starvation_start_ns != 0) {
+        const starvation_ns = monotonicNowNs() - s_app.render.buffer_starvation_start_ns;
+        if (s_app.debug.renderer_debug.commits) {
             gpu_renderer.bufferStarvationAccumNs += starvation_ns;
             gpu_renderer.bufferStarvationCount += 1;
         }
-        if (g_warn_slow_budget_ms) |budget_ms| {
+        if (s_app.debug.warn_slow_budget_ms) |budget_ms| {
             const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
             if (starvation_ns > budget_ns) {
                 std.debug.print("scrgo: buffer starvation {d:.1}ms (budget {}ms) — compositor hadn't released a dmabuf\n", .{
@@ -782,15 +663,13 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mo
                 });
             }
         }
-        g_buffer_starvation_start_ns = 0;
+        s_app.render.buffer_starvation_start_ns = 0;
     }
     if (debugRenderersEnabled()) {
-        std.debug.print("scrgo: queued gpu renderer frame serial={}\n", .{g_render_serial});
+        std.debug.print("scrgo: queued gpu renderer frame serial={}\n", .{s_app.render.render_serial});
     }
-    g_gpu_snapshot_dirty = false;
+    s_app.render.gpu_snapshot_dirty = false;
 }
-
-var g_buffer_starvation_start_ns: u64 = 0;
 
 fn combineTimeout(a: c_int, b_opt: ?c_int) c_int {
     const b = b_opt orelse return a;
@@ -805,8 +684,8 @@ fn renderActivePath(
     wl: *wayland_mod.Wayland,
     term: *terminal_mod.Terminal,
 ) void {
-    if (active_path != .cpu or !g_needs_redraw) return;
-    if (g_target_render_path == .gpu and gpu.active and gpu.ready) return;
+    if (active_path != .cpu or !s_app.render.needs_redraw) return;
+    if (s_app.render.target_render_path == .gpu and gpu.active and gpu.ready) return;
     // Same vsync throttle as the GPU path — wait for the compositor to
     // ack the previous commit before queueing the next one.
     if (wl.frame_pending) return;
@@ -816,17 +695,17 @@ fn renderActivePath(
             error.Busy => return,
             else => return,
         };
-        cpu.queueRender(term, g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height, g_render_serial, g_selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
+        cpu.queueRender(term, s_app.metrics.viewport_w, s_app.metrics.viewport_h, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height, s_app.render.render_serial, s_app.input.selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
             error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,
         };
-        g_needs_redraw = false;
+        s_app.render.needs_redraw = false;
         if (debugFramesEnabled()) {
-            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, diag.elapsedMs() });
+            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, s_app.diag.elapsedMs() });
         }
         return;
     }
-    g_needs_redraw = false;
+    s_app.render.needs_redraw = false;
 }
 
 fn noteGpuUnavailable(
@@ -840,14 +719,16 @@ fn noteGpuUnavailable(
     }
     if (active_path.* == .gpu) {
         active_path.* = .cpu;
-        g_needs_redraw = true;
+        s_app.render.needs_redraw = true;
     }
     restart.scheduleRetry();
 }
 
 pub fn main(init: std.process.Init) !void {
     const startup_timer = perf.Timer.now();
-    diag.markStart();
+    var state: app_state.AppState = .{};
+    s_app = &state;
+    state.diag.markStart();
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
@@ -897,23 +778,23 @@ pub fn main(init: std.process.Init) !void {
     // ── Phase 0: config + spawn GPU thread ──
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
-    g_renderer_debug = rendererDebugOptions();
-    g_warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
-    wayland_mod.Wayland.log_frame_events = g_renderer_debug.frames;
-    diag.debug = g_renderer_debug;
+    s_app.debug.renderer_debug = rendererDebugOptions();
+    s_app.debug.warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
+    wayland_mod.Wayland.log_frame_events = s_app.debug.renderer_debug.frames;
+    s_app.diag.debug = s_app.debug.renderer_debug;
     // Background memory poller (SCRGO_LOG=commits). Mirrors what the
     // bench's poller thread sees from outside the process.
-    const mem_thread = diag.startMemPollThread();
-    defer diag.stopMemPollThread(mem_thread);
+    const mem_thread = s_app.diag.startMemPollThread();
+    defer s_app.diag.stopMemPollThread(mem_thread);
     const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
     const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: debug flags startup={} renderers={} frames={} atlas={} pty={} reset_atlas={}\n", .{
-            g_renderer_debug.startup,
-            g_renderer_debug.renderers,
-            g_renderer_debug.frames,
-            g_renderer_debug.atlas,
-            g_renderer_debug.pty,
+            s_app.debug.renderer_debug.startup,
+            s_app.debug.renderer_debug.renderers,
+            s_app.debug.renderer_debug.frames,
+            s_app.debug.renderer_debug.atlas,
+            s_app.debug.renderer_debug.pty,
             runtime_flags.reset_atlas_each_frame,
         });
         std.debug.print("scrgo: requested renderer mode={s}\n", .{@tagName(requested_render_path)});
@@ -925,7 +806,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var gpu: gpu_renderer.Frontend = .{};
-    var gpu_restart = GpuRestartBackoff.init(
+    state.render.gpu_restart = GpuRestartBackoff.init(
         cfg.gpu_restart_initial_delay_ms,
         cfg.gpu_restart_max_delay_ms,
         cfg.gpu_restart_jitter_percent,
@@ -947,7 +828,7 @@ pub fn main(init: std.process.Init) !void {
     if (gpu_allowed) {
         gpu.start() catch |err| {
             std.debug.print("scrgo: gpu renderer thread start failed: {}\n", .{err});
-            gpu_restart.scheduleRetry();
+            state.render.gpu_restart.scheduleRetry();
         };
         if (debugStartupEnabled()) {
             std.debug.print("scrgo: gpu renderer thread started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
@@ -970,7 +851,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpu.stop(); // must run before wl.deinit() to destroy wayland buffers first
 
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
-        diag.recordCommit('b');
+        s_app.diag.recordCommit('b');
         if (debugStartupEnabled()) {
             std.debug.print("scrgo: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
@@ -979,7 +860,7 @@ pub fn main(init: std.process.Init) !void {
         if (bg_frame) |*frame| {
             frame.fillBackground(cfg.background);
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-            diag.recordCommit('b');
+            s_app.diag.recordCommit('b');
             if (debugStartupEnabled()) {
                 std.debug.print("scrgo: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
@@ -999,7 +880,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer allocator.free(atlas_thread.bootstrap_font_path);
     const atlas_ref_ptr = atlas_thread.atlas_ref;
-    g_atlas_ref = atlas_ref_ptr;
+    s_app.refs.atlas_ref = atlas_ref_ptr;
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
@@ -1007,13 +888,13 @@ pub fn main(init: std.process.Init) !void {
     var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
     defer bootstrap_atlas_lease.release();
     const cell_metrics = try renderer_mod.computeCellMetrics(bootstrap_atlas_lease.get(), cfg.font_size);
-    g_font_size = cfg.font_size;
-    g_cell_width = cell_metrics.cell_width;
-    g_cell_height = cell_metrics.cell_height;
+    s_app.metrics.font_size = cfg.font_size;
+    s_app.metrics.cell_width = cell_metrics.cell_width;
+    s_app.metrics.cell_height = cell_metrics.cell_height;
 
-    const grid = renderer_mod.computeGridSize(g_cell_width, g_cell_height, wl.width, wl.height);
-    g_viewport_w = wl.width;
-    g_viewport_h = wl.height;
+    const grid = renderer_mod.computeGridSize(s_app.metrics.cell_width, s_app.metrics.cell_height, wl.width, wl.height);
+    s_app.metrics.viewport_w = wl.width;
+    s_app.metrics.viewport_h = wl.height;
 
     // ── Phase 3: fork PTY (while atlas init continues in background) ──
     var pty = if (exec_argv.items.len > 0)
@@ -1051,10 +932,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
-        gpu.requestConfigure(wl.width, wl.height, g_font_size, g_cell_width, g_cell_height) catch |err| {
+        gpu.requestConfigure(wl.width, wl.height, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height) catch |err| {
             std.debug.print("scrgo: gpu renderer initial configure failed: {}\n", .{err});
             gpu.stop();
-            gpu_restart.scheduleRetry();
+            state.render.gpu_restart.scheduleRetry();
         };
         if (debugStartupEnabled()) {
             std.debug.print("scrgo: gpu renderer configured ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
@@ -1065,9 +946,9 @@ pub fn main(init: std.process.Init) !void {
 
     term.pty_fd = pty.master_fd;
 
-    g_term = &term;
-    g_pty = &pty;
-    g_wayland = &wl;
+    s_app.refs.term = &term;
+    s_app.refs.pty = &pty;
+    s_app.refs.wayland = &wl;
 
     // Bring up the clipboard manager now that the seat-bound
     // data/primary devices exist. Use a stable address (declared on
@@ -1083,25 +964,23 @@ pub fn main(init: std.process.Init) !void {
     );
     defer clipboard.deinit();
     clipboard.bindListeners();
-    g_clipboard = &clipboard;
+    s_app.refs.clipboard = &clipboard;
     wl.on_key = onKey;
     wl.on_mouse = onMouse;
     wl.on_resize = onResize;
     wl.on_focus = onFocus;
-    g_scroll_lines = cfg.scroll_lines;
-    g_base_font_size = cfg.font_size;
-    g_needs_redraw = false;
-    g_gpu_snapshot_dirty = false;
-    g_gpu_reconfigure_requested = false;
-    g_render_serial = 0;
+    s_app.metrics.scroll_lines = cfg.scroll_lines;
+    s_app.metrics.base_font_size = cfg.font_size;
+    s_app.render.needs_redraw = false;
+    s_app.render.gpu_snapshot_dirty = false;
+    s_app.render.gpu_reconfigure_requested = false;
+    s_app.render.render_serial = 0;
 
     // ── Phase 5: early PTY drain + event loop ──
-    var active_render_path: RenderPath = .cpu;
-    g_gpu = &gpu;
-    g_cpu = &cpu;
-    g_active_render_path = &active_render_path;
-    g_gpu_restart = &gpu_restart;
-    g_atlas_thread = &atlas_thread;
+    state.refs.gpu = &gpu;
+    state.refs.cpu = &cpu;
+    state.refs.atlas_thread = &atlas_thread;
+    state.render.active_render_path = .cpu;
 
     // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
     var pty_buf: [65536]u8 = undefined;
@@ -1120,8 +999,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     main_loop: while (!wl.closed) {
-        if (g_renderer_debug.commits and child_exited and diag.t_child_exited_ns == 0) {
-            diag.t_child_exited_ns = monotonicNowNs() - diag.commit_trace_start_ns;
+        if (s_app.debug.renderer_debug.commits and child_exited and s_app.diag.t_child_exited_ns == 0) {
+            s_app.diag.t_child_exited_ns = monotonicNowNs() - s_app.diag.commit_trace_start_ns;
         }
         if (child_exited and !draining) {
             // Slurp any bytes still buffered on the master before the kernel
@@ -1130,7 +1009,7 @@ pub fn main(init: std.process.Init) !void {
                 const n = pty.read(&pty_buf) catch break;
                 if (n == 0) break;
                 term.feedData(pty_buf[0..n]);
-                g_first_pty_data_seen = true;
+                s_app.lifecycle.first_pty_data_seen = true;
                 markRenderDirty();
             }
             draining = true;
@@ -1145,7 +1024,7 @@ pub fn main(init: std.process.Init) !void {
             // been committed (or no PTY output was ever produced). We
             // don't wait for the GPU renderer to overtake CPU — the user
             // has already seen the content.
-            const painted = g_first_content_painted or !g_first_pty_data_seen;
+            const painted = s_app.lifecycle.first_content_painted or !s_app.lifecycle.first_pty_data_seen;
             const renderers_idle = !gpu.render_in_flight and !cpu.render_in_flight;
             if (painted and renderers_idle) break;
             if (monotonicNowNs() >= drain_deadline_ns) {
@@ -1156,17 +1035,17 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and gpu_restart.due()) {
+        if (!gpu.active and s_app.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and state.render.gpu_restart.due()) {
             gpu.start() catch |err| {
                 std.debug.print("scrgo: gpu renderer restart failed: {}\n", .{err});
-                gpu_restart.scheduleRetry();
+                state.render.gpu_restart.scheduleRetry();
                 continue;
             };
             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
             if (debugRenderersEnabled() or debugStartupEnabled()) {
                 std.debug.print("scrgo: restarting gpu renderer ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
             }
-            gpu_restart.deadline_ns = null;
+            state.render.gpu_restart.deadline_ns = null;
         }
 
         while (!wl.prepareRead()) {
@@ -1176,28 +1055,28 @@ pub fn main(init: std.process.Init) !void {
             };
         }
 
-        if (g_gpu_reconfigure_requested) {
-            g_gpu_reconfigure_requested = false;
+        if (s_app.render.gpu_reconfigure_requested) {
+            s_app.render.gpu_reconfigure_requested = false;
             if (gpu.active and gpu.context_ready) {
-                gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
+                gpu.requestConfigure(s_app.metrics.viewport_w, s_app.metrics.viewport_h, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height) catch |err| {
                     std.debug.print("scrgo: gpu renderer reconfigure failed: {}\n", .{err});
-                    noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                    noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
                     continue;
                 };
-            } else if (g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null) {
-                gpu_restart.scheduleImmediate();
+            } else if (s_app.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null) {
+                state.render.gpu_restart.scheduleImmediate();
             }
         }
 
         maybeScheduleScrollbarHide();
         maybeQueueGpuRendererFrame(&gpu, &wl, &term);
-        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
+        renderActivePath(state.render.active_render_path, &gpu, &cpu, &wl, &term);
         wl.flush();
 
         // Key repeat timeout — wake up in time for next repeat event
         const repeat_timeout: c_int = if (wl.pumpRepeat()) |ms| @intCast(ms) else -1;
-        const restart_timeout = if (!gpu.active and g_target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null)
-            gpu_restart.timeoutMs()
+        const restart_timeout = if (!gpu.active and s_app.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null)
+            state.render.gpu_restart.timeoutMs()
         else
             null;
         const scroll_timeout = scrollbarTimeoutMs();
@@ -1211,11 +1090,11 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (atlas_thread.active) atlas_thread.responseFd() else -1, .events = if (atlas_thread.active) c.POLLIN else 0, .revents = 0 },
         };
 
-        const poll_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
+        const poll_t0 = if (s_app.debug.renderer_debug.commits) monotonicNowNs() else 0;
         const poll_rc = c.poll(&pollfds, 5, poll_timeout);
-        if (g_renderer_debug.commits) {
-            diag.phase_poll_ns += monotonicNowNs() - poll_t0;
-            diag.phase_poll_calls += 1;
+        if (s_app.debug.renderer_debug.commits) {
+            s_app.diag.phase_poll_ns += monotonicNowNs() - poll_t0;
+            s_app.diag.phase_poll_calls += 1;
         }
         if (poll_rc < 0) {
             wl.cancelRead();
@@ -1248,9 +1127,9 @@ pub fn main(init: std.process.Init) !void {
                         if (gpu.atlas_ref == null) {
                             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
                         }
-                        gpu.requestConfigure(g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height) catch |err| {
+                        gpu.requestConfigure(s_app.metrics.viewport_w, s_app.metrics.viewport_h, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height) catch |err| {
                             std.debug.print("scrgo: gpu renderer configure after context_ready failed: {}\n", .{err});
-                            noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                            noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
                             continue;
                         };
                     },
@@ -1258,22 +1137,22 @@ pub fn main(init: std.process.Init) !void {
                         if (wl.linux_dmabuf) |linux_dmabuf| {
                             gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |err| {
                                 std.debug.print("scrgo: GPU dmabuf import failed: {}\n", .{err});
-                                noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                                noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
                                 continue;
                             };
-                            g_gpu_snapshot_dirty = true;
-                            gpu_restart.clear();
+                            s_app.render.gpu_snapshot_dirty = true;
+                            state.render.gpu_restart.clear();
                             if (debugRenderersEnabled() or debugStartupEnabled()) {
                                 std.debug.print("scrgo: gpu renderer ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                             }
                         } else {
-                            noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                            noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
                         }
                     },
                     .frame => {
-                        if (g_target_render_path != .gpu) {
+                        if (s_app.render.target_render_path != .gpu) {
                             // Target switched away from gpu; drop this frame.
-                            diag.recordCommit('d');
+                            s_app.diag.recordCommit('d');
                         } else {
                             if (debugRenderersEnabled()) {
                                 std.debug.print("scrgo: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
@@ -1290,14 +1169,14 @@ pub fn main(init: std.process.Init) !void {
                                 // there's no latency penalty for the
                                 // newer content.
                                 gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                                diag.recordCommit('g');
-                                diag.recordCommitSerial('g', resp.serial, g_render_serial, g_gpu_snapshot_dirty or g_needs_redraw);
+                                s_app.diag.recordCommit('g');
+                                s_app.diag.recordCommitSerial('g', resp.serial, s_app.render.render_serial, s_app.render.gpu_snapshot_dirty or s_app.render.needs_redraw);
                                 if (!wl.frame_pending) wl.requestFrame();
-                                if (active_render_path != .gpu) {
+                                if (state.render.active_render_path != .gpu) {
                                     if (debugFramesEnabled()) {
                                         std.debug.print("scrgo: switching render path cpu->gpu\n", .{});
                                     }
-                                    active_render_path = .gpu;
+                                    state.render.active_render_path = .gpu;
                                 }
                                 if (!gpu.first_frame_presented) {
                                     if (debugFramesEnabled() or debugRenderersEnabled() or debugStartupEnabled()) {
@@ -1312,23 +1191,23 @@ pub fn main(init: std.process.Init) !void {
                             // produced more data while the renderer was
                             // working, we keep dirty=true and queue
                             // another render on the next loop iteration.
-                            if (resp.serial == g_render_serial) {
-                                g_needs_redraw = false;
+                            if (resp.serial == s_app.render.render_serial) {
+                                s_app.render.needs_redraw = false;
                                 term.resetDirty();
                             }
                         }
                     },
                     .retry => {
                         // Glyph miss — atlas extension requested, retry on next frame
-                        g_gpu_snapshot_dirty = true;
+                        s_app.render.gpu_snapshot_dirty = true;
                     },
                     .failed => {
                         std.debug.print("scrgo: gpu renderer failed\n", .{});
-                        noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                        noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
                     },
                 }
             } else {
-                noteGpuUnavailable(&gpu, &active_render_path, &gpu_restart);
+                noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
             }
         }
 
@@ -1338,17 +1217,17 @@ pub fn main(init: std.process.Init) !void {
                 switch (resp.tag) {
                     .frame => {
                         const buffer_ok = resp.buffer_index < cpu.buffer_count;
-                        const path_ok = active_render_path == .cpu;
+                        const path_ok = state.render.active_render_path == .cpu;
                         const size_ok = cpu.width == wl.width and cpu.height == wl.height;
                         if (buffer_ok and path_ok and size_ok) {
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                            diag.recordCommit('c');
-                            diag.recordCommitSerial('c', resp.serial, g_render_serial, g_gpu_snapshot_dirty or g_needs_redraw);
+                            s_app.diag.recordCommit('c');
+                            s_app.diag.recordCommitSerial('c', resp.serial, s_app.render.render_serial, s_app.render.gpu_snapshot_dirty or s_app.render.needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
                             if (debugFramesEnabled()) {
                                 std.debug.print("scrgo: cpu renderer frame committed buffer={} ({d:.1}ms)\n", .{
                                     resp.buffer_index,
-                                    diag.elapsedMs(),
+                                    s_app.diag.elapsedMs(),
                                 });
                             }
                             markFirstContentPaint();
@@ -1362,17 +1241,17 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.print("scrgo: cpu renderer frame dropped buffer={} ({s}) ({d:.1}ms)\n", .{
                                 resp.buffer_index,
                                 reason,
-                                diag.elapsedMs(),
+                                s_app.diag.elapsedMs(),
                             });
                         }
                         // Only clear dirty if no new PTY data arrived
                         // while the renderer was working.
-                        if (resp.serial == g_render_serial and !g_needs_redraw) {
+                        if (resp.serial == s_app.render.render_serial and !s_app.render.needs_redraw) {
                             term.resetDirty();
                         }
                     },
                     .failed => {
-                        g_needs_redraw = true;
+                        s_app.render.needs_redraw = true;
                     },
                 }
             }
@@ -1383,7 +1262,7 @@ pub fn main(init: std.process.Init) !void {
             if (resp_opt) |resp| {
                 switch (resp.tag) {
                     .updated => {
-                        if (debugRenderersEnabled() or g_renderer_debug.atlas) {
+                        if (debugRenderersEnabled() or s_app.debug.renderer_debug.atlas) {
                             std.debug.print("scrgo: atlas owner applied {} codepoints pages+={}\n", .{
                                 resp.requested_count,
                                 resp.added_pages,
@@ -1403,7 +1282,7 @@ pub fn main(init: std.process.Init) !void {
         // content is presented before the shell's SIGWINCH response
         // can clear the prompt line.
         maybeQueueGpuRendererFrame(&gpu, &wl, &term);
-        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
+        renderActivePath(state.render.active_render_path, &gpu, &cpu, &wl, &term);
 
         if (pollfds[1].revents & c.POLLIN != 0) {
             // Time-bounded drain: read until kernel buffer is empty OR
@@ -1417,7 +1296,7 @@ pub fn main(init: std.process.Init) !void {
             const read_start_ns = monotonicNowNs();
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
             while (true) {
-                const read_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
+                const read_t0 = if (s_app.debug.renderer_debug.commits) monotonicNowNs() else 0;
                 const n = pty.read(&pty_buf) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => {
@@ -1436,22 +1315,22 @@ pub fn main(init: std.process.Init) !void {
                     break;
                 }
                 if (debugPtyEnabled()) {
-                    std.debug.print("scrgo: PTY read {} bytes ({d:.1}ms)\n", .{ n, diag.elapsedMs() });
+                    std.debug.print("scrgo: PTY read {} bytes ({d:.1}ms)\n", .{ n, s_app.diag.elapsedMs() });
                 }
-                if (g_renderer_debug.commits) {
-                    diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
-                    diag.phase_bytes_read += @intCast(n);
+                if (s_app.debug.renderer_debug.commits) {
+                    s_app.diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
+                    s_app.diag.phase_bytes_read += @intCast(n);
                 }
-                const feed_t0 = if (g_renderer_debug.commits) monotonicNowNs() else 0;
+                const feed_t0 = if (s_app.debug.renderer_debug.commits) monotonicNowNs() else 0;
                 term.feedData(pty_buf[0..n]);
-                if (g_renderer_debug.commits) {
-                    diag.phase_feed_data_ns += monotonicNowNs() - feed_t0;
-                    diag.phase_feed_calls += 1;
+                if (s_app.debug.renderer_debug.commits) {
+                    s_app.diag.phase_feed_data_ns += monotonicNowNs() - feed_t0;
+                    s_app.diag.phase_feed_calls += 1;
                 }
-                if (g_renderer_debug.commits and diag.t_first_pty_ns == 0) {
-                    diag.t_first_pty_ns = monotonicNowNs() - diag.commit_trace_start_ns;
+                if (s_app.debug.renderer_debug.commits and s_app.diag.t_first_pty_ns == 0) {
+                    s_app.diag.t_first_pty_ns = monotonicNowNs() - s_app.diag.commit_trace_start_ns;
                 }
-                g_first_pty_data_seen = true;
+                s_app.lifecycle.first_pty_data_seen = true;
                 markRenderDirty();
                 if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
             }
@@ -1463,29 +1342,29 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
                 }
                 child_exited = true;
-                if (g_renderer_debug.commits and diag.t_child_exited_ns == 0) {
-                    diag.t_child_exited_ns = monotonicNowNs() - diag.commit_trace_start_ns;
+                if (s_app.debug.renderer_debug.commits and s_app.diag.t_child_exited_ns == 0) {
+                    s_app.diag.t_child_exited_ns = monotonicNowNs() - s_app.diag.commit_trace_start_ns;
                 }
             }
         }
 
         maybeQueueGpuRendererFrame(&gpu, &wl, &term);
-        renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
+        renderActivePath(state.render.active_render_path, &gpu, &cpu, &wl, &term);
 
         maybeQueueGpuRendererFrame(&gpu, &wl, &term);
     }
 
-    if (g_renderer_debug.commits) {
-        diag.t_main_loop_exit_ns = monotonicNowNs() - diag.commit_trace_start_ns;
+    if (s_app.debug.renderer_debug.commits) {
+        s_app.diag.t_main_loop_exit_ns = monotonicNowNs() - s_app.diag.commit_trace_start_ns;
     }
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
     }
-    diag.dumpExitReport(.{
+    s_app.diag.dumpExitReport(.{
         .wl_closed = wl.closed,
         .child_exited = child_exited,
-        .render_serial = g_render_serial,
-        .pipeline_dirty = g_gpu_snapshot_dirty or g_needs_redraw,
+        .render_serial = s_app.render.render_serial,
+        .pipeline_dirty = s_app.render.gpu_snapshot_dirty or s_app.render.needs_redraw,
     });
 
     // Skip the defer chain (cpu/atlas/gpu thread joins, wl_display_disconnect,
