@@ -11,6 +11,7 @@ const atlas_owner = @import("atlas_owner.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
 const gpu_renderer = @import("gpu_renderer.zig");
 const perf = @import("perf.zig");
+const selection_mod = @import("selection.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -111,6 +112,15 @@ var g_needs_redraw: bool = false;
 var g_gpu_snapshot_dirty: bool = false;
 var g_gpu_reconfigure_requested: bool = false;
 var g_render_serial: u32 = 0;
+
+/// Mouse / selection state. Selection rendering and clipboard hooks
+/// consume this. `g_selection` is the live state machine; `g_pointer_x/y`
+/// is the latest known pointer position in surface pixels (already
+/// converted from Wayland's fixed-point form in wayland.zig).
+var g_selection: selection_mod.State = .{};
+var g_pointer_x: f64 = 0;
+var g_pointer_y: f64 = 0;
+var g_pointer_in_surface: bool = false;
 
 // Drain-phase tracking. After the PTY child exits we keep looping until a
 // frame containing its final output has been committed; these two flags
@@ -501,11 +511,72 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     }
 }
 
+/// Wayland evdev codes for the buttons we care about. Imported here
+/// rather than dragging in <linux/input-event-codes.h> for a handful of
+/// constants.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+/// Convert surface-local pixel coords to terminal cell coords. Returns
+/// null when metrics aren't ready yet (early startup). Clamps to the
+/// grid so a drag past the window edge still produces a valid cell.
+fn pixelToCell(x: f64, y: f64) ?selection_mod.Cell {
+    if (g_cell_width <= 0 or g_cell_height <= 0) return null;
+    const term_cols = g_term.colCount();
+    const term_rows = g_term.rowCount();
+    if (term_cols == 0 or term_rows == 0) return null;
+    const col_f = @floor(x / g_cell_width);
+    const row_f = @floor(y / g_cell_height);
+    const col_i = @as(i32, @intFromFloat(@max(0.0, col_f)));
+    const row_i = @as(i32, @intFromFloat(@max(0.0, row_f)));
+    const col: u16 = @intCast(@min(@as(i32, term_cols - 1), col_i));
+    const row: u16 = @intCast(@min(@as(i32, term_rows - 1), row_i));
+    return .{ .row = row, .col = col };
+}
+
+fn nowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, ts.tv_sec) * std.time.ms_per_s + @divTrunc(ts.tv_nsec, std.time.ns_per_ms);
+}
+
 fn onMouse(ev: wayland_mod.MouseEvent) void {
-    if (ev.kind == .scroll) {
-        const lines: isize = if (ev.scroll_dy > 0) @intCast(g_scroll_lines) else -@as(isize, @intCast(g_scroll_lines));
-        g_term.scrollViewport(lines);
-        markRenderDirty();
+    g_pointer_x = ev.x;
+    g_pointer_y = ev.y;
+    switch (ev.kind) {
+        .enter => g_pointer_in_surface = true,
+        .leave => g_pointer_in_surface = false,
+        .scroll => {
+            const lines: isize = if (ev.scroll_dy > 0) @intCast(g_scroll_lines) else -@as(isize, @intCast(g_scroll_lines));
+            g_term.scrollViewport(lines);
+            markRenderDirty();
+        },
+        .button_press => {
+            const cell = pixelToCell(ev.x, ev.y) orelse return;
+            switch (ev.button) {
+                BTN_LEFT => {
+                    g_selection.beginPrimary(cell, ev.mods.shift, nowMs());
+                    markRenderDirty();
+                },
+                else => {},
+            }
+        },
+        .button_release => {
+            switch (ev.button) {
+                BTN_LEFT => {
+                    g_selection.endDrag();
+                    markRenderDirty();
+                },
+                else => {},
+            }
+        },
+        .motion => {
+            if (!g_selection.dragging) return;
+            const cell = pixelToCell(ev.x, ev.y) orelse return;
+            g_selection.updateDrag(cell);
+            markRenderDirty();
+        },
     }
 }
 

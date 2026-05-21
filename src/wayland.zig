@@ -57,8 +57,12 @@ pub const PendingMods = struct {
 };
 
 pub const MouseEvent = struct {
-    kind: enum { button_press, button_release, motion, scroll },
+    kind: enum { enter, leave, button_press, button_release, motion, scroll },
     button: u32 = 0,
+    /// Pointer position in surface-local pixels. For button events,
+    /// this is the cached position from the last motion/enter — Wayland
+    /// always sends motion before button. For scroll, it's also the
+    /// last-known position.
     x: f64 = 0,
     y: f64 = 0,
     scroll_dx: f64 = 0,
@@ -126,6 +130,13 @@ pub const Wayland = struct {
     repeat_delay: u32 = 600, // ms (from compositor)
     repeat_key: ?KeyEvent = null, // currently repeating key
     repeat_deadline_ns: i128 = 0, // next repeat fire time
+
+    /// Last-known pointer position. Updated on enter/motion; reused
+    /// for button/scroll events (Wayland delivers motion before any
+    /// button transition, so this is always current).
+    pointer_x: f64 = 0,
+    pointer_y: f64 = 0,
+    pointer_in_surface: bool = false,
 
     // Callbacks
     on_key: ?*const fn (KeyEvent) void = null,
@@ -784,15 +795,40 @@ pub const Wayland = struct {
         .axis_relative_direction = pointerAxisRelativeDirection,
     };
 
-    fn pointerEnter(_: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, _: ?*wl.wl_surface, _: i32, _: i32) callconv(.c) void {}
-    fn pointerLeave(_: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, _: ?*wl.wl_surface) callconv(.c) void {}
+    fn pointerEnter(data: ?*anyopaque, _: ?*wl.wl_pointer, serial: u32, _: ?*wl.wl_surface, sx: i32, sy: i32) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        self.last_input_serial = serial;
+        self.pointer_x = @as(f64, @floatFromInt(sx)) / 256.0;
+        self.pointer_y = @as(f64, @floatFromInt(sy)) / 256.0;
+        self.pointer_in_surface = true;
+        if (self.on_mouse) |cb| cb(.{
+            .kind = .enter,
+            .x = self.pointer_x,
+            .y = self.pointer_y,
+            .mods = self.getCurrentMods(),
+        });
+    }
+    fn pointerLeave(data: ?*anyopaque, _: ?*wl.wl_pointer, serial: u32, _: ?*wl.wl_surface) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        self.last_input_serial = serial;
+        self.pointer_in_surface = false;
+        if (self.on_mouse) |cb| cb(.{
+            .kind = .leave,
+            .x = self.pointer_x,
+            .y = self.pointer_y,
+            .mods = self.getCurrentMods(),
+        });
+    }
 
     fn pointerMotion(data: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, sx: i32, sy: i32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
+        self.pointer_x = @as(f64, @floatFromInt(sx)) / 256.0;
+        self.pointer_y = @as(f64, @floatFromInt(sy)) / 256.0;
         if (self.on_mouse) |cb| cb(.{
             .kind = .motion,
-            .x = @as(f64, @floatFromInt(sx)) / 256.0,
-            .y = @as(f64, @floatFromInt(sy)) / 256.0,
+            .x = self.pointer_x,
+            .y = self.pointer_y,
+            .mods = self.getCurrentMods(),
         });
     }
 
@@ -802,6 +838,9 @@ pub const Wayland = struct {
         if (self.on_mouse) |cb| cb(.{
             .kind = if (state == wl.WL_POINTER_BUTTON_STATE_PRESSED) .button_press else .button_release,
             .button = button,
+            .x = self.pointer_x,
+            .y = self.pointer_y,
+            .mods = self.getCurrentMods(),
         });
     }
 
@@ -812,6 +851,9 @@ pub const Wayland = struct {
             .kind = .scroll,
             .scroll_dx = if (axis == wl.WL_POINTER_AXIS_HORIZONTAL_SCROLL) v else 0,
             .scroll_dy = if (axis == wl.WL_POINTER_AXIS_VERTICAL_SCROLL) v else 0,
+            .x = self.pointer_x,
+            .y = self.pointer_y,
+            .mods = self.getCurrentMods(),
         });
     }
 

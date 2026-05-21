@@ -173,6 +173,34 @@ pub const Terminal = struct {
             return error.ResizeFailed;
     }
 
+    pub fn colCount(self: *Terminal) u16 {
+        var n: u16 = 0;
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_COLS, &n);
+        return n;
+    }
+
+    pub fn rowCount(self: *Terminal) u16 {
+        var n: u16 = 0;
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_ROWS, &n);
+        return n;
+    }
+
+    pub const Scrollbar = struct {
+        total: u64,
+        offset: u64,
+        len: u64,
+    };
+
+    /// Snapshot the viewport's scroll position. `total` is the total
+    /// number of rows including scrollback; `offset` is the topmost
+    /// visible row; `len` is the viewport height in rows. When
+    /// `total == len` the user is at the bottom with no scrollback.
+    pub fn scrollbar(self: *Terminal) Scrollbar {
+        var sb: c.GhosttyTerminalScrollbar = .{ .total = 0, .offset = 0, .len = 0 };
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb);
+        return .{ .total = sb.total, .offset = sb.offset, .len = sb.len };
+    }
+
     pub fn updateRenderState(self: *Terminal) !void {
         if (c.ghostty_render_state_update(self.render_state, self.handle) != c.GHOSTTY_SUCCESS)
             return error.RenderStateUpdateFailed;
