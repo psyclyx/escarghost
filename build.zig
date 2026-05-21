@@ -90,9 +90,13 @@ fn createSnailModule(b: *std.Build, deps: Deps) *std.Build.Module {
     snail_opts.addOption(bool, "enable_profiling", false);
     snail_opts.addOption(bool, "enable_harfbuzz", true);
     snail_opts.addOption(bool, "enable_vulkan", false);
-    snail_opts.addOption(bool, "enable_opengl", true);
+    // snail 0.11.0 split the GL backend into three independent toggles.
+    // scrgo only uses the GLES 3.0 renderer; gl33/gl44 stay disabled so
+    // the snail module doesn't link libOpenGL.
+    snail_opts.addOption(bool, "enable_gl33", false);
+    snail_opts.addOption(bool, "enable_gl44", false);
+    snail_opts.addOption(bool, "enable_gles30", true);
     snail_opts.addOption(bool, "enable_cpu", true);
-    snail_opts.addOption(bool, "force_gl33", false);
 
     const vk_stub = b.createModule(.{
         .root_source_file = b.addWriteFiles().add("vk_stub.zig", ""),
@@ -105,7 +109,7 @@ fn createSnailModule(b: *std.Build, deps: Deps) *std.Build.Module {
         .link_libc = true,
     });
     snail_mod.addOptions("build_options", snail_opts);
-    snail_mod.linkSystemLibrary("OpenGL", .{});
+    snail_mod.linkSystemLibrary("GLESv2", .{});
     snail_mod.linkSystemLibrary("harfbuzz", .{});
     snail_mod.addImport("vulkan_shaders", vk_stub);
     return snail_mod;
@@ -135,7 +139,7 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     mod.linkSystemLibrary("wayland-egl", .{});
     mod.linkSystemLibrary("egl", .{});
     mod.linkSystemLibrary("xkbcommon", .{});
-    mod.linkSystemLibrary("OpenGL", .{});
+    mod.linkSystemLibrary("GLESv2", .{});
     mod.linkSystemLibrary("gbm", .{});
     mod.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
     mod.linkSystemLibrary("fontconfig", .{});

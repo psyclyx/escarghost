@@ -29,8 +29,12 @@ const c = @cImport({
     @cInclude("EGL/egl.h");
     @cInclude("EGL/eglext.h");
     @cDefine("GL_GLEXT_PROTOTYPES", "1");
-    @cInclude("GL/gl.h");
-    @cInclude("GL/glext.h");
+    @cInclude("GLES3/gl3.h");
+    @cInclude("GLES3/gl3ext.h");
+    // GL_OES_EGL_image (`GLeglImageOES`, `glEGLImageTargetTexture2DOES`) is
+    // declared in the GLES2 extension header; the GLES3 ext header doesn't
+    // re-export it.
+    @cInclude("GLES2/gl2ext.h");
 });
 
 fn rendererDebugOptions() render_env.RendererDebug {
@@ -155,7 +159,7 @@ const OffscreenEgl = struct {
         if (c.eglInitialize(self.display, &major, &minor) == c.EGL_FALSE)
             return error.EglInitFailed;
         gpuDebug(timer, "egl initialized {}.{}", .{ major, minor });
-        _ = c.eglBindAPI(c.EGL_OPENGL_API);
+        _ = c.eglBindAPI(c.EGL_OPENGL_ES_API);
 
         const attrs = [_]c.EGLint{
             c.EGL_SURFACE_TYPE,    c.EGL_PBUFFER_BIT,
@@ -163,7 +167,7 @@ const OffscreenEgl = struct {
             c.EGL_GREEN_SIZE,      8,
             c.EGL_BLUE_SIZE,       8,
             c.EGL_ALPHA_SIZE,      8,
-            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_BIT,
+            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_ES3_BIT,
             c.EGL_NONE,
         };
 
@@ -171,22 +175,13 @@ const OffscreenEgl = struct {
         if (c.eglChooseConfig(self.display, &attrs, &self.config, 1, &num) == c.EGL_FALSE or num == 0)
             return error.EglConfigFailed;
 
-        const gl44 = [_]c.EGLint{
-            c.EGL_CONTEXT_MAJOR_VERSION,       4,
-            c.EGL_CONTEXT_MINOR_VERSION,       4,
-            c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-            c.EGL_NONE,
-        };
-        const gl33 = [_]c.EGLint{
-            c.EGL_CONTEXT_MAJOR_VERSION,       3,
-            c.EGL_CONTEXT_MINOR_VERSION,       3,
-            c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        const gles3 = [_]c.EGLint{
+            c.EGL_CONTEXT_MAJOR_VERSION, 3,
+            c.EGL_CONTEXT_MINOR_VERSION, 0,
             c.EGL_NONE,
         };
 
-        self.context = c.eglCreateContext(self.display, self.config, c.EGL_NO_CONTEXT, &gl44);
-        if (self.context == c.EGL_NO_CONTEXT)
-            self.context = c.eglCreateContext(self.display, self.config, c.EGL_NO_CONTEXT, &gl33);
+        self.context = c.eglCreateContext(self.display, self.config, c.EGL_NO_CONTEXT, &gles3);
         if (self.context == c.EGL_NO_CONTEXT) return error.EglContextFailed;
 
         const pbuffer_attrs = [_]c.EGLint{ c.EGL_WIDTH, 1, c.EGL_HEIGHT, 1, c.EGL_NONE };
@@ -646,13 +641,6 @@ pub const Frontend = struct {
 
         // Signal context ready — main can now send configure
         writeResponse(self.response_fds[1], .{ .tag = .context_ready });
-
-        // Sane default for our linear-format dmabuf FBO. snail's GL
-        // pipeline manages this state per-draw via setSrgbFormatTarget
-        // (we set it to false in renderer.init); explicit disable here
-        // just guards against any pre-existing state from a previous
-        // GL context.
-        c.glDisable(c.GL_FRAMEBUFFER_SRGB);
 
         var allocator_state: ?DmabufAllocator = null;
         defer if (allocator_state) |*existing| existing.deinit(&egl);

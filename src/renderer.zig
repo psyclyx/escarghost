@@ -12,8 +12,8 @@ const Rgb = color.Rgb;
 
 const gl = @cImport({
     @cDefine("GL_GLEXT_PROTOTYPES", "1");
-    @cInclude("GL/gl.h");
-    @cInclude("GL/glext.h");
+    @cInclude("GLES3/gl3.h");
+    @cInclude("GLES3/gl3ext.h");
 });
 
 const MAX_SNAPSHOT_ROWS: usize = render_snapshot.MaxRows;
@@ -136,7 +136,7 @@ pub const Renderer = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef,
     atlas_lease: atlas_ref_mod.AtlasRef.Lease,
 
-    gl_renderer: snail.GlRenderer,
+    gl_renderer: snail.Gles30Renderer,
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
 
@@ -235,7 +235,7 @@ pub const Renderer = struct {
         cell_width: f32,
         cell_height: f32,
     ) !Renderer {
-        var gl_renderer = try snail.GlRenderer.init(allocator);
+        var gl_renderer = try snail.Gles30Renderer.init(allocator);
         errdefer gl_renderer.deinit();
 
         var atlas_lease = atlas_ref.acquire();
