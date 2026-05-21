@@ -84,6 +84,9 @@ const TargetState = struct {
     /// stale highlight gets repainted with no-selection cells).
     selection_rows: [MAX_SNAPSHOT_ROWS]u16 = [_]u16{0} ** MAX_SNAPSHOT_ROWS,
     selection_row_count: usize = 0,
+    /// Scrollbar identity painted onto this buffer; see
+    /// `packScrollbarId`. Zero = scrollbar was hidden.
+    scrollbar_id: u64 = 0,
 
     fn reset(self: *TargetState) void {
         self.seeded = false;
@@ -92,6 +95,7 @@ const TargetState = struct {
         self.cursor_id = 0;
         self.selection_id = 0;
         self.selection_row_count = 0;
+        self.scrollbar_id = 0;
     }
 
     fn clearEvicted(self: *TargetState, evicted_hashes: []const u64) void {
@@ -131,6 +135,19 @@ fn containsIndex(slice: []const usize, target: usize) bool {
 fn cursorRowFromId(id: u64) ?usize {
     if (id == 0) return null;
     return @intCast((id >> 16) & 0xFFFF);
+}
+
+/// Pack a scrollbar overlay into a u64 for fast "has the scrollbar
+/// changed" checks. Quantizes the fractional fields to 16-bit so
+/// sub-pixel jitter doesn't trigger a full repaint every frame.
+fn packScrollbarId(sb: ?render_snapshot.ScrollbarOverlay) u64 {
+    const s = sb orelse return 0;
+    const alpha_q: u64 = @intFromFloat(@max(0.0, @min(1.0, s.alpha)) * 255.0);
+    const off_q: u64 = @intFromFloat(@max(0.0, @min(1.0, s.thumb_offset)) * 65535.0);
+    const size_q: u64 = @intFromFloat(@max(0.0, @min(1.0, s.thumb_size)) * 65535.0);
+    const packed_id = (alpha_q & 0xFF) | ((off_q & 0xFFFF) << 8) | ((size_q & 0xFFFF) << 24);
+    // Reserve 0 for "hidden".
+    return if (packed_id == 0) 1 else packed_id;
 }
 
 pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h: u32) struct { cols: u16, rows: u16 } {
@@ -605,7 +622,7 @@ pub const Renderer = struct {
         const dirty = self.computeDirty(built);
         self.recordDirtyStats(built, dirty);
 
-        try self.flushDraw(built, dirty, snapshot.header.default_bg);
+        try self.flushDraw(built, dirty, snapshot.header.default_bg, snapshot.header.default_fg);
         self.ephemeral_blobs.releaseAll();
         frame_stats.record(frame_timer.elapsedUs());
     }
@@ -648,6 +665,14 @@ pub const Renderer = struct {
             }
         }
 
+        // Scrollbar state changes invalidate the right-edge stripe on
+        // every painted row. Mark all rows dirty when the overlay
+        // appears, disappears, or its geometry shifts; once stable
+        // (steady alpha + thumb position) we skip the extra repaint.
+        const new_scrollbar_id = packScrollbarId(built.scrollbar);
+        if (new_scrollbar_id != target.scrollbar_id) {
+            for (0..row_count) |i| marked[i] = true;
+        }
         if (built.selection_id != target.selection_id) {
             // Mark every row covered by the new selection. We also have
             // to repaint rows that were covered by the *previous*
@@ -717,7 +742,7 @@ pub const Renderer = struct {
         self.prev_atlas_identity = self.last_atlas_identity;
     }
 
-    fn flushDraw(self: *Renderer, built: row_build.BuiltSnapshot, dirty: []const usize, default_bg: Rgb) !void {
+    fn flushDraw(self: *Renderer, built: row_build.BuiltSnapshot, dirty: []const usize, default_bg: Rgb, default_fg: Rgb) !void {
         const default_bg_color = default_bg.toFloat4(1.0);
         // Cursor's row is always in `dirty` whenever the cursor changed,
         // so we can locate "cursor's dirty row" by membership: if the
@@ -790,6 +815,25 @@ pub const Renderer = struct {
         }
         if (cursor_in_dirty) {
             if (built.cursor) |cursor| try self.emitCursor(&picture_builder, cursor);
+        }
+
+        // Scrollbar overlay on the right edge. Paint last so it sits
+        // on top of everything else. When the scrollbar is visible we
+        // emit it on every dirty frame (the dirty set already covers
+        // every row whenever the scrollbar state changes).
+        if (built.scrollbar) |sb| {
+            const geom = render_common.scrollbarGeometry(self.viewport_w, self.viewport_h, sb.thumb_offset, sb.thumb_size);
+            const sc = render_common.scrollbarColors(default_fg, sb.alpha);
+            try picture_builder.addFilledRect(
+                .{ .x = geom.gutter_x, .y = geom.gutter_y, .w = geom.gutter_w, .h = geom.gutter_h },
+                .{ .paint = .{ .solid = sc.gutter } },
+                .identity,
+            );
+            try picture_builder.addFilledRect(
+                .{ .x = geom.gutter_x, .y = geom.thumb_y, .w = geom.gutter_w, .h = geom.thumb_h },
+                .{ .paint = .{ .solid = sc.thumb } },
+                .identity,
+            );
         }
 
         var picture = try picture_builder.freeze(.{
@@ -927,6 +971,7 @@ pub const Renderer = struct {
             target.selection_rows[target.selection_row_count] = span.row;
             target.selection_row_count += 1;
         }
+        target.scrollbar_id = packScrollbarId(built.scrollbar);
 
         // Block on the GPU pipeline before reading back. glFlush alone is
         // fire-and-forget; for a readback we need the FBO to actually have

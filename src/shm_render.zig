@@ -266,6 +266,31 @@ pub const SnapshotRenderer = struct {
         }
     }
 
+    /// Paint the right-edge scrollbar overlay (gutter + thumb). Both
+    /// renderers share the geometry helpers in render_common so the
+    /// scrollbar looks identical regardless of which path is active.
+    fn paintScrollbar(
+        picture: *snail.PathPictureBuilder,
+        sb: render_snapshot.ScrollbarOverlay,
+        viewport_w: f32,
+        viewport_h: f32,
+        default_fg: Rgb,
+    ) !void {
+        if (sb.alpha <= 0) return;
+        const geom = render_common.scrollbarGeometry(viewport_w, viewport_h, sb.thumb_offset, sb.thumb_size);
+        const colors = render_common.scrollbarColors(default_fg, sb.alpha);
+        try picture.addFilledRect(
+            .{ .x = geom.gutter_x, .y = geom.gutter_y, .w = geom.gutter_w, .h = geom.gutter_h },
+            .{ .paint = .{ .solid = colors.gutter } },
+            .identity,
+        );
+        try picture.addFilledRect(
+            .{ .x = geom.gutter_x, .y = geom.thumb_y, .w = geom.gutter_w, .h = geom.thumb_h },
+            .{ .paint = .{ .solid = colors.thumb } },
+            .identity,
+        );
+    }
+
     /// Render a snapshot to a Wayland SHM buffer. Returns any text runs
     /// whose glyphs weren't in the atlas — caller forwards to the atlas
     /// thread for extension.
@@ -355,7 +380,7 @@ pub const SnapshotRenderer = struct {
             }
         }
 
-        try self.flushDraw(built, default_bg, width, height, cell_width, cell_height);
+        try self.flushDraw(built, default_bg, snapshot.header.default_fg, width, height, cell_width, cell_height);
         self.ephemeral_blobs.releaseAll();
         return misses;
     }
@@ -379,6 +404,7 @@ pub const SnapshotRenderer = struct {
         self: *SnapshotRenderer,
         built: row_build.BuiltSnapshot,
         default_bg: Rgb,
+        default_fg: Rgb,
         viewport_w: u32,
         viewport_h: u32,
         cell_width: f32,
@@ -415,6 +441,13 @@ pub const SnapshotRenderer = struct {
             );
         }
         if (built.cursor) |cursor| try emitCursor(&picture_builder, cursor, cell_width, cell_height);
+
+        // Scrollbar overlay: thin band on the right edge, drawn after
+        // text/cursor so it sits on top of everything. Snapshot carries
+        // null when the scrollbar should be hidden.
+        if (built.scrollbar) |sb| {
+            try paintScrollbar(&picture_builder, sb, @floatFromInt(viewport_w), @floatFromInt(viewport_h), default_fg);
+        }
 
         var picture = try picture_builder.freeze(.{
             .persistent_allocator = self.allocator,

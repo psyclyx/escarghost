@@ -66,3 +66,47 @@ pub fn selectionFillColor(default_bg: Rgb) [4]f32 {
         return .{ 31.0 / 255.0, 87.0 / 255.0, 184.0 / 255.0, 0.40 };
     }
 }
+
+/// Scrollbar thumb and gutter geometry. Computed from a snapshot
+/// ScrollbarOverlay + viewport dimensions; both renderers consume
+/// this to draw a thin band on the right edge.
+pub const ScrollbarGeometry = struct {
+    /// Right-edge gutter rect: x, y, width, height in pixels.
+    gutter_x: f32,
+    gutter_y: f32,
+    gutter_w: f32,
+    gutter_h: f32,
+    /// Thumb rect, in pixels. Always contained within the gutter.
+    thumb_y: f32,
+    thumb_h: f32,
+};
+
+pub const SCROLLBAR_PIXEL_WIDTH: f32 = 8.0;
+pub const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
+
+pub fn scrollbarGeometry(viewport_w: f32, viewport_h: f32, thumb_offset: f32, thumb_size: f32) ScrollbarGeometry {
+    const gutter_x = viewport_w - SCROLLBAR_PIXEL_WIDTH;
+    const raw_thumb_h = @max(SCROLLBAR_MIN_THUMB_PX, thumb_size * viewport_h);
+    const max_thumb_top = viewport_h - raw_thumb_h;
+    const thumb_y = @max(0.0, @min(max_thumb_top, thumb_offset * viewport_h));
+    return .{
+        .gutter_x = gutter_x,
+        .gutter_y = 0,
+        .gutter_w = SCROLLBAR_PIXEL_WIDTH,
+        .gutter_h = viewport_h,
+        .thumb_y = thumb_y,
+        .thumb_h = raw_thumb_h,
+    };
+}
+
+/// Scrollbar gutter and thumb fill colors. Gutter is the default fg
+/// at low alpha; thumb is fg at higher alpha. Both scale by the
+/// snapshot's overlay alpha for fade-in / fade-out.
+pub fn scrollbarColors(default_fg: Rgb, alpha: f32) struct { gutter: [4]f32, thumb: [4]f32 } {
+    const a = @max(0.0, @min(1.0, alpha));
+    const fg = default_fg.toFloat4(1.0);
+    return .{
+        .gutter = .{ fg[0], fg[1], fg[2], 0.08 * a },
+        .thumb = .{ fg[0], fg[1], fg[2], 0.55 * a },
+    };
+}

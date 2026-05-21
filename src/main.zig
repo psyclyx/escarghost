@@ -12,6 +12,7 @@ const cpu_renderer_worker = @import("cpu_worker.zig");
 const gpu_renderer = @import("gpu_renderer.zig");
 const perf = @import("perf.zig");
 const selection_mod = @import("selection.zig");
+const render_snapshot = @import("render_snapshot.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -121,6 +122,21 @@ var g_selection: selection_mod.State = .{};
 var g_pointer_x: f64 = 0;
 var g_pointer_y: f64 = 0;
 var g_pointer_in_surface: bool = false;
+
+/// Scrollbar overlay state. The scrollbar is shown on scroll events
+/// and when the pointer hovers near the right edge; otherwise hidden
+/// after a 1s idle. Animation is plain on/off — no per-frame
+/// interpolation, so we don't have to wake the render loop on a
+/// tight timer.
+const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
+/// Hover detection: pointer is within this many pixels of the right edge.
+const SCROLLBAR_HOVER_WIDTH: f64 = 16.0;
+var g_scrollbar_visible_until_ns: u64 = 0;
+/// Tracks whether the previous render observed a visible scrollbar.
+/// Used to decide whether the hide-timeout still needs to redirty the
+/// frame (otherwise we'd never repaint to clear the scrollbar after
+/// idle).
+var g_scrollbar_was_visible: bool = false;
 
 // Drain-phase tracking. After the PTY child exits we keep looping until a
 // frame containing its final output has been committed; these two flags
@@ -546,10 +562,15 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
     g_pointer_y = ev.y;
     switch (ev.kind) {
         .enter => g_pointer_in_surface = true,
-        .leave => g_pointer_in_surface = false,
+        .leave => {
+            g_pointer_in_surface = false;
+            // Leaving the surface also kills hover detection — fall
+            // back to scroll-driven visibility only.
+        },
         .scroll => {
             const lines: isize = if (ev.scroll_dy > 0) @intCast(g_scroll_lines) else -@as(isize, @intCast(g_scroll_lines));
             g_term.scrollViewport(lines);
+            bumpScrollbarVisibility();
             markRenderDirty();
         },
         .button_press => {
@@ -572,12 +593,70 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
             }
         },
         .motion => {
-            if (!g_selection.dragging) return;
-            const cell = pixelToCell(ev.x, ev.y) orelse return;
-            g_selection.updateDrag(cell);
-            markRenderDirty();
+            const near_right_edge = @as(f64, @floatFromInt(g_viewport_w)) - ev.x <= SCROLLBAR_HOVER_WIDTH;
+            if (near_right_edge) {
+                bumpScrollbarVisibility();
+                markRenderDirty();
+            }
+            if (g_selection.dragging) {
+                const cell = pixelToCell(ev.x, ev.y) orelse return;
+                g_selection.updateDrag(cell);
+                markRenderDirty();
+            }
         },
     }
+}
+
+fn bumpScrollbarVisibility() void {
+    g_scrollbar_visible_until_ns = monotonicNowNs() + SCROLLBAR_HIDE_DELAY_NS;
+}
+
+/// Compute the scrollbar overlay for this snapshot. Returns null when
+/// there's no scrollback or the visibility window has elapsed. The
+/// renderer paints the overlay as a thin band on the right edge.
+fn currentScrollbarOverlay() ?render_snapshot.ScrollbarOverlay {
+    const sb = g_term.scrollbar();
+    if (sb.total == 0 or sb.len == 0 or sb.total <= sb.len) {
+        g_scrollbar_was_visible = false;
+        return null;
+    }
+    const now = monotonicNowNs();
+    if (now >= g_scrollbar_visible_until_ns) {
+        g_scrollbar_was_visible = false;
+        return null;
+    }
+    const total_f: f32 = @floatFromInt(sb.total);
+    const offset_f: f32 = @floatFromInt(sb.offset);
+    const len_f: f32 = @floatFromInt(sb.len);
+    g_scrollbar_was_visible = true;
+    return .{
+        // Alpha is binary for the first cut — visible vs not. Fading
+        // adds per-frame redraw cost that we can layer in later.
+        .alpha = 0.7,
+        .thumb_offset = offset_f / total_f,
+        .thumb_size = @max(0.04, len_f / total_f),
+    };
+}
+
+/// Time until the scrollbar should be hidden — feeds into poll_timeout
+/// so the main loop wakes in time to redraw the frame with the
+/// scrollbar gone. Returns null when the scrollbar is already hidden
+/// (no timer needed).
+fn scrollbarTimeoutMs() ?c_int {
+    if (!g_scrollbar_was_visible) return null;
+    const now = monotonicNowNs();
+    if (now >= g_scrollbar_visible_until_ns) return 0;
+    const delta_ns = g_scrollbar_visible_until_ns - now;
+    const delta_ms = delta_ns / std.time.ns_per_ms + 1;
+    return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
+}
+
+/// Called once per loop iteration. Marks a redraw if the scrollbar
+/// hide timer has elapsed and the previous frame still showed it.
+fn maybeScheduleScrollbarHide() void {
+    if (!g_scrollbar_was_visible) return;
+    if (monotonicNowNs() < g_scrollbar_visible_until_ns) return;
+    markRenderDirty();
 }
 
 var g_base_font_size: f32 = 14.0;
@@ -643,7 +722,7 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mo
     // input-faster-than-render conditions (rare in a terminal), we
     // over-commit and the compositor discards intermediate buffers;
     // the wasted work is one render (~3ms) per redundant commit.
-    gpu.queueRender(term, g_render_serial, g_selection.toSnapshot()) catch |err| switch (err) {
+    gpu.queueRender(term, g_render_serial, g_selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer
             // so we can see at exit whether compositor release
@@ -694,7 +773,7 @@ fn renderActivePath(
             error.Busy => return,
             else => return,
         };
-        cpu.queueRender(term, g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height, g_render_serial, g_selection.toSnapshot()) catch |err| switch (err) {
+        cpu.queueRender(term, g_viewport_w, g_viewport_h, g_font_size, g_cell_width, g_cell_height, g_render_serial, g_selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
             error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,
         };
@@ -1055,6 +1134,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        maybeScheduleScrollbarHide();
         maybeQueueGpuRendererFrame(&gpu, &wl, &term);
         renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
         wl.flush();
@@ -1065,7 +1145,8 @@ pub fn main(init: std.process.Init) !void {
             gpu_restart.timeoutMs()
         else
             null;
-        const poll_timeout = combineTimeout(repeat_timeout, restart_timeout);
+        const scroll_timeout = scrollbarTimeoutMs();
+        const poll_timeout = combineTimeout(combineTimeout(repeat_timeout, restart_timeout), scroll_timeout);
 
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },

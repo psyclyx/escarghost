@@ -538,6 +538,9 @@ pub const BuiltSnapshot = struct {
     /// selections that produce the same painted band hash to the same
     /// value. Zero = no selection.
     selection_id: u64,
+    /// Optional right-edge scrollbar overlay. Renderers paint a thin
+    /// band on top of everything else when present.
+    scrollbar: ?render_snapshot.ScrollbarOverlay,
 };
 
 /// Walk a snapshot row-by-row, hit the row cache, and capture cursor
@@ -669,6 +672,7 @@ pub fn buildSnapshot(
         .cursor = cursor,
         .selection_spans = spans,
         .selection_id = packSelectionId(snapshot.selection, spans),
+        .scrollbar = snapshot.scrollbar,
     };
 }
 

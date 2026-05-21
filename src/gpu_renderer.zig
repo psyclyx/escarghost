@@ -493,6 +493,7 @@ pub const Frontend = struct {
         term: *terminal_mod.Terminal,
         serial: u32,
         selection: ?@import("selection.zig").Snapshot,
+        scrollbar: ?render_snapshot.ScrollbarOverlay,
     ) !void {
         if (!self.active or !self.ready) return error.NotReady;
         if (self.render_in_flight or self.request_pending) return error.Busy;
@@ -506,7 +507,7 @@ pub const Frontend = struct {
         // again. The acquired lease moves into the request so the atlas
         // outlives iteration; the worker releases it.
         const snap_t0 = monotonicNs();
-        try render_snapshot.prepare(&self.snapshots[snapshot_slot], term, selection);
+        try render_snapshot.prepare(&self.snapshots[snapshot_slot], term, selection, scrollbar);
         snapshotPhaseAccumNs += monotonicNs() - snap_t0;
         snapshotPhaseCount += 1;
         self.snapshot_busy[snapshot_slot] = true;

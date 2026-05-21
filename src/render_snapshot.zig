@@ -52,12 +52,27 @@ pub const Header = struct {
     reserved: u8 = 0,
 };
 
+/// Scrollbar overlay sampled at snapshot time. Null = no scrollback
+/// available, or scrollbar should be hidden. `alpha` lets the caller
+/// animate fade in/out without renderer-side timing logic.
+pub const ScrollbarOverlay = struct {
+    /// Opacity in [0, 1]. Zero = fully hidden (renderers skip the
+    /// pass); non-zero = visible at that alpha.
+    alpha: f32,
+    /// Top of the thumb as a fraction of the gutter (0 = top, 1 = bottom).
+    thumb_offset: f32,
+    /// Thumb height as a fraction of the gutter (always > 0 when visible).
+    thumb_size: f32,
+};
+
 pub const SharedSnapshot = struct {
     header: Header = .{},
     cells: [MaxCells]Cell = [_]Cell{.{}} ** MaxCells,
     /// Active text selection at the time the snapshot was captured.
     /// Null = no selection; renderers skip the highlight pass.
     selection: ?selection_mod.Snapshot = null,
+    /// Scrollbar overlay state. Null = hidden.
+    scrollbar: ?ScrollbarOverlay = null,
 };
 
 pub var updateRenderStateAccumNs: u64 = 0;
@@ -84,12 +99,18 @@ fn monotonicNs() u64 {
 /// across the prepare/captureCells split (the worker that runs
 /// captureCells won't see selection mutations that happened mid-frame).
 /// Pass null when there's no live selection.
-pub fn prepare(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, selection: ?selection_mod.Snapshot) !void {
+pub fn prepare(
+    snapshot: *SharedSnapshot,
+    term: *terminal_mod.Terminal,
+    selection: ?selection_mod.Snapshot,
+    scrollbar: ?ScrollbarOverlay,
+) !void {
     const t0 = monotonicNs();
     try term.updateRenderState();
     updateRenderStateAccumNs += monotonicNs() - t0;
     updateRenderStateCount += 1;
     snapshot.selection = selection;
+    snapshot.scrollbar = scrollbar;
 }
 
 /// Walk the terminal's render_state (already populated by `prepare`) into
@@ -183,7 +204,8 @@ pub fn capture(
     term: *terminal_mod.Terminal,
     atlas: *const snail.TextAtlas,
     selection: ?selection_mod.Snapshot,
+    scrollbar: ?ScrollbarOverlay,
 ) !void {
-    try prepare(snapshot, term, selection);
+    try prepare(snapshot, term, selection, scrollbar);
     try captureCells(snapshot, term, atlas);
 }
