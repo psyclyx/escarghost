@@ -252,7 +252,7 @@ fn runMemory(args: Args) !void {
     };
     printHeader(
         "memory (steady-state after ~9 MB scrollback; MiB)",
-        "terminal      n  rss    anon   vram   rss_peak anon_peak (peak includes GPU-driver init transient)",
+        "terminal      n  rss    anon   rss_peak anon_peak (peak includes GPU-driver init transient)",
     );
     for (args.terminals) |spec| {
         const bin = binFor(spec) orelse {
@@ -270,11 +270,10 @@ fn runMemory(args: Args) !void {
         // regressions and capturing GPU-driver init transients.
         const k: f64 = 1024.0;
         std.debug.print(
-            "{s:<10}  {d:>3}  {d:>5.1}  {d:>5.1}  {d:>5.1}  {d:>7.1}  {d:>7.1}\n",
+            "{s:<10}  {d:>3}  {d:>5.1}  {d:>5.1}  {d:>7.1}  {d:>7.1}\n",
             .{
                 spec.label,            a.n,
                 a.rss.median / k,      a.anon.median / k,
-                a.vram.median / k,
                 a.peak_rss.median / k, a.peak_anon.median / k,
             },
         );
