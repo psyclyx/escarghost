@@ -282,49 +282,127 @@ pub const Row = struct {
 /// renderer (no cross-thread sharing); each renderer's lock-free atlas
 /// snapshot identity is held alongside the content hash on each entry.
 ///
-/// Atlas-snapshot bumps trigger `rebindAll`, not a wipe. Metrics changes
-/// (font size, DPI) invalidate the entire cache because each cached blob
-/// bakes `placement.em` into its per-instance `Transform2D`.
+/// Atlas-snapshot bumps don't trigger a sweep. Cached blobs stay on
+/// whatever identity they were shaped against; the next `getCurrent`
+/// call rebinds (or evicts) them lazily. Callers track live atlas
+/// snapshots via `entriesForIdentity` so each snapshot's lease can be
+/// released the moment the cache stops referencing it. Metrics changes
+/// (font size, DPI) invalidate the entire cache because each cached
+/// blob bakes `placement.em` into its per-instance `Transform2D`.
 pub const RowCache = struct {
     allocator: std.mem.Allocator,
     map: std.AutoHashMap(u64, Row),
     cache_bytes: usize = 0,
     cache_budget: usize,
     frame_counter: u64 = 0,
-
-    pub const RebindStats = struct { rebound: usize, evicted: usize };
+    /// Count of cached rows whose blob is bound to each atlas snapshot
+    /// identity. Caller reads this via `entriesForIdentity` to decide
+    /// when each snapshot's lease can be safely released.
+    entries_by_identity: std.AutoHashMap(u64, usize),
+    /// Content hashes whose entry was evicted this frame because the
+    /// snapshot they reference is no longer rebindable (had_misses, or
+    /// rebound failed). Callers drain this after `buildSnapshot` to
+    /// zero matching slots in each TargetState — otherwise the
+    /// freshly-shaped replacement row would be skipped by the dirty
+    /// check (content_hash unchanged) and the dmabuf would keep
+    /// showing stale glyphs.
+    invalidations: std.ArrayList(u64),
 
     pub fn init(allocator: std.mem.Allocator, budget_bytes: usize) RowCache {
         return .{
             .allocator = allocator,
             .map = std.AutoHashMap(u64, Row).init(allocator),
             .cache_budget = budget_bytes,
+            .entries_by_identity = std.AutoHashMap(u64, usize).init(allocator),
+            .invalidations = .empty,
         };
     }
 
     pub fn deinit(self: *RowCache) void {
         self.clear();
         self.map.deinit();
+        self.entries_by_identity.deinit();
+        self.invalidations.deinit(self.allocator);
     }
 
     pub fn clear(self: *RowCache) void {
         var it = self.map.valueIterator();
         while (it.next()) |row| destroyRow(self.allocator, row);
         self.map.clearRetainingCapacity();
+        self.entries_by_identity.clearRetainingCapacity();
+        self.invalidations.clearRetainingCapacity();
         self.cache_bytes = 0;
     }
 
-    /// Begin a new frame; entries inherit this counter on `get` / `store` so
-    /// LRU eviction can find genuinely-old rows.
+    /// Begin a new frame; entries inherit this counter on store so the
+    /// LRU sweep can find genuinely-old rows.
     pub fn beginFrame(self: *RowCache) void {
         self.frame_counter += 1;
     }
 
-    /// Look up a row by content hash. Returns null on miss. On hit, marks
-    /// the row as used this frame so it survives the LRU sweep.
-    pub fn get(self: *RowCache, key: u64) ?*Row {
+    /// Number of cached rows currently bound to `identity`. The caller
+    /// holds a lease on each identity with a non-zero count; once a
+    /// count drops to zero the lease can be released because no blob
+    /// dereferences that snapshot anymore.
+    pub fn entriesForIdentity(self: *const RowCache, identity: u64) usize {
+        return self.entries_by_identity.get(identity) orelse 0;
+    }
+
+    /// Content hashes that lost their cache entry this frame due to
+    /// stale-atlas state. Drained in one go by the caller — the slice
+    /// stays valid until `clearInvalidations` or another cache mutation
+    /// that grows the list.
+    pub fn drainInvalidations(self: *RowCache) []const u64 {
+        return self.invalidations.items;
+    }
+
+    pub fn clearInvalidations(self: *RowCache) void {
+        self.invalidations.clearRetainingCapacity();
+    }
+
+    /// Look up a row by content hash, transparently migrating its blob
+    /// onto the current atlas snapshot if it was shaped against an older
+    /// one. Returns null on outright miss, on a stale `had_misses` entry
+    /// (always re-shape so a freshly-extended atlas can fill the gaps),
+    /// or on rebind failure. Both eviction paths queue `key` into
+    /// `invalidations` so the caller can clear any downstream paint
+    /// state keyed by the same content hash before the replacement row
+    /// gets painted.
+    ///
+    /// `current_atlas` must outlive the call: the rebind path
+    /// dereferences both the new and the row's old atlas pointers.
+    pub fn getCurrent(
+        self: *RowCache,
+        key: u64,
+        current_atlas: *const snail.TextAtlas,
+        current_identity: u64,
+    ) ?*Row {
         const row = self.map.getPtr(key) orelse return null;
+        if (row.had_misses) {
+            self.queueInvalidation(key);
+            self.evict(key);
+            return null;
+        }
+        if (row.atlas_identity == current_identity) {
+            row.last_used_frame = self.frame_counter;
+            return row;
+        }
+        const new_blob = row.blob.rebound(self.allocator, current_atlas) catch {
+            self.queueInvalidation(key);
+            self.evict(key);
+            return null;
+        };
+        const old_identity = row.atlas_identity;
+        row.blob.deinit();
+        row.blob.* = new_blob;
+        row.atlas_identity = current_identity;
         row.last_used_frame = self.frame_counter;
+        self.decrementIdentity(old_identity);
+        self.incrementIdentity(current_identity) catch {
+            self.queueInvalidation(key);
+            self.evict(key);
+            return null;
+        };
         return row;
     }
 
@@ -343,6 +421,7 @@ pub const RowCache = struct {
         if (self.map.fetchRemove(key)) |kv| {
             var stale = kv.value;
             self.cache_bytes -= stale.byte_size;
+            self.decrementIdentity(stale.atlas_identity);
             destroyRow(self.allocator, &stale);
         }
 
@@ -369,6 +448,10 @@ pub const RowCache = struct {
             return null;
         };
         self.cache_bytes += byte_size;
+        self.incrementIdentity(atlas_identity) catch {
+            self.evict(key);
+            return null;
+        };
 
         var guard: usize = 0;
         while (self.cache_bytes > self.cache_budget and guard < 32) : (guard += 1) {
@@ -381,8 +464,25 @@ pub const RowCache = struct {
         if (self.map.fetchRemove(key)) |kv| {
             var row = kv.value;
             self.cache_bytes -= row.byte_size;
+            self.decrementIdentity(row.atlas_identity);
             destroyRow(self.allocator, &row);
         }
+    }
+
+    fn queueInvalidation(self: *RowCache, key: u64) void {
+        self.invalidations.append(self.allocator, key) catch {};
+    }
+
+    fn incrementIdentity(self: *RowCache, identity: u64) !void {
+        const gop = try self.entries_by_identity.getOrPut(identity);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    fn decrementIdentity(self: *RowCache, identity: u64) void {
+        const count = self.entries_by_identity.getPtr(identity) orelse return;
+        if (count.* > 0) count.* -= 1;
+        if (count.* == 0) _ = self.entries_by_identity.remove(identity);
     }
 
     fn evictLru(self: *RowCache) void {
@@ -396,55 +496,6 @@ pub const RowCache = struct {
             }
         }
         if (oldest_key) |k| self.evict(k);
-    }
-
-    /// Walk the cache after an atlas-snapshot bump. Entries with
-    /// `had_misses == true` are evicted (their blob's glyph list omits the
-    /// missing GIDs and `rebound` would silently succeed with absent
-    /// glyphs); clean entries are rebound to the new atlas.
-    pub fn rebindAll(
-        self: *RowCache,
-        new_atlas: *const snail.TextAtlas,
-        new_identity: u64,
-    ) RebindStats {
-        return self.rebindAllInto(new_atlas, new_identity, null);
-    }
-
-    /// Like `rebindAll`, but also write each evicted entry's content hash
-    /// into `evicted_out` (up to its capacity). Lets callers correlate
-    /// which specific rows' painted pixels are now stale, rather than
-    /// invalidating their entire downstream cache.
-    pub fn rebindAllInto(
-        self: *RowCache,
-        new_atlas: *const snail.TextAtlas,
-        new_identity: u64,
-        evicted_out: ?[]u64,
-    ) RebindStats {
-        var stale: std.ArrayList(u64) = .empty;
-        defer stale.deinit(self.allocator);
-        var it = self.map.iterator();
-        var rebound: usize = 0;
-        while (it.next()) |entry| {
-            const row = entry.value_ptr;
-            if (row.had_misses) {
-                stale.append(self.allocator, entry.key_ptr.*) catch {};
-                continue;
-            }
-            const new_blob = row.blob.rebound(self.allocator, new_atlas) catch {
-                stale.append(self.allocator, entry.key_ptr.*) catch {};
-                continue;
-            };
-            row.blob.deinit();
-            row.blob.* = new_blob;
-            row.atlas_identity = new_identity;
-            rebound += 1;
-        }
-        if (evicted_out) |out| {
-            const n = @min(out.len, stale.items.len);
-            @memcpy(out[0..n], stale.items[0..n]);
-        }
-        for (stale.items) |k| self.evict(k);
-        return .{ .rebound = rebound, .evicted = stale.items.len };
     }
 };
 
@@ -601,12 +652,7 @@ pub fn buildSnapshot(
         const content_hash = hashSnapshotRow(snapshot, row_start_index, cols);
         const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
 
-        var entry: ?*Row = null;
-        if (cache.get(content_hash)) |row| {
-            if (!row.had_misses and row.atlas_identity == atlas_identity) {
-                entry = row;
-            }
-        }
+        var entry: ?*Row = cache.getCurrent(content_hash, atlas, atlas_identity);
         if (entry == null) {
             builder.reset();
             const built = try buildRow(

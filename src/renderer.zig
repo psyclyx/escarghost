@@ -54,6 +54,11 @@ pub fn computeCellMetrics(atlas: *const snail.TextAtlas, font_size: f32) !CellMe
 
 pub const MaxTargets: usize = 4;
 
+/// Upper bound on how many stale identities `releaseStaleLeases` can
+/// retire in a single frame. The lease map should never get this deep
+/// in normal operation; the cap is purely to bound stack scratch.
+const MaxStaleLeases: usize = 32;
+
 /// Per-output-buffer paint state. We render directly into the caller's
 /// dmabuf with `backdrop = .target`, so each dmabuf's pixels persist
 /// across the swap chain rotation — but each one persists *its own*
@@ -162,7 +167,13 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     atlas_ref: *atlas_ref_mod.AtlasRef,
-    atlas_lease: atlas_ref_mod.AtlasRef.Lease,
+    /// One lease per atlas snapshot identity that still has live blobs
+    /// in `row_cache`. The current snapshot is always present, keyed by
+    /// `last_atlas_identity`. Older entries are kept around so cached
+    /// blobs can be lazily rebound on lookup (the rebind path
+    /// dereferences both the blob's old atlas and the new one); we drop
+    /// each older entry the frame its cache count drops to zero.
+    atlas_leases: std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease),
 
     gl_renderer: snail.Gles30Renderer,
     scene: snail.Scene,
@@ -248,13 +259,14 @@ pub const Renderer = struct {
     pub var dirty_full_repaint_frames: u64 = 0;
     pub var dirty_repaint_first_frame: u64 = 0;
     pub var dirty_repaint_atlas_changed: u64 = 0;
-    /// Atlas-snapshot bumps where `rebindAll` evicted at least one row.
-    /// Those evictions mean the canvas's painted pixels for those rows
-    /// are stale; the canvas must repaint. A subset of `atlas_changed`.
+    /// Atlas-snapshot bumps where the cache had to evict at least one
+    /// row (had_misses, or lazy rebind failed). Those evictions mean
+    /// the canvas's painted pixels for those rows are stale; the canvas
+    /// must repaint. A subset of `atlas_changed`.
     pub var dirty_repaint_atlas_hard: u64 = 0;
-    /// Most recent rebindAll() eviction count, snapshotted at the moment
-    /// of atlas refresh so recordDirtyStats can attribute hard vs soft.
-    var last_rebind_evicted: usize = 0;
+    /// Cache invalidations drained this frame, snapshotted at end of
+    /// `drawSnapshot` so `recordDirtyStats` can attribute hard vs soft.
+    var last_invalidation_count: usize = 0;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -269,19 +281,24 @@ pub const Renderer = struct {
         var atlas_lease = atlas_ref.acquire();
         errdefer atlas_lease.release();
         const atlas = atlas_lease.get();
+        const initial_identity = atlas.snapshotIdentity();
         const builder = snail.TextBlobBuilder.init(allocator, atlas);
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
 
+        var atlas_leases = std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease).init(allocator);
+        errdefer atlas_leases.deinit();
+        try atlas_leases.put(initial_identity, atlas_lease);
+
         return .{
             .allocator = allocator,
             .atlas_ref = atlas_ref,
-            .atlas_lease = atlas_lease,
+            .atlas_leases = atlas_leases,
             .gl_renderer = gl_renderer,
             .scene = scene,
             .builder = builder,
             .last_atlas_gen = atlas_ref.loadGeneration(),
-            .last_atlas_identity = atlas.snapshotIdentity(),
+            .last_atlas_identity = initial_identity,
             .row_cache = row_build.RowCache.init(allocator, 32 * 1024 * 1024),
             .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
             .cell_width = cell_width,
@@ -300,9 +317,19 @@ pub const Renderer = struct {
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
         self.builder.deinit();
-        self.atlas_lease.release();
+        var lease_it = self.atlas_leases.valueIterator();
+        while (lease_it.next()) |lease| lease.release();
+        self.atlas_leases.deinit();
         self.scene.deinit();
         self.gl_renderer.deinit();
+    }
+
+    /// Look up the current atlas snapshot via the lease map. Always
+    /// present — `init` seeds it and `refreshAtlas` adds the new
+    /// identity before bumping `last_atlas_identity`.
+    fn currentAtlas(self: *const Renderer) *const snail.TextAtlas {
+        const lease = self.atlas_leases.get(self.last_atlas_identity) orelse unreachable;
+        return lease.get();
     }
 
     /// Drop all per-target paint state so the next paint into any
@@ -338,7 +365,7 @@ pub const Renderer = struct {
             self.invalidateAllTargets();
         }
 
-        const atlas = self.atlas_lease.get();
+        const atlas = self.currentAtlas();
         self.scene.reset();
         self.builder.reset();
 
@@ -458,15 +485,33 @@ pub const Renderer = struct {
         self.invalidateAllTargets();
     }
 
-    /// Refresh atlas snapshot. On identity change, rebind cached blobs.
+    /// Pick up the latest atlas snapshot. Cached blobs are migrated
+    /// lazily via `RowCache.getCurrent` during `buildSnapshot`, so this
+    /// only installs the new lease + rebuilds the builder. Old leases
+    /// are released in `releaseStaleLeases` after the build completes,
+    /// once we know which identities still have live blobs.
     fn refreshAtlas(self: *Renderer) *const snail.TextAtlas {
-        last_rebind_evicted = 0;
         var next_lease = self.atlas_ref.acquire();
         const atlas = next_lease.get();
         const identity = atlas.snapshotIdentity();
         if (identity == self.last_atlas_identity) {
             next_lease.release();
-            return self.atlas_lease.get();
+            return atlas;
+        }
+
+        const gop = self.atlas_leases.getOrPut(identity) catch {
+            // Bookkeeping OOM. Drop the new lease and stay on the old
+            // snapshot — next frame will retry.
+            next_lease.release();
+            return self.currentAtlas();
+        };
+        if (gop.found_existing) {
+            // Identity already retained (shouldn't happen with the
+            // current AtlasRef contract, but be defensive). Release
+            // the duplicate.
+            next_lease.release();
+        } else {
+            gop.value_ptr.* = next_lease;
         }
 
         self.last_atlas_gen = self.atlas_ref.loadGeneration();
@@ -476,28 +521,35 @@ pub const Renderer = struct {
         self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
 
-        var evicted_buf: [MAX_SNAPSHOT_ROWS]u64 = undefined;
-        const stats = self.row_cache.rebindAllInto(atlas, identity, evicted_buf[0..]);
-        last_rebind_evicted = stats.evicted;
-        // Surgical per-target dirtying: rows whose blob couldn't be
-        // rebound have stale pixels in *every* dmabuf that painted
-        // them. Walk each target's hash table and null out the entries
-        // that match an evicted content hash; future frames into that
-        // dmabuf will repaint those rows. If we got truncated (more
-        // evictions than fit in our scratch buffer), fall back to a
-        // full invalidate.
-        if (stats.evicted > evicted_buf.len) {
-            self.invalidateAllTargets();
-        } else if (stats.evicted > 0) {
-            const evicted = evicted_buf[0..stats.evicted];
-            for (&self.targets) |*t| t.clearEvicted(evicted);
-        }
         if (self.debug_log_atlas) {
-            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (rebound={}, evicted={})\n", .{ identity, stats.rebound, stats.evicted });
+            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (lazy rebind)\n", .{identity});
         }
-        self.atlas_lease.release();
-        self.atlas_lease = next_lease;
         return atlas;
+    }
+
+    /// Release any retained lease whose snapshot no longer has cached
+    /// blobs referencing it. Called once per frame after `buildSnapshot`
+    /// has had a chance to migrate or evict rows lazily. The current
+    /// snapshot's lease is always retained even if no rows are cached
+    /// on it yet (e.g. an empty cache after metrics change).
+    fn releaseStaleLeases(self: *Renderer) void {
+        var stale_buf: [MaxStaleLeases]u64 = undefined;
+        var n: usize = 0;
+        var it = self.atlas_leases.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == self.last_atlas_identity) continue;
+            if (self.row_cache.entriesForIdentity(id) != 0) continue;
+            if (n >= stale_buf.len) break;
+            stale_buf[n] = id;
+            n += 1;
+        }
+        for (stale_buf[0..n]) |id| {
+            if (self.atlas_leases.fetchRemove(id)) |kv| {
+                var lease = kv.value;
+                lease.release();
+            }
+        }
     }
 
     fn rowMetrics(self: *const Renderer) row_build.Metrics {
@@ -619,6 +671,19 @@ pub const Renderer = struct {
             }
         }
 
+        // Any rows whose cache entry got evicted this frame (had_misses,
+        // or a rebound that couldn't satisfy the new atlas) have stale
+        // pixels in every dmabuf that painted them — the new shape
+        // would otherwise be skipped by the content_hash dirty check.
+        // Clear those slots before computeDirty so it picks them up.
+        const invalidations = self.row_cache.drainInvalidations();
+        last_invalidation_count = invalidations.len;
+        if (invalidations.len > 0) {
+            for (&self.targets) |*t| t.clearEvicted(invalidations);
+        }
+        self.row_cache.clearInvalidations();
+        self.releaseStaleLeases();
+
         const dirty = self.computeDirty(built);
         self.recordDirtyStats(built, dirty);
 
@@ -713,7 +778,7 @@ pub const Renderer = struct {
 
         const is_first_frame = self.prev_row_count == 0;
         const atlas_changed = !is_first_frame and self.prev_atlas_identity != self.last_atlas_identity;
-        const atlas_hard = atlas_changed and last_rebind_evicted > 0;
+        const atlas_hard = atlas_changed and last_invalidation_count > 0;
         if (is_first_frame) dirty_repaint_first_frame += 1;
         if (atlas_changed) dirty_repaint_atlas_changed += 1;
         if (atlas_hard) dirty_repaint_atlas_hard += 1;

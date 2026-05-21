@@ -157,7 +157,13 @@ pub const SnapshotRenderer = struct {
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
 
-    atlas_lease: ?atlas_ref_mod.AtlasRef.Lease = null,
+    /// One lease per atlas identity still referenced by `row_cache`.
+    /// The current snapshot's lease is keyed by `builder_atlas_identity`;
+    /// older entries stay until the row cache stops holding blobs on
+    /// them, so the lazy rebind path in `RowCache.getCurrent` can safely
+    /// dereference each blob's old atlas. `null` until the first
+    /// `ensureBuilderForAtlas` call seeds it.
+    atlas_leases: ?std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease) = null,
     builder_atlas_identity: u64 = 0,
 
     draw_buf: std.ArrayList(u32) = .empty,
@@ -210,7 +216,11 @@ pub const SnapshotRenderer = struct {
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
         if (self.builder_atlas_identity != 0) self.builder.deinit();
-        if (self.atlas_lease) |*lease| lease.release();
+        if (self.atlas_leases) |*leases| {
+            var it = leases.valueIterator();
+            while (it.next()) |lease| lease.release();
+            leases.deinit();
+        }
         self.scene.deinit();
         self.allocator.free(self.scratch_rects);
     }
@@ -221,16 +231,53 @@ pub const SnapshotRenderer = struct {
         if (id == self.builder_atlas_identity) return;
         if (self.builder_atlas_identity != 0) self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
-        // Migrate cached row blobs onto the new atlas snapshot. Dirty
-        // (had_misses) entries get evicted; clean entries are rebound.
-        // The old lease must outlive this call: blob.rebound's
-        // validateRebindAtlas dereferences the blob's atlas pointer (the
-        // old snapshot). First-time install (builder_atlas_identity == 0)
-        // has no cache yet, so this is a cheap no-op then.
-        _ = self.row_cache.rebindAll(atlas, id);
-        if (self.atlas_lease) |*old_lease| old_lease.release();
-        self.atlas_lease = atlas_lease.clone();
+
+        // Stash a lease for the new snapshot. We don't touch the cache
+        // here — RowCache.getCurrent rebinds (or evicts) stale entries
+        // lazily on lookup. `releaseStaleLeases` (called after each
+        // frame's build) drops any retained lease whose identity has
+        // no surviving cache entries.
+        if (self.atlas_leases == null) {
+            self.atlas_leases = std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease).init(self.allocator);
+        }
+        const gop = self.atlas_leases.?.getOrPut(id) catch {
+            // Bookkeeping OOM — fall back to the prior identity. Next
+            // frame's ensureBuilderForAtlas retries.
+            if (self.builder_atlas_identity != 0) self.builder.deinit();
+            self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
+            return;
+        };
+        if (!gop.found_existing) gop.value_ptr.* = atlas_lease.clone();
         self.builder_atlas_identity = id;
+    }
+
+    /// Release any retained lease whose snapshot no longer has cached
+    /// blobs referencing it. Called after each frame's build.
+    fn releaseStaleLeases(self: *SnapshotRenderer) void {
+        const leases = if (self.atlas_leases) |*m| m else return;
+        var stale_buf: [32]u64 = undefined;
+        var n: usize = 0;
+        var it = leases.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == self.builder_atlas_identity) continue;
+            if (self.row_cache.entriesForIdentity(id) != 0) continue;
+            if (n >= stale_buf.len) break;
+            stale_buf[n] = id;
+            n += 1;
+        }
+        for (stale_buf[0..n]) |id| {
+            if (leases.fetchRemove(id)) |kv| {
+                var lease = kv.value;
+                lease.release();
+            }
+        }
+    }
+
+    fn currentAtlas(self: *SnapshotRenderer) *const snail.TextAtlas {
+        const leases = self.atlas_leases orelse unreachable;
+        const lease = leases.get(self.builder_atlas_identity) orelse unreachable;
+        return lease.get();
     }
 
     /// Emit cursor geometry into the per-frame path picture. Same edge-snap
@@ -340,7 +387,7 @@ pub const SnapshotRenderer = struct {
             metrics,
             &self.row_cache,
             &self.builder,
-            self.atlas_lease.?.get(),
+            self.currentAtlas(),
             self.builder_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
@@ -355,7 +402,7 @@ pub const SnapshotRenderer = struct {
         // against the new atlas. On miss/failure: ship partial — buffer
         // shows gaps for the missing glyphs but the rest paints.
         if (!misses.isEmpty()) {
-            const baseline_atlas = self.atlas_lease.?.get();
+            const baseline_atlas = self.currentAtlas();
             const result = self.extendAtlas(atlas_lease, baseline_atlas, misses.text());
             if (result == .extended) {
                 self.scene.reset();
@@ -368,7 +415,7 @@ pub const SnapshotRenderer = struct {
                     metrics,
                     &self.row_cache,
                     &self.builder,
-                    self.atlas_lease.?.get(),
+                    self.currentAtlas(),
                     self.builder_atlas_identity,
                     self.scratch_rects,
                     rows_buf[0..],
@@ -380,6 +427,12 @@ pub const SnapshotRenderer = struct {
             }
         }
 
+        // CPU path rewrites the whole SHM buffer each frame, so there's
+        // no per-target dirty bookkeeping to invalidate. Still drain so
+        // the cache's list doesn't grow unbounded.
+        self.row_cache.clearInvalidations();
+        self.releaseStaleLeases();
+
         try self.flushDraw(built, default_bg, snapshot.header.default_fg, width, height, cell_width, cell_height);
         self.ephemeral_blobs.releaseAll();
         return misses;
@@ -387,11 +440,11 @@ pub const SnapshotRenderer = struct {
 
     fn extendAtlas(
         self: *SnapshotRenderer,
-        _: *const atlas_ref_mod.AtlasRef.Lease,
+        atlas_lease: *const atlas_ref_mod.AtlasRef.Lease,
         baseline: *const snail.TextAtlas,
         miss_text: []const u8,
     ) atlas_ref_mod.AtlasRef.ExtendResult {
-        const atlas_ref = self.atlas_lease.?.ref;
+        const atlas_ref = atlas_lease.ref;
         const result = atlas_ref.extend(baseline, miss_text) catch return .missing;
         if (result != .extended) return result;
         var new_lease = atlas_ref.acquire();
