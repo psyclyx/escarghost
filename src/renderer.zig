@@ -64,10 +64,11 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     atlas_ref: *atlas_ref_mod.AtlasRef,
-    /// Retained leases on every atlas snapshot identity we've ever
-    /// rendered against. The current snapshot is keyed by
-    /// `last_atlas_identity`; older entries are not currently released.
-    atlas_leases: std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease),
+    /// Lease on the current atlas snapshot. Swapped (and the old one
+    /// released) in `refreshAtlas` when the atlas thread publishes a
+    /// new identity. No blob outlives the frame that built it, so we
+    /// never need to retain more than one snapshot.
+    atlas_lease: atlas_ref_mod.AtlasRef.Lease,
 
     gl_renderer: snail.Gles30Renderer,
     scene: snail.Scene,
@@ -131,14 +132,10 @@ pub const Renderer = struct {
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
 
-        var atlas_leases = std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease).init(allocator);
-        errdefer atlas_leases.deinit();
-        try atlas_leases.put(initial_identity, atlas_lease);
-
         return .{
             .allocator = allocator,
             .atlas_ref = atlas_ref,
-            .atlas_leases = atlas_leases,
+            .atlas_lease = atlas_lease,
             .gl_renderer = gl_renderer,
             .scene = scene,
             .builder = builder,
@@ -160,19 +157,13 @@ pub const Renderer = struct {
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
         self.builder.deinit();
-        var lease_it = self.atlas_leases.valueIterator();
-        while (lease_it.next()) |lease| lease.release();
-        self.atlas_leases.deinit();
+        self.atlas_lease.release();
         self.scene.deinit();
         self.gl_renderer.deinit();
     }
 
-    /// Look up the current atlas snapshot via the lease map. Always
-    /// present — `init` seeds it and `refreshAtlas` adds the new
-    /// identity before bumping `last_atlas_identity`.
     fn currentAtlas(self: *const Renderer) *const snail.TextAtlas {
-        const lease = self.atlas_leases.get(self.last_atlas_identity) orelse unreachable;
-        return lease.get();
+        return self.atlas_lease.get();
     }
 
     /// No-op kept for API stability with the gpu_renderer worker. We
@@ -313,32 +304,21 @@ pub const Renderer = struct {
         self.cell_height = cell_height;
     }
 
-    /// Pick up the latest atlas snapshot. Installs the new lease and
-    /// rebuilds the builder against the fresh atlas.
+    /// Pick up the latest atlas snapshot. Swaps the retained lease and
+    /// rebuilds the builder against the fresh atlas. Safe to call only
+    /// at frame boundaries: the previous frame's ephemeral blobs must
+    /// have been released before the old lease is dropped here.
     fn refreshAtlas(self: *Renderer) *const snail.TextAtlas {
         var next_lease = self.atlas_ref.acquire();
         const atlas = next_lease.get();
         const identity = atlas.snapshotIdentity();
         if (identity == self.last_atlas_identity) {
             next_lease.release();
-            return atlas;
+            return self.atlas_lease.get();
         }
 
-        const gop = self.atlas_leases.getOrPut(identity) catch {
-            // Bookkeeping OOM. Drop the new lease and stay on the old
-            // snapshot — next frame will retry.
-            next_lease.release();
-            return self.currentAtlas();
-        };
-        if (gop.found_existing) {
-            // Identity already retained (shouldn't happen with the
-            // current AtlasRef contract, but be defensive). Release
-            // the duplicate.
-            next_lease.release();
-        } else {
-            gop.value_ptr.* = next_lease;
-        }
-
+        self.atlas_lease.release();
+        self.atlas_lease = next_lease;
         self.last_atlas_gen = self.atlas_ref.loadGeneration();
         self.last_atlas_identity = identity;
 
@@ -347,7 +327,7 @@ pub const Renderer = struct {
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
 
         if (self.debug_log_atlas) {
-            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (lazy rebind)\n", .{identity});
+            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {}\n", .{identity});
         }
         return atlas;
     }

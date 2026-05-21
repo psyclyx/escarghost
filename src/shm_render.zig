@@ -157,12 +157,12 @@ pub const SnapshotRenderer = struct {
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
 
-    /// Retained lease for the current atlas snapshot, keyed by
-    /// `builder_atlas_identity`. Older entries are dropped at end of
-    /// frame in `releaseStaleLeases` — nothing outlives the frame that
-    /// would still reference them. `null` until the first
-    /// `ensureBuilderForAtlas` call seeds it.
-    atlas_leases: ?std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease) = null,
+    /// Cloned lease on the atlas snapshot the builder is currently
+    /// bound to. Swapped in `ensureBuilderForAtlas` when the caller
+    /// hands us a new identity. `null` until the first frame seeds it.
+    /// No blob outlives the frame that built it, so we never need to
+    /// retain more than one snapshot.
+    atlas_lease: ?atlas_ref_mod.AtlasRef.Lease = null,
     builder_atlas_identity: u64 = 0,
 
     draw_buf: std.ArrayList(u32) = .empty,
@@ -209,11 +209,7 @@ pub const SnapshotRenderer = struct {
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
         if (self.builder_atlas_identity != 0) self.builder.deinit();
-        if (self.atlas_leases) |*leases| {
-            var it = leases.valueIterator();
-            while (it.next()) |lease| lease.release();
-            leases.deinit();
-        }
+        if (self.atlas_lease) |*lease| lease.release();
         self.scene.deinit();
         self.allocator.free(self.scratch_rects);
     }
@@ -224,53 +220,13 @@ pub const SnapshotRenderer = struct {
         if (id == self.builder_atlas_identity) return;
         if (self.builder_atlas_identity != 0) self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
-
-        // Stash a lease for the new snapshot. `releaseStaleLeases`
-        // (called after each frame's build) drops any retained lease
-        // that isn't the current builder identity — ephemeral blobs are
-        // released at end of frame so nothing else references the old
-        // atlas.
-        if (self.atlas_leases == null) {
-            self.atlas_leases = std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease).init(self.allocator);
-        }
-        const gop = self.atlas_leases.?.getOrPut(id) catch {
-            // Bookkeeping OOM — fall back to the prior identity. Next
-            // frame's ensureBuilderForAtlas retries.
-            if (self.builder_atlas_identity != 0) self.builder.deinit();
-            self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
-            return;
-        };
-        if (!gop.found_existing) gop.value_ptr.* = atlas_lease.clone();
+        if (self.atlas_lease) |*prev| prev.release();
+        self.atlas_lease = atlas_lease.clone();
         self.builder_atlas_identity = id;
     }
 
-    /// Release any retained lease that isn't the current builder
-    /// identity. Called after each frame's build; ephemeral blobs are
-    /// released at end of frame so nothing else references the old
-    /// atlas.
-    fn releaseStaleLeases(self: *SnapshotRenderer) void {
-        const leases = if (self.atlas_leases) |*m| m else return;
-        var stale_buf: [32]u64 = undefined;
-        var n: usize = 0;
-        var it = leases.iterator();
-        while (it.next()) |entry| {
-            const id = entry.key_ptr.*;
-            if (id == self.builder_atlas_identity) continue;
-            if (n >= stale_buf.len) break;
-            stale_buf[n] = id;
-            n += 1;
-        }
-        for (stale_buf[0..n]) |id| {
-            if (leases.fetchRemove(id)) |kv| {
-                var lease = kv.value;
-                lease.release();
-            }
-        }
-    }
-
     fn currentAtlas(self: *SnapshotRenderer) *const snail.TextAtlas {
-        const leases = self.atlas_leases orelse unreachable;
-        const lease = leases.get(self.builder_atlas_identity) orelse unreachable;
+        const lease = if (self.atlas_lease) |*l| l else unreachable;
         return lease.get();
     }
 
@@ -409,8 +365,6 @@ pub const SnapshotRenderer = struct {
                 phase_row_build_ns += rebuild_t0.elapsedNs();
             }
         }
-
-        self.releaseStaleLeases();
 
         try self.flushDraw(built, default_bg, snapshot.header.default_fg, width, height, cell_width, cell_height);
         self.ephemeral_blobs.releaseAll();
