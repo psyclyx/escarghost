@@ -143,6 +143,10 @@ fn recordCommit(path_tag: u8) void {
     g_commit_trace_len += 1;
 }
 
+fn elapsedSinceStartupMs() f64 {
+    return @as(f64, @floatFromInt(monotonicNowNs() - g_commit_trace_start_ns)) / @as(f64, std.time.ns_per_ms);
+}
+
 // Phase timing accumulators. Populated when SCRGO_LOG=commits.
 var g_phase_pty_read_ns: u64 = 0;
 var g_phase_feed_data_ns: u64 = 0;
@@ -153,11 +157,89 @@ var g_phase_feed_calls: u64 = 0;
 var g_phase_poll_ns: u64 = 0;
 var g_phase_poll_calls: u64 = 0;
 
+// Self-sampled memory peaks. Updated by a background thread that polls
+// /proc/self/status at ~5ms intervals while the process is alive, then
+// dumped at exit. Lets us verify bench reports against scrgo's own
+// view of its memory.
+var g_peak_vmrss_kib: u64 = 0;
+var g_peak_rss_anon_kib: u64 = 0;
+var g_mem_poll_stop: std.atomic.Value(bool) = .init(false);
+
+fn readProcStatus(key: []const u8) u64 {
+    const fd = c.open("/proc/self/status", c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+    var buf: [16384]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..@intCast(n)], '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        var tok = std.mem.tokenizeAny(u8, line[key.len..], " \t");
+        const val_s = tok.next() orelse return 0;
+        return std.fmt.parseInt(u64, val_s, 10) catch 0;
+    }
+    return 0;
+}
+
+fn memPollLoop() void {
+    while (!g_mem_poll_stop.load(.acquire)) {
+        const rss = readProcStatus("VmRSS:");
+        const anon = readProcStatus("RssAnon:");
+        if (rss > g_peak_vmrss_kib) g_peak_vmrss_kib = rss;
+        if (anon > g_peak_rss_anon_kib) g_peak_rss_anon_kib = anon;
+        var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 5 * std.time.ns_per_ms };
+        _ = c.nanosleep(&ts, null);
+    }
+}
+
 // Lifecycle milestone timestamps (ns since g_commit_trace_start_ns).
 var g_t_first_pty_ns: u64 = 0;
 var g_t_child_exited_ns: u64 = 0;
 var g_t_main_loop_exit_ns: u64 = 0;
 var g_t_before_exit_ns: u64 = 0;
+
+// Stale-frame diagnostic state. Per-commit we log whether the snapshot we
+// just committed was already behind the latest markRenderDirty serial; at
+// exit we log whether the *final* committed frame was caught up. Together
+// these answer "is the last frame the user sees actually up-to-date?"
+var g_last_commit_serial: u32 = 0;
+var g_last_commit_latest_at_commit: u32 = 0;
+var g_last_commit_ns: u64 = 0;
+var g_total_stale_commits: u64 = 0;
+var g_total_throttled_skips: u64 = 0;
+
+fn recordCommitSerial(path: u8, committed_serial: u32) void {
+    if (!debugFramesEnabled()) return;
+    const latest = g_render_serial;
+    const stale = committed_serial != latest;
+    if (stale) g_total_stale_commits += 1;
+    g_last_commit_serial = committed_serial;
+    g_last_commit_latest_at_commit = latest;
+    g_last_commit_ns = monotonicNowNs();
+    const tag: []const u8 = switch (path) {
+        'g' => "gpu",
+        'c' => "cpu",
+        else => "?",
+    };
+    if (stale) {
+        std.debug.print("scrgo: {s} commit serial={} latest={} STALE (gap={}, dirty={}) ({d:.1}ms)\n", .{
+            tag,
+            committed_serial,
+            latest,
+            latest - committed_serial,
+            g_gpu_snapshot_dirty or g_needs_redraw,
+            elapsedSinceStartupMs(),
+        });
+    } else {
+        std.debug.print("scrgo: {s} commit serial={} latest={} caught-up ({d:.1}ms)\n", .{
+            tag,
+            committed_serial,
+            latest,
+            elapsedSinceStartupMs(),
+        });
+    }
+}
 // Time between fork()/exec() and main() getting control (ld.so + libc
 // init + Zig _start). Sampled once at main entry.
 var g_t_premain_ns: u64 = 0;
@@ -394,9 +476,12 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     const utf8 = if (utf8_len > 0) ev.utf8[0..utf8_len] else null;
 
     if (utf8) |text| {
-        // Scroll to bottom on typing (common terminal behavior)
+        // Scroll to bottom on typing (common terminal behavior).
+        // No markRenderDirty here: the PTY echo will mark dirty when
+        // actual content arrives. Marking dirty before the echo
+        // triggers a wasted render of pre-keystroke state, costing one
+        // vsync — measured as ~17ms of extra input latency.
         g_term.scrollToBottom();
-        markRenderDirty();
         g_pty.write(text) catch {};
         return;
     }
@@ -404,7 +489,6 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
     const gkey = keysymToGhosttyKey(ev.keysym);
     if (gkey != 0) {
         g_term.scrollToBottom();
-        markRenderDirty();
         const encoded = g_term.encodeKey(
             gkey,
             ghostty_c.GHOSTTY_KEY_ACTION_PRESS,
@@ -474,18 +558,46 @@ fn onFocus(focused: bool) void {
     _ = focused;
 }
 
-fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, term: *terminal_mod.Terminal) void {
+fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mod.Wayland, term: *terminal_mod.Terminal) void {
+    _ = wl;
     if (g_target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !g_gpu_snapshot_dirty) return;
+    // No vsync gate. Worker renders as soon as there's a free dmabuf
+    // (and only one render at a time via render_in_flight). When the
+    // render finishes, the response handler commits immediately so
+    // the latest content lands as soon as the GPU is done — the
+    // compositor presents whichever buffer was last committed at
+    // each vsync. Skipping the vsync gate keeps input-to-screen
+    // latency at a single frame. The tradeoff is that under
+    // input-faster-than-render conditions (rare in a terminal), we
+    // over-commit and the compositor discards intermediate buffers;
+    // the wasted work is one render (~3ms) per redundant commit.
     gpu.queueRender(term, g_render_serial) catch |err| switch (err) {
-        error.NotReady, error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot => return,
+        error.NoFreeBuffer => {
+            // Track how long we're stuck without a released buffer
+            // so we can see at exit whether compositor release
+            // latency is the throughput bottleneck.
+            if (g_renderer_debug.commits) {
+                const now = monotonicNowNs();
+                if (g_buffer_starvation_start_ns == 0) g_buffer_starvation_start_ns = now;
+            }
+            return;
+        },
+        error.NotReady, error.Busy, error.NoFreeSnapshot => return,
         else => return,
     };
+    if (g_renderer_debug.commits and g_buffer_starvation_start_ns != 0) {
+        gpu_renderer.bufferStarvationAccumNs += monotonicNowNs() - g_buffer_starvation_start_ns;
+        gpu_renderer.bufferStarvationCount += 1;
+        g_buffer_starvation_start_ns = 0;
+    }
     if (debugRenderersEnabled()) {
         std.debug.print("scrgo: queued gpu renderer frame serial={}\n", .{g_render_serial});
     }
     g_gpu_snapshot_dirty = false;
 }
+
+var g_buffer_starvation_start_ns: u64 = 0;
 
 fn combineTimeout(a: c_int, b_opt: ?c_int) c_int {
     const b = b_opt orelse return a;
@@ -502,6 +614,9 @@ fn renderActivePath(
 ) void {
     if (active_path != .cpu or !g_needs_redraw) return;
     if (g_target_render_path == .gpu and gpu.active and gpu.ready) return;
+    // Same vsync throttle as the GPU path — wait for the compositor to
+    // ack the previous commit before queueing the next one.
+    if (wl.frame_pending) return;
     if (cpu.active) {
         const shm = wl.shm orelse return;
         cpu.ensureBuffers(@ptrCast(shm), wl.width, wl.height) catch |err| switch (err) {
@@ -514,7 +629,7 @@ fn renderActivePath(
         };
         g_needs_redraw = false;
         if (debugFramesEnabled()) {
-            std.debug.print("scrgo: queue cpu renderer frame {}x{}\n", .{ wl.width, wl.height });
+            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, elapsedSinceStartupMs() });
         }
         return;
     }
@@ -591,6 +706,17 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
     g_renderer_debug = rendererDebugOptions();
+    wayland_mod.Wayland.log_frame_events = g_renderer_debug.frames;
+    // Background memory poller (SCRGO_LOG=commits). Mirrors what the
+    // bench's poller thread sees from outside the process.
+    var mem_thread: ?std.Thread = null;
+    if (g_renderer_debug.commits) {
+        mem_thread = std.Thread.spawn(.{}, memPollLoop, .{}) catch null;
+    }
+    defer {
+        g_mem_poll_stop.store(true, .release);
+        if (mem_thread) |t| t.join();
+    }
     const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
     const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
     if (debugStartupEnabled()) {
@@ -858,7 +984,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        maybeQueueGpuRendererFrame(&gpu, &term);
+        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
         renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
         wl.flush();
 
@@ -949,8 +1075,16 @@ pub fn main(init: std.process.Init) !void {
                                 });
                             }
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
+                                // Commit immediately. If the compositor
+                                // still has the prior frame pending,
+                                // this commit replaces it in the
+                                // compositor's pending state — the
+                                // prior render is discarded, but
+                                // there's no latency penalty for the
+                                // newer content.
                                 gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                                 recordCommit('g');
+                                recordCommitSerial('g', resp.serial);
                                 if (!wl.frame_pending) wl.requestFrame();
                                 if (active_render_path != .gpu) {
                                     if (debugFramesEnabled()) {
@@ -996,14 +1130,33 @@ pub fn main(init: std.process.Init) !void {
             if (resp_opt) |resp| {
                 switch (resp.tag) {
                     .frame => {
-                        if (resp.buffer_index < cpu.buffer_count and
-                            active_render_path == .cpu and
-                            cpu.width == wl.width and cpu.height == wl.height)
-                        {
+                        const buffer_ok = resp.buffer_index < cpu.buffer_count;
+                        const path_ok = active_render_path == .cpu;
+                        const size_ok = cpu.width == wl.width and cpu.height == wl.height;
+                        if (buffer_ok and path_ok and size_ok) {
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                             recordCommit('c');
+                            recordCommitSerial('c', resp.serial);
                             if (!wl.frame_pending) wl.requestFrame();
+                            if (debugFramesEnabled()) {
+                                std.debug.print("scrgo: cpu renderer frame committed buffer={} ({d:.1}ms)\n", .{
+                                    resp.buffer_index,
+                                    elapsedSinceStartupMs(),
+                                });
+                            }
                             markFirstContentPaint();
+                        } else if (debugFramesEnabled()) {
+                            const reason: []const u8 = if (!buffer_ok)
+                                "bad buffer index"
+                            else if (!path_ok)
+                                "active path is gpu"
+                            else
+                                "size mismatch";
+                            std.debug.print("scrgo: cpu renderer frame dropped buffer={} ({s}) ({d:.1}ms)\n", .{
+                                resp.buffer_index,
+                                reason,
+                                elapsedSinceStartupMs(),
+                            });
                         }
                         // Only clear dirty if no new PTY data arrived
                         // while the renderer was working.
@@ -1042,7 +1195,7 @@ pub fn main(init: std.process.Init) !void {
         // After zoom/resize, draw before reading PTY so the reflowed
         // content is presented before the shell's SIGWINCH response
         // can clear the prompt line.
-        maybeQueueGpuRendererFrame(&gpu, &term);
+        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
         renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
 
         if (pollfds[1].revents & c.POLLIN != 0) {
@@ -1076,7 +1229,7 @@ pub fn main(init: std.process.Init) !void {
                     break;
                 }
                 if (debugPtyEnabled()) {
-                    std.debug.print("scrgo: PTY read {} bytes\n", .{n});
+                    std.debug.print("scrgo: PTY read {} bytes ({d:.1}ms)\n", .{ n, elapsedSinceStartupMs() });
                 }
                 if (g_renderer_debug.commits) {
                     g_phase_pty_read_ns += monotonicNowNs() - read_t0;
@@ -1109,10 +1262,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        maybeQueueGpuRendererFrame(&gpu, &term);
+        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
         renderActivePath(active_render_path, &gpu, &cpu, &wl, &term);
 
-        maybeQueueGpuRendererFrame(&gpu, &term);
+        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
     }
 
     if (g_renderer_debug.commits) {
@@ -1120,6 +1273,47 @@ pub fn main(init: std.process.Init) !void {
     }
     if (debugStartupEnabled()) {
         std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+    }
+    // Stale-last-frame diagnostic. If the final committed frame's serial is
+    // behind the latest dirty-serial, the user's last visible frame doesn't
+    // reflect the last PTY data we received — that's the "stale last frame"
+    // symptom. If they match, the pipeline caught up and any visible
+    // staleness is somewhere else (rendering, snapshot, or compositor).
+    if (debugFramesEnabled() and g_last_commit_serial != 0) {
+        const final_latest = g_render_serial;
+        const final_dirty = g_gpu_snapshot_dirty or g_needs_redraw;
+        const verdict: []const u8 = if (g_last_commit_serial == final_latest and !final_dirty)
+            "caught-up"
+        else
+            "STALE";
+        std.debug.print(
+            "scrgo: final commit serial={} latest={} dirty={} → {s}  (stale commits={}, throttle skips={})\n",
+            .{
+                g_last_commit_serial,
+                final_latest,
+                final_dirty,
+                verdict,
+                g_total_stale_commits,
+                g_total_throttled_skips,
+            },
+        );
+        // Wayland-side counters. If frame_done_count > request_frame_count,
+        // the compositor is firing extra callbacks (possibly from the second
+        // wl_surface_commit inside requestFrame). If frame_done_count <
+        // request_frame_count, callbacks are getting lost. If max
+        // frame-done dt is much larger than 1 vsync, the compositor is
+        // throttling our callbacks unexpectedly.
+        const ms = @as(f64, @floatFromInt(@as(u64, std.time.ns_per_ms)));
+        std.debug.print(
+            "scrgo: wayland  requestFrame={} (skipped={}, commits={})  frameDone={}  max_dt={d:.1}ms\n",
+            .{
+                wayland_mod.Wayland.request_frame_count,
+                wayland_mod.Wayland.request_frame_skipped,
+                wayland_mod.Wayland.request_frame_commit_count,
+                wayland_mod.Wayland.frame_done_count,
+                @as(f64, @floatFromInt(wayland_mod.Wayland.last_frame_done_dt_max_ns)) / ms,
+            },
+        );
     }
     renderer_mod.Renderer.frame_stats.log("frame");
     if (g_renderer_debug.commits) {
@@ -1138,6 +1332,77 @@ pub fn main(init: std.process.Init) !void {
                 gpu_renderer.snapshotPhaseCount,
             },
         );
+        std.debug.print(
+            "scrgo: gpu sched  worker_wait={d:.1}ms({})  buf_starvation={d:.1}ms({})\n",
+            .{
+                @as(f64, @floatFromInt(gpu_renderer.workerWaitAccumNs)) / ms,
+                gpu_renderer.workerWaitCount,
+                @as(f64, @floatFromInt(gpu_renderer.bufferStarvationAccumNs)) / ms,
+                gpu_renderer.bufferStarvationCount,
+            },
+        );
+        std.debug.print(
+            "scrgo: memory  peak_rss={d}MiB  peak_anon={d}MiB  final_rss={d}MiB  final_anon={d}MiB\n",
+            .{
+                g_peak_vmrss_kib / 1024,
+                g_peak_rss_anon_kib / 1024,
+                readProcStatus("VmRSS:") / 1024,
+                readProcStatus("RssAnon:") / 1024,
+            },
+        );
+        // Per-backend snail-pipeline breakdown. Each line covers the work
+        // done inside one drawSnapshot/renderToMemory call: row build (cache
+        // lookup + cold-row shaping), path picture build+freeze, snail
+        // resource upload, draw-list assembly, drawPass rasterization.
+        // Totals are cumulative across the run; divide by `frames` for
+        // average per-frame ms.
+        if (renderer_mod.Renderer.phase_frame_count > 0) {
+            std.debug.print(
+                "scrgo: gpu pipeline  frames={}  row_build={d:.1}ms  picture={d:.1}ms  upload={d:.1}ms  drawlist={d:.1}ms  draw={d:.1}ms\n",
+                .{
+                    renderer_mod.Renderer.phase_frame_count,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_row_build_ns)) / ms,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_picture_ns)) / ms,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_upload_ns)) / ms,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_drawlist_ns)) / ms,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.phase_draw_ns)) / ms,
+                },
+            );
+        }
+        if (renderer_mod.Renderer.dirty_frames_examined > 0) {
+            const frames_f = @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_frames_examined));
+            std.debug.print(
+                "scrgo: gpu dirty  frames={}  avg_dirty={d:.2}  avg_dirty_content={d:.2}  avg_visible={d:.2}  full_repaint={}(first={},atlas_soft={},atlas_hard={})  buckets[0,1,2-4,5-25,26+]=[{},{},{},{},{}]\n",
+                .{
+                    renderer_mod.Renderer.dirty_frames_examined,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_rows_with_cursor_total)) / frames_f,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_rows_content_only_total)) / frames_f,
+                    @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_rows_visible_total)) / frames_f,
+                    renderer_mod.Renderer.dirty_full_repaint_frames,
+                    renderer_mod.Renderer.dirty_repaint_first_frame,
+                    renderer_mod.Renderer.dirty_repaint_atlas_changed - renderer_mod.Renderer.dirty_repaint_atlas_hard,
+                    renderer_mod.Renderer.dirty_repaint_atlas_hard,
+                    renderer_mod.Renderer.dirty_bucket_0,
+                    renderer_mod.Renderer.dirty_bucket_1,
+                    renderer_mod.Renderer.dirty_bucket_2_4,
+                    renderer_mod.Renderer.dirty_bucket_5_25,
+                    renderer_mod.Renderer.dirty_bucket_26plus,
+                },
+            );
+        }
+        if (shm_render.phase_frame_count > 0) {
+            std.debug.print(
+                "scrgo: cpu pipeline  frames={}  row_build={d:.1}ms  picture={d:.1}ms  upload={d:.1}ms  drawlist={d:.1}ms  draw={d:.1}ms\n",
+                .{
+                    shm_render.phase_frame_count,
+                    @as(f64, @floatFromInt(shm_render.phase_row_build_ns)) / ms,
+                    @as(f64, @floatFromInt(shm_render.phase_picture_ns)) / ms,
+                    @as(f64, @floatFromInt(shm_render.phase_upload_ns)) / ms,
+                    @as(f64, @floatFromInt(shm_render.phase_drawlist_ns)) / ms,
+                    @as(f64, @floatFromInt(shm_render.phase_draw_ns)) / ms,
+                },
+            );
+        }
     }
     if (g_renderer_debug.commits and g_commit_trace_len > 0) {
         std.debug.print("scrgo: commit trace ({} commits):\n", .{g_commit_trace_len});

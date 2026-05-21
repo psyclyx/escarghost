@@ -23,6 +23,7 @@ const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
     @cInclude("fcntl.h");
+    @cInclude("sys/eventfd.h");
     @cInclude("gbm.h");
     @cInclude("drm/drm_fourcc.h");
     @cInclude("EGL/egl.h");
@@ -60,6 +61,21 @@ pub var snapshotPhaseCount: u64 = 0;
 /// how much wall time we saved by offloading.
 pub var captureCellsAccumNs: u64 = 0;
 pub var captureCellsCount: u64 = 0;
+
+/// Cumulative time the worker spent blocked on the request eventfd
+/// between render requests. If this is high relative to wall time
+/// while the workload was actively producing frames, something is
+/// keeping main from queueing renders (typically buffer-release
+/// latency from the compositor — `freeBufferIndex` returns null
+/// until the prior buffer is released).
+pub var workerWaitAccumNs: u64 = 0;
+pub var workerWaitCount: u64 = 0;
+/// Cumulative time spent with `g_gpu_snapshot_dirty == true` but
+/// unable to queue because `freeBufferIndex` returned null. Set by
+/// the main thread (gated on SCRGO_LOG=commits to avoid the clock
+/// read in hot paths when diagnostics are off).
+pub var bufferStarvationAccumNs: u64 = 0;
+pub var bufferStarvationCount: u64 = 0;
 
 fn monotonicNs() u64 {
     var ts: c.struct_timespec = undefined;
@@ -351,7 +367,13 @@ const DmabufAllocator = struct {
 pub const Frontend = struct {
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
-    cond: c.pthread_cond_t = undefined,
+    /// eventfd the worker blocks on instead of `pthread_cond_wait`.
+    /// pthread_cond does extra wait-queue bookkeeping that adds a few
+    /// hundred ns of variance on the wakeup path; a bare eventfd is a
+    /// direct futex underneath, which gives us tighter latency on
+    /// input-driven renders (key→pixel measurement was right at the
+    /// edge of one vsync, so jitter in the wakeup matters).
+    request_event_fd: c_int = -1,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
 
     // Set by main before spawning thread
@@ -386,14 +408,26 @@ pub const Frontend = struct {
         return self.response_fds[0];
     }
 
+    /// Wake the worker. eventfd accumulates writes into a counter and
+    /// the worker's blocking read drains it; we never miss a signal
+    /// even if we write twice between worker iterations.
+    fn signalWorker(self: *Frontend) void {
+        var v: u64 = 1;
+        _ = c.write(self.request_event_fd, &v, @sizeOf(u64));
+    }
+
     /// Start the GPU renderer thread. It immediately begins EGL init (no deps).
     pub fn start(self: *Frontend) !void {
         if (self.active) return;
         self.* = .{};
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
-        if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
-        errdefer _ = c.pthread_cond_destroy(&self.cond);
+        self.request_event_fd = c.eventfd(0, c.EFD_CLOEXEC);
+        if (self.request_event_fd < 0) return error.EventfdFailed;
+        errdefer {
+            _ = c.close(self.request_event_fd);
+            self.request_event_fd = -1;
+        }
 
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
@@ -442,7 +476,7 @@ pub const Frontend = struct {
         self.request_pending = true;
         self.ready = false;
         self.render_in_flight = false;
-        _ = c.pthread_cond_signal(&self.cond);
+        self.signalWorker();
     }
 
     pub fn freeBufferIndex(self: *Frontend) ?u8 {
@@ -491,7 +525,7 @@ pub const Frontend = struct {
         };
         self.request_pending = true;
         self.render_in_flight = true;
-        _ = c.pthread_cond_signal(&self.cond);
+        self.signalWorker();
     }
 
     pub fn readResponse(self: *Frontend) !?Response {
@@ -554,7 +588,7 @@ pub const Frontend = struct {
             defer _ = c.pthread_mutex_unlock(&self.mutex);
             self.stop_requested = true;
             was_ready = self.context_ready;
-            _ = c.pthread_cond_signal(&self.cond);
+            self.signalWorker();
         }
         if (!was_ready) {
             // OffscreenEgl.init() has no cancellation point, so joining
@@ -583,7 +617,10 @@ pub const Frontend = struct {
         if (self.response_fds[0] >= 0) _ = c.close(self.response_fds[0]);
         if (self.response_fds[1] >= 0) _ = c.close(self.response_fds[1]);
         self.response_fds = [_]c_int{-1} ** 2;
-        _ = c.pthread_cond_destroy(&self.cond);
+        if (self.request_event_fd >= 0) {
+            _ = c.close(self.request_event_fd);
+            self.request_event_fd = -1;
+        }
         _ = c.pthread_mutex_destroy(&self.mutex);
         self.active = false;
         self.context_ready = false;
@@ -624,15 +661,36 @@ pub const Frontend = struct {
         var current_width: u32 = 0;
         var current_height: u32 = 0;
 
-        // Phase 2+3: request loop
+        // Phase 2+3: request loop. We wait on the eventfd outside the
+        // mutex — pthread_cond_wait would tangle the wakeup with the
+        // mutex's wait queue, adding bookkeeping latency on a code
+        // path that fires on every keystroke. The eventfd is a direct
+        // futex; the mutex is only held to copy the request struct.
         while (true) {
-            _ = c.pthread_mutex_lock(&self.mutex);
-            while (!self.request_pending and !self.stop_requested) {
-                _ = c.pthread_cond_wait(&self.cond, &self.mutex);
+            // Fast-path: if request already pending we don't need to
+            // block on the eventfd. This trims a syscall when main
+            // posted a new request while we were processing the prior
+            // one.
+            const need_wait = blk: {
+                _ = c.pthread_mutex_lock(&self.mutex);
+                defer _ = c.pthread_mutex_unlock(&self.mutex);
+                break :blk !self.request_pending and !self.stop_requested;
+            };
+            if (need_wait) {
+                const wait_t0 = monotonicNs();
+                var v: u64 = 0;
+                _ = c.read(self.request_event_fd, &v, @sizeOf(u64));
+                workerWaitAccumNs += monotonicNs() - wait_t0;
+                workerWaitCount += 1;
             }
+            _ = c.pthread_mutex_lock(&self.mutex);
             if (self.stop_requested) {
                 _ = c.pthread_mutex_unlock(&self.mutex);
                 return;
+            }
+            if (!self.request_pending) {
+                _ = c.pthread_mutex_unlock(&self.mutex);
+                continue;
             }
             const request = self.request;
             self.request_pending = false;
@@ -685,9 +743,36 @@ pub const Frontend = struct {
                         renderer.?.setDebugResetAtlas(runtime_flags.reset_atlas_each_frame);
                         renderer.?.setViewport(request.width, request.height);
                     }
+                    // We just allocated fresh dmabuf textures; their
+                    // pixels are undefined. Drop any per-target paint
+                    // state the renderer was carrying over from the
+                    // prior allocation so the first paint into each
+                    // new buffer uses backdrop=.clear instead of
+                    // sampling garbage.
+                    renderer.?.notifyTargetsReinstalled();
+
+                    // Warm snail's GL pipeline: render a tiny synthetic
+                    // scene (one rect + one glyph + .target resolve)
+                    // into buffer 0. This compiles every shader program
+                    // we'll use at steady state and uploads the atlas to
+                    // the GPU, paying the first-use driver costs *before*
+                    // we tell the main thread the GPU is ready. Without
+                    // this, the first user-visible frames carry a ~10ms
+                    // compile spike. We invalidate target state at the
+                    // end so the first real frame still paints from
+                    // scratch with backdrop=.clear.
+                    const active_allocator = &allocator_state.?;
+                    if (active_allocator.count > 0) {
+                        const warm_t0 = perf.Timer.now();
+                        c.glBindFramebuffer(c.GL_FRAMEBUFFER, active_allocator.targets[0].framebuffer);
+                        c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
+                        renderer.?.warmPipeline() catch |err| {
+                            gpuDebug(timer, "pipeline warmup failed: {}", .{err});
+                        };
+                        gpuDebug(timer, "pipeline warmup in {d:.1}ms", .{warm_t0.elapsedMs()});
+                    }
 
                     // Publish buffer descriptors for main thread
-                    const active_allocator = &allocator_state.?;
                     self.buffer_count = @intCast(active_allocator.count);
                     for (0..active_allocator.count) |i| {
                         self.buffer_descs[i] = active_allocator.targets[i].desc;
@@ -734,6 +819,15 @@ pub const Frontend = struct {
                     const target = &active_allocator.targets[request.buffer_index];
                     c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
                     c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
+
+                    // drawSnapshot paints directly into the dmabuf
+                    // FBO bound above. Each dmabuf retains its own
+                    // pixels across the swap chain rotation; the
+                    // renderer keeps per-buffer paint state keyed by
+                    // buffer_index so it can compute the dirty set as
+                    // "rows that differ from *this dmabuf's* recorded
+                    // era," not from the global most-recent frame.
+                    r.setActiveTarget(request.buffer_index);
 
                     var misses: glyph_misses.Set = .{};
                     r.drawSnapshot(&self.snapshots[request.snapshot_slot], &misses) catch {

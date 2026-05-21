@@ -47,7 +47,7 @@ pub const SharedBuffer = struct {
             @intCast(width),
             @intCast(height),
             @intCast(stride),
-            wl.WL_SHM_FORMAT_ARGB8888,
+            wl.WL_SHM_FORMAT_ABGR8888,
         ) orelse return error.WlBufferCreateFailed;
 
         return .{
@@ -77,7 +77,9 @@ pub const SharedBuffer = struct {
     }
 
     pub fn fillBackground(self: *SharedBuffer, r: u8, g: u8, b: u8) void {
-        const pixel: u32 = 0xff000000 | (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
+        // Buffer is WL_SHM_FORMAT_ABGR8888 (little-endian bytes R, G, B, A)
+        // to match snail's RGBA8888 output contract.
+        const pixel: u32 = 0xff000000 | (@as(u32, b) << 16) | (@as(u32, g) << 8) | r;
         const pixels: [*]u32 = @ptrCast(@alignCast(self.map_ptr.?));
         @memset(pixels[0 .. self.desc.width * self.desc.height], pixel);
     }

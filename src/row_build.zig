@@ -406,6 +406,19 @@ pub const RowCache = struct {
         new_atlas: *const snail.TextAtlas,
         new_identity: u64,
     ) RebindStats {
+        return self.rebindAllInto(new_atlas, new_identity, null);
+    }
+
+    /// Like `rebindAll`, but also write each evicted entry's content hash
+    /// into `evicted_out` (up to its capacity). Lets callers correlate
+    /// which specific rows' painted pixels are now stale, rather than
+    /// invalidating their entire downstream cache.
+    pub fn rebindAllInto(
+        self: *RowCache,
+        new_atlas: *const snail.TextAtlas,
+        new_identity: u64,
+        evicted_out: ?[]u64,
+    ) RebindStats {
         var stale: std.ArrayList(u64) = .empty;
         defer stale.deinit(self.allocator);
         var it = self.map.iterator();
@@ -424,6 +437,10 @@ pub const RowCache = struct {
             row.blob.* = new_blob;
             row.atlas_identity = new_identity;
             rebound += 1;
+        }
+        if (evicted_out) |out| {
+            const n = @min(out.len, stale.items.len);
+            @memcpy(out[0..n], stale.items[0..n]);
         }
         for (stale.items) |k| self.evict(k);
         return .{ .rebound = rebound, .evicted = stale.items.len };
@@ -478,9 +495,16 @@ pub const EphemeralBlobs = struct {
 /// Output of `buildSnapshot`: the per-row draw list (cached blob + row_y)
 /// and an optional cursor overlay. Backends iterate this to emit the four
 /// passes (clear → bg/decoration rects → cursor rect → text scene).
+///
+/// Carries `blob` and `rects` directly rather than `*Row`: `cache.store`
+/// can rehash the underlying `std.AutoHashMap` mid-build and invalidate
+/// previously-returned `*Row` pointers, but the heap-allocated `blob` and
+/// `rects` themselves are stable across rehash.
 pub const RowDraw = struct {
-    row: *Row,
+    blob: *snail.TextBlob,
+    rects: []ColoredRect,
     row_y: f32,
+    content_hash: u64,
 };
 
 pub const CursorOverlay = struct {
@@ -580,7 +604,11 @@ pub fn buildSnapshot(
         cell_index = next_index;
 
         if (entry) |row| {
-            rows_out[row_count] = .{ .row = row, .row_y = row_y };
+            // Snapshot the stable heap pointers now. The `*Row` itself
+            // lives in `cache.map` and gets invalidated on rehash; the
+            // blob and rects allocations are independent and outlive any
+            // hashmap reshuffle.
+            rows_out[row_count] = .{ .blob = row.blob, .rects = row.rects, .row_y = row_y, .content_hash = content_hash };
             row_count += 1;
         }
     }

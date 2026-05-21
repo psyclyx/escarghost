@@ -390,14 +390,28 @@ pub const Wayland = struct {
     }
 
     pub fn requestFrame(self: *Wayland) void {
-        if (self.frame_pending) return;
+        if (self.frame_pending) {
+            request_frame_skipped += 1;
+            return;
+        }
         self.frame_callback = wl.wl_surface_frame(self.surface.?);
         if (self.frame_callback) |cb| {
             _ = wl.wl_callback_add_listener(cb, &frame_listener, @ptrCast(self));
             self.frame_pending = true;
         }
         wl.wl_surface_commit(self.surface.?);
+        request_frame_count += 1;
+        request_frame_commit_count += 1;
     }
+
+    /// Diagnostic counters. All access is on the main thread (Wayland's
+    /// single-threaded protocol), so plain vars are fine.
+    pub var request_frame_count: u64 = 0;
+    pub var request_frame_skipped: u64 = 0;
+    pub var request_frame_commit_count: u64 = 0;
+    pub var frame_done_count: u64 = 0;
+    pub var last_frame_done_ns: u64 = 0;
+    pub var last_frame_done_dt_max_ns: u64 = 0;
 
     pub fn resizeEgl(self: *Wayland, w: u32, h: u32) void {
         self.width = w;
@@ -770,5 +784,25 @@ pub const Wayland = struct {
         if (callback) |cb| wl.wl_callback_destroy(cb);
         self.frame_callback = null;
         self.frame_pending = false;
+        const now_ns = monotonicNowNsLocal();
+        var dt_ms: f64 = 0;
+        if (last_frame_done_ns != 0) {
+            const dt = now_ns - last_frame_done_ns;
+            if (dt > last_frame_done_dt_max_ns) last_frame_done_dt_max_ns = dt;
+            dt_ms = @as(f64, @floatFromInt(dt)) / @as(f64, std.time.ns_per_ms);
+        }
+        last_frame_done_ns = now_ns;
+        frame_done_count += 1;
+        if (log_frame_events) {
+            std.debug.print("scrgo: wl frame_done #{} dt={d:.1}ms\n", .{ frame_done_count, dt_ms });
+        }
+    }
+
+    pub var log_frame_events: bool = false;
+
+    fn monotonicNowNsLocal() u64 {
+        var ts: time_c.struct_timespec = undefined;
+        if (time_c.clock_gettime(time_c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
     }
 };
