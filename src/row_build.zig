@@ -15,7 +15,30 @@ const glyph_misses = @import("glyph_misses.zig");
 const color = @import("color.zig");
 const selection_mod = @import("selection.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
+const perf = @import("perf.zig");
 const Rgb = color.Rgb;
+
+/// Sub-phase counters for `buildSnapshot`. Split the row-build wall time
+/// into "cache lookup + rebind" (hit path) and "shape + store" (miss
+/// path) so a slow-frame warning can attribute drift to one or the other.
+/// Single writer (the GPU worker thread, which is also the sole caller
+/// of buildSnapshot); diagnostic-only readers are benign.
+pub var phase_row_lookup_ns: u64 = 0;
+pub var phase_row_rebuild_ns: u64 = 0;
+pub var phase_row_hit_count: u64 = 0;
+pub var phase_row_miss_count: u64 = 0;
+/// Further split of the rebuild path: HB shape walk, blob finalize +
+/// rect dupe, and cache store (which includes LRU eviction). Lets the
+/// slow-frame line show which sub-step in the miss path is creeping.
+pub var phase_row_shape_ns: u64 = 0;
+pub var phase_row_finish_ns: u64 = 0;
+pub var phase_row_store_ns: u64 = 0;
+/// Total time spent inside the LRU eviction loop and the count of
+/// `evictLru` iterations across all stores in the frame. Lets the
+/// slow-frame line surface whether per-store cost growth is from
+/// excessive evictions vs per-eviction work.
+pub var phase_row_store_evict_ns: u64 = 0;
+pub var phase_row_store_evict_count: u64 = 0;
 
 pub const baseline_factor: f32 = 0.8;
 pub const MAX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 3;
@@ -313,64 +336,82 @@ pub fn buildRow(
 /// (or the per-frame Scene) is already holding. The `lru_*` links form
 /// an intrusive doubly-linked list owned by the enclosing RowCache; do
 /// not touch them outside cache code.
+/// Sentinel for "no slot" in the index-based LRU links and free list.
+const NIL_SLOT: u32 = std.math.maxInt(u32);
+
+/// Slot allocations are grouped into fixed-size chunks. Each chunk is a
+/// stable heap allocation (we never realloc), so any pointer taken into
+/// a slot (in particular `&row.blob` for `RowDraw.blob`) remains valid
+/// even when the pool grows. Chunk size is a tradeoff: smaller chunks
+/// waste less memory on under-utilization, larger chunks reduce the
+/// per-chunk header overhead and amortize allocations.
+const SLOT_CHUNK_SIZE: u32 = 256;
+const SLOT_CHUNK_SHIFT: u5 = 8; // log2(SLOT_CHUNK_SIZE)
+const SLOT_CHUNK_MASK: u32 = SLOT_CHUNK_SIZE - 1;
+
+const SlotChunk = [SLOT_CHUNK_SIZE]Row;
+
 pub const Row = struct {
-    blob: *snail.TextBlob,
+    blob: snail.TextBlob,
     rects: []ColoredRect,
     content_hash: u64,
     atlas_identity: u64,
     had_misses: bool,
     byte_size: usize,
-    lru_prev: ?*Row = null,
-    lru_next: ?*Row = null,
+    /// Doubly-linked LRU. `NIL_SLOT` = no neighbor. When a slot is on
+    /// the free list (not in the cache), `lru_next` doubles as the
+    /// next-free index and `lru_prev` is meaningless.
+    lru_prev: u32 = NIL_SLOT,
+    lru_next: u32 = NIL_SLOT,
 };
 
-/// Per-row TextBlob+rect cache shared between backends. One instance per
-/// renderer (no cross-thread sharing); each renderer's lock-free atlas
-/// snapshot identity is held alongside the content hash on each entry.
+/// Per-row TextBlob+rect cache. One instance per renderer (no
+/// cross-thread sharing); each row records the atlas snapshot identity
+/// it was shaped against, so atlas extensions can rebind (or evict)
+/// each row lazily on the next lookup rather than sweeping the whole
+/// cache.
 ///
-/// Atlas-snapshot bumps don't trigger a sweep. Cached blobs stay on
-/// whatever identity they were shaped against; the next `getCurrent`
-/// call rebinds (or evicts) them lazily. Callers track live atlas
-/// snapshots via `entriesForIdentity` so each snapshot's lease can be
-/// released the moment the cache stops referencing it. Metrics changes
-/// (font size, DPI) invalidate the entire cache because each cached
-/// blob bakes `placement.em` into its per-instance `Transform2D`.
+/// Row storage is a chunked slot pool: rows live in fixed-size chunks
+/// owned by `chunks`, addressed by `u32` indices. The HashMap maps
+/// content hashes to slot indices, and the LRU links are slot indices
+/// too — no per-row heap allocations on hot paths. Variable-size
+/// payloads (the blob's glyphs slice, the rects slice) still flow
+/// through `allocator`, but the highest-frequency alloc (the `Row`
+/// struct itself) is amortized over the chunk allocation.
 ///
-/// LRU order is tracked via an intrusive doubly-linked list across the
-/// `Row` allocations themselves: `lru_head` is the next eviction
-/// candidate, `lru_tail` the most-recently-used. Touching a row on
-/// lookup or storing a new one moves it to the tail in O(1); evicting
-/// pops the head in O(1).
+/// LRU order: `lru_head` is the next eviction candidate, `lru_tail`
+/// the most-recently-used; touching/storing/evicting are O(1).
 pub const RowCache = struct {
     allocator: std.mem.Allocator,
-    map: std.AutoHashMap(u64, *Row),
+    map: std.AutoHashMap(u64, u32),
     cache_bytes: usize = 0,
     cache_budget: usize,
-    /// Count of cached rows whose blob is bound to each atlas snapshot
-    /// identity. Caller reads this via `entriesForIdentity` to decide
-    /// when each snapshot's lease can be safely released.
     entries_by_identity: std.AutoHashMap(u64, usize),
-    /// Content hashes whose entry was evicted this frame because the
-    /// snapshot they reference is no longer rebindable (had_misses, or
-    /// rebound failed). Callers drain this after `buildSnapshot` to
-    /// zero matching slots in each TargetState — otherwise the
-    /// freshly-shaped replacement row would be skipped by the dirty
-    /// check (content_hash unchanged) and the dmabuf would keep
-    /// showing stale glyphs.
     invalidations: std.ArrayList(u64),
-    /// Oldest entry; next eviction candidate. Null when cache is empty.
-    lru_head: ?*Row = null,
-    /// Most-recently-used entry; new stores append here. Null when
-    /// cache is empty.
-    lru_tail: ?*Row = null,
+
+    /// Stable-pointer chunks of `Row` storage. Each `*SlotChunk` is its
+    /// own allocation and never moves; the pool grows by appending new
+    /// chunks. Slot `i` lives at `chunks.items[i >> SLOT_CHUNK_SHIFT][i & SLOT_CHUNK_MASK]`.
+    chunks: std.ArrayList(*SlotChunk),
+    /// Number of slots ever handed out from chunks (used to find the
+    /// next slot when the free list is empty). Slots `[0, allocated_slots)`
+    /// are either in the cache or on the free list.
+    allocated_slots: u32 = 0,
+    /// Head of the free list of evicted slots, or `NIL_SLOT` when
+    /// every allocated slot is in use.
+    free_head: u32 = NIL_SLOT,
+
+    lru_head: u32 = NIL_SLOT,
+    lru_tail: u32 = NIL_SLOT,
 
     pub fn init(allocator: std.mem.Allocator, budget_bytes: usize) RowCache {
         return .{
             .allocator = allocator,
-            .map = std.AutoHashMap(u64, *Row).init(allocator),
+            .map = std.AutoHashMap(u64, u32).init(allocator),
             .cache_budget = budget_bytes,
             .entries_by_identity = std.AutoHashMap(u64, usize).init(allocator),
             .invalidations = .empty,
+            .chunks = .empty,
         };
     }
 
@@ -379,37 +420,63 @@ pub const RowCache = struct {
         self.map.deinit();
         self.entries_by_identity.deinit();
         self.invalidations.deinit(self.allocator);
+        for (self.chunks.items) |chunk| self.allocator.destroy(chunk);
+        self.chunks.deinit(self.allocator);
+    }
+
+    pub const Stats = struct {
+        entries: usize,
+        cache_bytes: usize,
+        identities: usize,
+    };
+
+    pub fn stats(self: *const RowCache) Stats {
+        return .{
+            .entries = self.map.count(),
+            .cache_bytes = self.cache_bytes,
+            .identities = self.entries_by_identity.count(),
+        };
     }
 
     pub fn clear(self: *RowCache) void {
-        var it = self.map.valueIterator();
-        while (it.next()) |row_pp| destroyRow(self.allocator, row_pp.*);
+        // Walk every live slot (those reachable from the LRU list) and
+        // destroy its payload. Don't touch the free list — those slots
+        // hold no payload.
+        var idx = self.lru_head;
+        while (idx != NIL_SLOT) {
+            const row = self.slot(idx);
+            const next = row.lru_next;
+            row.blob.deinit();
+            self.allocator.free(row.rects);
+            idx = next;
+        }
         self.map.clearRetainingCapacity();
         self.entries_by_identity.clearRetainingCapacity();
         self.invalidations.clearRetainingCapacity();
         self.cache_bytes = 0;
-        self.lru_head = null;
-        self.lru_tail = null;
+        self.lru_head = NIL_SLOT;
+        self.lru_tail = NIL_SLOT;
+        // Reset the pool: every slot is now free.
+        self.allocated_slots = 0;
+        self.free_head = NIL_SLOT;
     }
 
-    /// Number of cached rows currently bound to `identity`. The caller
-    /// holds a lease on each identity with a non-zero count; once a
-    /// count drops to zero the lease can be released because no blob
-    /// dereferences that snapshot anymore.
     pub fn entriesForIdentity(self: *const RowCache, identity: u64) usize {
         return self.entries_by_identity.get(identity) orelse 0;
     }
 
-    /// Content hashes that lost their cache entry this frame due to
-    /// stale-atlas state. Drained in one go by the caller — the slice
-    /// stays valid until `clearInvalidations` or another cache mutation
-    /// that grows the list.
     pub fn drainInvalidations(self: *RowCache) []const u64 {
         return self.invalidations.items;
     }
 
     pub fn clearInvalidations(self: *RowCache) void {
         self.invalidations.clearRetainingCapacity();
+    }
+
+    /// Resolve a slot index to its `Row`. Slot pointers are stable for
+    /// the lifetime of the cache: chunks are never reallocated.
+    pub fn slot(self: *const RowCache, index: u32) *Row {
+        return &self.chunks.items[index >> SLOT_CHUNK_SHIFT][index & SLOT_CHUNK_MASK];
     }
 
     /// Look up a row by content hash, transparently migrating its blob
@@ -420,48 +487,54 @@ pub const RowCache = struct {
     /// `invalidations` so the caller can clear any downstream paint
     /// state keyed by the same content hash before the replacement row
     /// gets painted.
-    ///
-    /// `current_atlas` must outlive the call: the rebind path
-    /// dereferences both the new and the row's old atlas pointers.
     pub fn getCurrent(
         self: *RowCache,
         key: u64,
         current_atlas: *const snail.TextAtlas,
         current_identity: u64,
     ) ?*Row {
-        const row = self.map.get(key) orelse return null;
+        const idx = self.map.get(key) orelse return null;
+        const row = self.slot(idx);
         if (row.had_misses) {
             self.queueInvalidation(key);
-            self.evictRow(row);
+            self.evictSlot(idx);
             return null;
         }
         if (row.atlas_identity == current_identity) {
-            self.touchLru(row);
+            self.touchLru(idx);
             return row;
         }
         const new_blob = row.blob.rebound(self.allocator, current_atlas) catch {
             self.queueInvalidation(key);
-            self.evictRow(row);
+            self.evictSlot(idx);
             return null;
         };
         const old_identity = row.atlas_identity;
         row.blob.deinit();
-        row.blob.* = new_blob;
+        row.blob = new_blob;
         row.atlas_identity = current_identity;
         self.decrementIdentity(old_identity);
         self.incrementIdentity(current_identity) catch {
             self.queueInvalidation(key);
-            self.evictRow(row);
+            self.evictSlot(idx);
             return null;
         };
-        self.touchLru(row);
+        self.touchLru(idx);
         return row;
     }
 
+    /// Per-entry memory overhead independent of glyph/rect payload.
+    /// Without this, a blank row (no rects, no glyphs) charges 0 against
+    /// the budget — the LRU keeps growing such rows forever and the
+    /// content-byte eviction loop walks past them without freeing any
+    /// budget bytes. Sized to roughly cover the slot + HashMap entry
+    /// per row.
+    const baseline_byte_overhead: usize = @sizeOf(Row) + 32;
+
     /// Take ownership of a freshly-built blob+rects under `key`. Returns
-    /// the inserted entry, or null if the underlying allocation fails (in
-    /// which case `blob` and `rects` are deinit/freed before return so the
-    /// caller never has to clean up after a failed store).
+    /// the inserted row, or null if the underlying allocation fails (in
+    /// which case `blob` and `rects` are deinit/freed before return so
+    /// the caller never has to clean up after a failed store).
     pub fn store(
         self: *RowCache,
         key: u64,
@@ -470,68 +543,74 @@ pub const RowCache = struct {
         atlas_identity: u64,
         had_misses: bool,
     ) ?*Row {
-        if (self.map.get(key)) |stale| self.evictRow(stale);
+        if (self.map.get(key)) |stale_idx| self.evictSlot(stale_idx);
 
-        const byte_size = rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
-        const blob_slot = self.allocator.create(snail.TextBlob) catch {
+        const byte_size = baseline_byte_overhead + rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
+        const idx = self.acquireSlot() catch {
             var b = blob;
             b.deinit();
             self.allocator.free(rects);
             return null;
         };
-        blob_slot.* = blob;
-        const row = self.allocator.create(Row) catch {
-            blob_slot.deinit();
-            self.allocator.destroy(blob_slot);
-            self.allocator.free(rects);
-            return null;
-        };
+        const row = self.slot(idx);
         row.* = .{
-            .blob = blob_slot,
+            .blob = blob,
             .rects = rects,
             .content_hash = key,
             .atlas_identity = atlas_identity,
             .had_misses = had_misses,
             .byte_size = byte_size,
         };
-        self.map.put(key, row) catch {
-            destroyRow(self.allocator, row);
+        self.map.put(key, idx) catch {
+            row.blob.deinit();
+            self.allocator.free(row.rects);
+            self.releaseSlot(idx);
             return null;
         };
         self.cache_bytes += byte_size;
-        self.appendLru(row);
+        self.appendLru(idx);
         self.incrementIdentity(atlas_identity) catch {
-            // Roll back the put so we don't keep a Row whose identity
-            // bookkeeping is wrong. `evictRow` undoes everything we
-            // just did (map, lru, cache_bytes) except identity
-            // counting, which we never bumped — that's intentional.
             _ = self.map.remove(key);
-            self.unlinkLru(row);
+            self.unlinkLru(idx);
             self.cache_bytes -= byte_size;
-            destroyRow(self.allocator, row);
+            row.blob.deinit();
+            self.allocator.free(row.rects);
+            self.releaseSlot(idx);
             return null;
         };
 
+        // Loop is bounded by entries-added-this-store (1) plus the
+        // standing surplus from prior stores. With `baseline_byte_overhead`
+        // charging every entry, each eviction makes guaranteed progress
+        // and the loop converges in well under the cap during normal
+        // operation.
+        const evict_t0 = perf.Timer.now();
         var guard: usize = 0;
-        while (self.cache_bytes > self.cache_budget and guard < 32) : (guard += 1) {
+        while (self.cache_bytes > self.cache_budget and guard < 256) : (guard += 1) {
             self.evictLru();
         }
+        phase_row_store_evict_ns += evict_t0.elapsedNs();
+        phase_row_store_evict_count += guard;
         return row;
     }
 
     pub fn evict(self: *RowCache, key: u64) void {
-        const row = self.map.get(key) orelse return;
-        self.evictRow(row);
+        const idx = self.map.get(key) orelse return;
+        self.evictSlot(idx);
     }
 
-    /// Drop `row` from the cache. Caller must hold a valid pointer;
-    /// `getCurrent` and `evict` are the usual entry points.
-    fn evictRow(self: *RowCache, row: *Row) void {
+    /// Drop the slot at `idx` from the cache and return its slot to the
+    /// pool. Frees the row's payload (glyphs slice via `blob.deinit`,
+    /// rects slice via the allocator).
+    fn evictSlot(self: *RowCache, idx: u32) void {
+        const row = self.slot(idx);
         _ = self.map.remove(row.content_hash);
         self.cache_bytes -= row.byte_size;
         self.decrementIdentity(row.atlas_identity);
-        self.unlinkLru(row);
-        destroyRow(self.allocator, row);
+        self.unlinkLru(idx);
+        row.blob.deinit();
+        self.allocator.free(row.rects);
+        self.releaseSlot(idx);
     }
 
     fn queueInvalidation(self: *RowCache, key: u64) void {
@@ -551,52 +630,79 @@ pub const RowCache = struct {
     }
 
     fn evictLru(self: *RowCache) void {
-        const oldest = self.lru_head orelse return;
-        self.evictRow(oldest);
+        if (self.lru_head == NIL_SLOT) return;
+        self.evictSlot(self.lru_head);
     }
 
-    /// Append `row` at the tail (most-recently-used end). Assumes the
-    /// row is not currently in the list (its links are null, e.g.
-    /// fresh from `store`).
-    fn appendLru(self: *RowCache, row: *Row) void {
+    /// Acquire a fresh slot. Pops from the free list when possible;
+    /// otherwise allocates from the current chunk, growing the pool by
+    /// one chunk when the current one is full.
+    fn acquireSlot(self: *RowCache) !u32 {
+        if (self.free_head != NIL_SLOT) {
+            const idx = self.free_head;
+            self.free_head = self.slot(idx).lru_next;
+            return idx;
+        }
+        const chunk_idx = self.allocated_slots >> SLOT_CHUNK_SHIFT;
+        if (chunk_idx >= self.chunks.items.len) {
+            const new_chunk = try self.allocator.create(SlotChunk);
+            self.chunks.append(self.allocator, new_chunk) catch |err| {
+                self.allocator.destroy(new_chunk);
+                return err;
+            };
+        }
+        const idx = self.allocated_slots;
+        self.allocated_slots += 1;
+        return idx;
+    }
+
+    /// Return a slot to the free list. The slot's payload must already
+    /// be released; we only repurpose `lru_next` as the free-list link.
+    fn releaseSlot(self: *RowCache, idx: u32) void {
+        const row = self.slot(idx);
+        row.lru_next = self.free_head;
+        self.free_head = idx;
+    }
+
+    fn appendLru(self: *RowCache, idx: u32) void {
+        const row = self.slot(idx);
         row.lru_prev = self.lru_tail;
-        row.lru_next = null;
-        if (self.lru_tail) |t| t.lru_next = row;
-        self.lru_tail = row;
-        if (self.lru_head == null) self.lru_head = row;
+        row.lru_next = NIL_SLOT;
+        if (self.lru_tail != NIL_SLOT) self.slot(self.lru_tail).lru_next = idx;
+        self.lru_tail = idx;
+        if (self.lru_head == NIL_SLOT) self.lru_head = idx;
     }
 
-    /// Detach `row` from the list. Safe whether or not the row is the
-    /// head/tail; the links are zeroed so `appendLru` can re-insert.
-    fn unlinkLru(self: *RowCache, row: *Row) void {
-        if (row.lru_prev) |p| p.lru_next = row.lru_next else self.lru_head = row.lru_next;
-        if (row.lru_next) |n| n.lru_prev = row.lru_prev else self.lru_tail = row.lru_prev;
-        row.lru_prev = null;
-        row.lru_next = null;
+    fn unlinkLru(self: *RowCache, idx: u32) void {
+        const row = self.slot(idx);
+        if (row.lru_prev != NIL_SLOT) {
+            self.slot(row.lru_prev).lru_next = row.lru_next;
+        } else {
+            self.lru_head = row.lru_next;
+        }
+        if (row.lru_next != NIL_SLOT) {
+            self.slot(row.lru_next).lru_prev = row.lru_prev;
+        } else {
+            self.lru_tail = row.lru_prev;
+        }
+        row.lru_prev = NIL_SLOT;
+        row.lru_next = NIL_SLOT;
     }
 
-    /// Move `row` to the most-recently-used end. No-op when already
-    /// there, which is the steady-state case for a hot row hit twice
-    /// without any intervening stores.
-    fn touchLru(self: *RowCache, row: *Row) void {
-        if (row == self.lru_tail) return;
-        self.unlinkLru(row);
-        self.appendLru(row);
+    fn touchLru(self: *RowCache, idx: u32) void {
+        if (idx == self.lru_tail) return;
+        self.unlinkLru(idx);
+        self.appendLru(idx);
     }
 };
 
-fn destroyRow(allocator: std.mem.Allocator, row: *Row) void {
-    row.blob.deinit();
-    allocator.destroy(row.blob);
-    allocator.free(row.rects);
-    allocator.destroy(row);
-}
-
-/// Per-frame stash of heap-allocated `TextBlob`s that the scene records
-/// pointers to. Freed in bulk at end of frame; both backends own one.
+/// Per-frame stash for heap-allocated `TextBlob`s + `ColoredRect`
+/// slices that the rendered scene references by pointer. Released in
+/// bulk at end of frame; both backends own one.
 pub const EphemeralBlobs = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(*snail.TextBlob) = .empty,
+    rect_slices: std.ArrayList([]ColoredRect) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) EphemeralBlobs {
         return .{ .allocator = allocator };
@@ -605,6 +711,7 @@ pub const EphemeralBlobs = struct {
     pub fn deinit(self: *EphemeralBlobs) void {
         self.releaseAll();
         self.items.deinit(self.allocator);
+        self.rect_slices.deinit(self.allocator);
     }
 
     pub fn releaseAll(self: *EphemeralBlobs) void {
@@ -613,6 +720,8 @@ pub const EphemeralBlobs = struct {
             self.allocator.destroy(b);
         }
         self.items.clearRetainingCapacity();
+        for (self.rect_slices.items) |r| self.allocator.free(r);
+        self.rect_slices.clearRetainingCapacity();
     }
 
     pub fn stash(self: *EphemeralBlobs, blob: snail.TextBlob) ?*const snail.TextBlob {
@@ -629,6 +738,12 @@ pub const EphemeralBlobs = struct {
         };
         return slot;
     }
+
+    /// Take ownership of a heap-allocated rect slice. The slice is
+    /// freed back to `allocator` at the next `releaseAll`.
+    pub fn stashRects(self: *EphemeralBlobs, rects: []ColoredRect) !void {
+        try self.rect_slices.append(self.allocator, rects);
+    }
 };
 
 /// Output of `buildSnapshot`: the per-row draw list (cached blob + row_y)
@@ -640,7 +755,7 @@ pub const EphemeralBlobs = struct {
 /// previously-returned `*Row` pointers, but the heap-allocated `blob` and
 /// `rects` themselves are stable across rehash.
 pub const RowDraw = struct {
-    blob: *snail.TextBlob,
+    blob: *const snail.TextBlob,
     rects: []ColoredRect,
     row_y: f32,
     content_hash: u64,
@@ -735,39 +850,47 @@ pub fn buildSnapshot(
             }
         }
 
+        _ = cache;
+        _ = atlas_identity;
+
         const content_hash = hashSnapshotRow(snapshot, row_start_index, cols);
         const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
 
-        var entry: ?*Row = cache.getCurrent(content_hash, atlas, atlas_identity);
-        if (entry == null) {
-            builder.reset();
-            const built = try buildRow(
-                snapshot,
-                &cell_index,
-                cols,
-                0,
-                scratch_rects,
-                builder,
-                atlas,
-                atlas_ref,
-                allocator,
-                metrics,
-                misses,
-            );
-            const blob = try builder.finish();
-            const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
-            entry = cache.store(content_hash, blob, rects, atlas_identity, built.had_misses);
-        }
+        // No row cache: shape every row every frame. For workloads where
+        // every row's content changes per frame (e.g. tmatrix), the
+        // cache hit rate was 0% and the lookup + store path was pure
+        // overhead. For stable text the shape work would be redundant
+        // — that's a known tradeoff; we'd reinstate caching in a form
+        // that doesn't churn the allocator if it ever matters.
+        const rebuild_t0 = perf.Timer.now();
+        builder.reset();
+        const shape_t0 = perf.Timer.now();
+        const built = try buildRow(
+            snapshot,
+            &cell_index,
+            cols,
+            0,
+            scratch_rects,
+            builder,
+            atlas,
+            atlas_ref,
+            allocator,
+            metrics,
+            misses,
+        );
+        phase_row_shape_ns += shape_t0.elapsedNs();
+        const finish_t0 = perf.Timer.now();
+        const blob = try builder.finish();
+        const blob_ptr = blob_stash.stash(blob) orelse return error.OutOfMemory;
+        const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
+        try blob_stash.stashRects(rects);
+        phase_row_finish_ns += finish_t0.elapsedNs();
+        phase_row_rebuild_ns += rebuild_t0.elapsedNs();
+        phase_row_miss_count += 1;
         cell_index = next_index;
 
-        if (entry) |row| {
-            // Snapshot the stable heap pointers now. The `*Row` itself
-            // lives in `cache.map` and gets invalidated on rehash; the
-            // blob and rects allocations are independent and outlive any
-            // hashmap reshuffle.
-            rows_out[row_count] = .{ .blob = row.blob, .rects = row.rects, .row_y = row_y, .content_hash = content_hash };
-            row_count += 1;
-        }
+        rows_out[row_count] = .{ .blob = blob_ptr, .rects = rects, .row_y = row_y, .content_hash = content_hash };
+        row_count += 1;
     }
 
     var cursor: ?CursorOverlay = null;

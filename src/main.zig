@@ -909,19 +909,19 @@ fn onFocus(focused: bool) void {
 }
 
 fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mod.Wayland, term: *terminal_mod.Terminal) void {
-    _ = wl;
     if (g_target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !g_gpu_snapshot_dirty) return;
-    // No vsync gate. Worker renders as soon as there's a free dmabuf
-    // (and only one render at a time via render_in_flight). When the
-    // render finishes, the response handler commits immediately so
-    // the latest content lands as soon as the GPU is done — the
-    // compositor presents whichever buffer was last committed at
-    // each vsync. Skipping the vsync gate keeps input-to-screen
-    // latency at a single frame. The tradeoff is that under
-    // input-faster-than-render conditions (rare in a terminal), we
-    // over-commit and the compositor discards intermediate buffers;
-    // the wasted work is one render (~3ms) per redundant commit.
+    // Vsync-gate the GPU render. Without this we'd kick off the
+    // render whenever PTY produced fresh data — which lands at
+    // arbitrary phase inside the vsync window. If the data arrives
+    // 12 ms into a 16.7 ms vsync, our 5–7 ms of work finishes past
+    // the latch deadline and the commit slips to the *next* vsync,
+    // dropping a frame. Waiting for the frame callback re-bases the
+    // render to start at the vsync boundary so the whole budget is
+    // available for the work. (The CPU path already does this; the
+    // GPU path used to skip it for a marginal latency win that
+    // turned out not to be worth the missed frames.)
+    if (wl.frame_pending) return;
     gpu.queueRender(term, g_render_serial, g_selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer
@@ -1748,27 +1748,6 @@ pub fn main(init: std.process.Init) !void {
                     @as(f64, @floatFromInt(renderer_mod.Renderer.phase_upload_ns)) / ms,
                     @as(f64, @floatFromInt(renderer_mod.Renderer.phase_drawlist_ns)) / ms,
                     @as(f64, @floatFromInt(renderer_mod.Renderer.phase_draw_ns)) / ms,
-                },
-            );
-        }
-        if (renderer_mod.Renderer.dirty_frames_examined > 0) {
-            const frames_f = @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_frames_examined));
-            std.debug.print(
-                "scrgo: gpu dirty  frames={}  avg_dirty={d:.2}  avg_dirty_content={d:.2}  avg_visible={d:.2}  full_repaint={}(first={},atlas_soft={},atlas_hard={})  buckets[0,1,2-4,5-25,26+]=[{},{},{},{},{}]\n",
-                .{
-                    renderer_mod.Renderer.dirty_frames_examined,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_rows_with_cursor_total)) / frames_f,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_rows_content_only_total)) / frames_f,
-                    @as(f64, @floatFromInt(renderer_mod.Renderer.dirty_rows_visible_total)) / frames_f,
-                    renderer_mod.Renderer.dirty_full_repaint_frames,
-                    renderer_mod.Renderer.dirty_repaint_first_frame,
-                    renderer_mod.Renderer.dirty_repaint_atlas_changed - renderer_mod.Renderer.dirty_repaint_atlas_hard,
-                    renderer_mod.Renderer.dirty_repaint_atlas_hard,
-                    renderer_mod.Renderer.dirty_bucket_0,
-                    renderer_mod.Renderer.dirty_bucket_1,
-                    renderer_mod.Renderer.dirty_bucket_2_4,
-                    renderer_mod.Renderer.dirty_bucket_5_25,
-                    renderer_mod.Renderer.dirty_bucket_26plus,
                 },
             );
         }

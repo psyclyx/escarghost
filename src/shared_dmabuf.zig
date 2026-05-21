@@ -20,7 +20,13 @@ pub const BufferDesc = extern struct {
     modifier_lo: u32 = 0,
 };
 
-pub const MaxBuffers = 2;
+// Triple-buffered: at steady state the compositor holds one buffer for
+// scanout, we just attached the second, and the third is free for the
+// next render. With only two, the GPU stalls each frame waiting for the
+// compositor to release the buffer it's still reading — every render is
+// gated to vsync via implicit dma-fence sync, which adds ~10ms per frame
+// of fence-wait time.
+pub const MaxBuffers = 3;
 
 pub const ReadyMessage = extern struct {
     tag: u8 = 1,

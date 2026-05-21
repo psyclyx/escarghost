@@ -52,109 +52,6 @@ pub fn computeCellMetrics(atlas: *const snail.TextAtlas, font_size: f32) !CellMe
     };
 }
 
-pub const MaxTargets: usize = 4;
-
-/// Upper bound on how many stale identities `releaseStaleLeases` can
-/// retire in a single frame. The lease map should never get this deep
-/// in normal operation; the cap is purely to bound stack scratch.
-const MaxStaleLeases: usize = 32;
-
-/// Per-output-buffer paint state. We render directly into the caller's
-/// dmabuf with `backdrop = .target`, so each dmabuf's pixels persist
-/// across the swap chain rotation — but each one persists *its own*
-/// content era, not the canvas's. When we come back to dmabuf #i for
-/// the second time, we have to bring it up to date with the rows that
-/// changed since its prior paint. Each `TargetState` records what that
-/// dmabuf currently shows so we can compute the delta cheaply.
-const TargetState = struct {
-    /// False until the first paint completes for this buffer. With
-    /// `backdrop = .target` we must avoid sampling undefined pixels —
-    /// the first frame into any buffer uses `backdrop = .clear` to
-    /// seed it.
-    seeded: bool = false,
-    /// Blob pointer painted at each row index. `null` = no row was
-    /// painted at this index. Dirty-test: current blob ptr != recorded.
-    row_blobs: [MAX_SNAPSHOT_ROWS]?*const snail.TextBlob = [_]?*const snail.TextBlob{null} ** MAX_SNAPSHOT_ROWS,
-    /// Content hash painted at each row index. Lets a `rebindAll`
-    /// eviction (which carries content hashes, not row indices) map
-    /// back to which target rows need repainting.
-    row_hashes: [MAX_SNAPSHOT_ROWS]u64 = [_]u64{0} ** MAX_SNAPSHOT_ROWS,
-    /// Cursor identity painted onto this buffer; see `packCursorId`.
-    cursor_id: u64 = 0,
-    /// Selection identity painted onto this buffer. Zero = no
-    /// selection was painted. See `packSelectionId` in row_build.
-    selection_id: u64 = 0,
-    /// Row indices that the most-recent painted selection covered.
-    /// Used to dirty those rows when the selection changes (so the
-    /// stale highlight gets repainted with no-selection cells).
-    selection_rows: [MAX_SNAPSHOT_ROWS]u16 = [_]u16{0} ** MAX_SNAPSHOT_ROWS,
-    selection_row_count: usize = 0,
-    /// Scrollbar identity painted onto this buffer; see
-    /// `packScrollbarId`. Zero = scrollbar was hidden.
-    scrollbar_id: u64 = 0,
-
-    fn reset(self: *TargetState) void {
-        self.seeded = false;
-        @memset(&self.row_blobs, null);
-        @memset(&self.row_hashes, 0);
-        self.cursor_id = 0;
-        self.selection_id = 0;
-        self.selection_row_count = 0;
-        self.scrollbar_id = 0;
-    }
-
-    fn clearEvicted(self: *TargetState, evicted_hashes: []const u64) void {
-        for (&self.row_hashes, 0..) |h, i| {
-            for (evicted_hashes) |k| {
-                if (h == k) {
-                    self.row_blobs[i] = null;
-                    self.row_hashes[i] = 0;
-                    break;
-                }
-            }
-        }
-    }
-};
-
-/// Pack a cursor overlay into a u64 for cheap "has the cursor changed in
-/// a way that would redirty its row?" comparisons. Layout: bit 63 set =
-/// cursor visible; low bits carry x, y, style, has-inverted-glyph. Zero
-/// is reserved for "no cursor."
-fn packCursorId(cursor: ?row_build.CursorOverlay) u64 {
-    const c = cursor orelse return 0;
-    const inverted_bit: u64 = if (c.inverted_glyph != null) 1 else 0;
-    return (@as(u64, 1) << 63) |
-        (@as(u64, c.cell_x) & 0xFFFF) |
-        ((@as(u64, c.cell_y) & 0xFFFF) << 16) |
-        ((@as(u64, @intFromEnum(c.style)) & 0xFF) << 32) |
-        (inverted_bit << 40);
-}
-
-fn containsIndex(slice: []const usize, target: usize) bool {
-    for (slice) |v| {
-        if (v == target) return true;
-    }
-    return false;
-}
-
-fn cursorRowFromId(id: u64) ?usize {
-    if (id == 0) return null;
-    return @intCast((id >> 16) & 0xFFFF);
-}
-
-/// Pack a scrollbar overlay into a u64 for fast "has the scrollbar
-/// changed" checks. Quantizes the fractional fields to 16-bit so
-/// sub-pixel jitter doesn't trigger a full repaint every frame.
-fn packScrollbarId(sb: ?render_snapshot.ScrollbarOverlay) u64 {
-    const s = sb orelse return 0;
-    const alpha_q: u64 = @intFromFloat(@max(0.0, @min(1.0, s.alpha)) * 255.0);
-    const off_q: u64 = @intFromFloat(@max(0.0, @min(1.0, s.thumb_offset)) * 65535.0);
-    const size_q: u64 = @intFromFloat(@max(0.0, @min(1.0, s.thumb_size)) * 65535.0);
-    const packed_id = (alpha_q & 0xFF) | ((off_q & 0xFFFF) << 8) | ((size_q & 0xFFFF) << 24);
-    // Reserve 0 for "hidden".
-    return if (packed_id == 0) 1 else packed_id;
-}
-
 pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h: u32) struct { cols: u16, rows: u16 } {
     return .{
         .cols = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_w)) / cell_width))),
@@ -209,25 +106,6 @@ pub const Renderer = struct {
     debug_log_atlas: bool = false,
     debug_reset_atlas_each_frame: bool = false,
 
-    /// Prior-frame state for the dirty-row stats counters. `prev_row_count == 0`
-    /// distinguishes the very-first frame from a mid-run canvas invalidation.
-    /// `prev_atlas_identity` lets us tell atlas snapshots apart for diagnostic
-    /// bucketing.
-    prev_row_count: usize = 0,
-    prev_atlas_identity: u64 = 0,
-    /// Per-output-buffer paint state. The dmabuf swap chain rotates,
-    /// but each individual dmabuf preserves its own pixels across
-    /// rotations — so we treat each dmabuf as its own persistent
-    /// canvas. The caller selects which one before `drawSnapshot` via
-    /// `setActiveTarget`. See `TargetState` for the per-buffer fields.
-    targets: [MaxTargets]TargetState = [_]TargetState{.{}} ** MaxTargets,
-    /// Index into `targets` for the buffer the next `drawSnapshot`
-    /// will paint into. Set by the caller via `setActiveTarget`.
-    active_target: u8 = 0,
-
-    /// Per-frame scratch: indices into `built.rows` that need repainting.
-    dirty_rows_buf: [MAX_SNAPSHOT_ROWS]usize = undefined,
-
     pub var frame_stats: perf.FrameStats = .{};
 
     /// Per-phase wall-time accumulators (ns). Written by the GPU worker
@@ -239,34 +117,6 @@ pub const Renderer = struct {
     pub var phase_drawlist_ns: u64 = 0;
     pub var phase_draw_ns: u64 = 0;
     pub var phase_frame_count: u64 = 0;
-
-    /// Dirty-row measurement. For each rendered frame, counts how many rows
-    /// would have needed repainting under a canvas-preserving scheme:
-    /// rows whose content_hash differs from the prior frame's, plus rows
-    /// touched by cursor movement. `dirty_rows_with_cursor_total` and
-    /// `dirty_rows_content_only_total` differ by exactly the cursor cost.
-    /// Histograms bucket frames by how many rows were dirty under the
-    /// cursor-inclusive rule.
-    pub var dirty_frames_examined: u64 = 0;
-    pub var dirty_rows_content_only_total: u64 = 0;
-    pub var dirty_rows_with_cursor_total: u64 = 0;
-    pub var dirty_rows_visible_total: u64 = 0;
-    pub var dirty_bucket_0: u64 = 0;
-    pub var dirty_bucket_1: u64 = 0;
-    pub var dirty_bucket_2_4: u64 = 0;
-    pub var dirty_bucket_5_25: u64 = 0;
-    pub var dirty_bucket_26plus: u64 = 0;
-    pub var dirty_full_repaint_frames: u64 = 0;
-    pub var dirty_repaint_first_frame: u64 = 0;
-    pub var dirty_repaint_atlas_changed: u64 = 0;
-    /// Atlas-snapshot bumps where the cache had to evict at least one
-    /// row (had_misses, or lazy rebind failed). Those evictions mean
-    /// the canvas's painted pixels for those rows are stale; the canvas
-    /// must repaint. A subset of `atlas_changed`.
-    pub var dirty_repaint_atlas_hard: u64 = 0;
-    /// Cache invalidations drained this frame, snapshotted at end of
-    /// `drawSnapshot` so `recordDirtyStats` can attribute hard vs soft.
-    var last_invalidation_count: usize = 0;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -332,37 +182,25 @@ pub const Renderer = struct {
         return lease.get();
     }
 
-    /// Drop all per-target paint state so the next paint into any
-    /// dmabuf starts from a clean clear. Used when viewport/metrics
-    /// change (every dmabuf's geometry is now stale).
-    fn invalidateAllTargets(self: *Renderer) void {
-        for (&self.targets) |*t| t.reset();
-    }
-
-    /// Select which output buffer `drawSnapshot` will paint into. The
-    /// caller is responsible for binding that buffer's FBO before
-    /// calling `drawSnapshot`; we use the index to look up its
-    /// persistent paint state.
+    /// No-op kept for API stability with the gpu_renderer worker. We
+    /// don't keep per-dmabuf paint state anymore — every frame paints
+    /// itself fully into whichever dmabuf the caller bound.
     pub fn setActiveTarget(self: *Renderer, idx: u8) void {
-        self.active_target = if (idx < MaxTargets) idx else 0;
+        _ = self;
+        _ = idx;
     }
 
     /// Render a tiny synthetic frame to compile every shader program
     /// snail will use at steady state: text (glyph blob), vector path
-    /// (filled rect), and the linear-resolve seed + encode shaders
-    /// (via `backdrop = .target`). Atlas textures + glyph pages get
-    /// uploaded here too. Without this, those one-time costs would
-    /// land on the first real frames the user sees as visible jank
-    /// (~10ms on frame 1, then a smaller spike on the first `.target`
-    /// frame). Caller must bind a valid FBO; we paint into it and
-    /// then invalidate all per-buffer state so the first real frame
-    /// repaints from scratch.
+    /// (filled rect), and the linear-resolve shaders. Atlas textures +
+    /// glyph pages get uploaded here too. Without this, those one-time
+    /// costs would land on the first real frames the user sees as
+    /// visible jank.
     pub fn warmPipeline(self: *Renderer) !void {
         defer {
             self.scene.reset();
             self.builder.reset();
             self.ephemeral_blobs.releaseAll();
-            self.invalidateAllTargets();
         }
 
         const atlas = self.currentAtlas();
@@ -444,8 +282,11 @@ pub const Renderer = struct {
     /// Call this whenever the GPU side re-imports its dmabufs (initial
     /// install, reconfigure, GPU/context restart, etc.), even if the
     /// viewport dimensions didn't change.
+    /// No-op kept for API stability. With every frame fully repainting
+    /// every row, there is no per-dmabuf "seeded" state to invalidate
+    /// when the GPU side reinstalls its dmabufs.
     pub fn notifyTargetsReinstalled(self: *Renderer) void {
-        self.invalidateAllTargets();
+        _ = self;
     }
 
     fn ensureScratch(self: *Renderer) !void {
@@ -464,13 +305,15 @@ pub const Renderer = struct {
         self.debug_log_atlas = options.atlas;
     }
 
-    /// Resize the drawable. Pure window-resize; cell metrics are unchanged
-    /// so the row cache stays hot.
+    pub fn cacheStats(self: *const Renderer) row_build.RowCache.Stats {
+        return self.row_cache.stats();
+    }
+
+    /// Resize the drawable. Pure window-resize; cell metrics are unchanged.
     pub fn setViewport(self: *Renderer, w: u32, h: u32) void {
         if (self.viewport_w == @as(f32, @floatFromInt(w)) and self.viewport_h == @as(f32, @floatFromInt(h))) return;
         self.viewport_w = @floatFromInt(w);
         self.viewport_h = @floatFromInt(h);
-        self.invalidateAllTargets();
     }
 
     /// Update font metrics. Each cached `TextBlob` bakes `placement.em` into
@@ -482,7 +325,6 @@ pub const Renderer = struct {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
         self.row_cache.clear();
-        self.invalidateAllTargets();
     }
 
     /// Pick up the latest atlas snapshot. Cached blobs are migrated
@@ -525,31 +367,6 @@ pub const Renderer = struct {
             std.debug.print("scrgo[gpu-renderer]: atlas snapshot {} (lazy rebind)\n", .{identity});
         }
         return atlas;
-    }
-
-    /// Release any retained lease whose snapshot no longer has cached
-    /// blobs referencing it. Called once per frame after `buildSnapshot`
-    /// has had a chance to migrate or evict rows lazily. The current
-    /// snapshot's lease is always retained even if no rows are cached
-    /// on it yet (e.g. an empty cache after metrics change).
-    fn releaseStaleLeases(self: *Renderer) void {
-        var stale_buf: [MaxStaleLeases]u64 = undefined;
-        var n: usize = 0;
-        var it = self.atlas_leases.iterator();
-        while (it.next()) |entry| {
-            const id = entry.key_ptr.*;
-            if (id == self.last_atlas_identity) continue;
-            if (self.row_cache.entriesForIdentity(id) != 0) continue;
-            if (n >= stale_buf.len) break;
-            stale_buf[n] = id;
-            n += 1;
-        }
-        for (stale_buf[0..n]) |id| {
-            if (self.atlas_leases.fetchRemove(id)) |kv| {
-                var lease = kv.value;
-                lease.release();
-            }
-        }
     }
 
     fn rowMetrics(self: *const Renderer) row_build.Metrics {
@@ -608,7 +425,7 @@ pub const Renderer = struct {
 
     pub fn drawSnapshot(self: *Renderer, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
         const frame_timer = perf.Timer.now();
-        var atlas = self.refreshAtlas();
+        const atlas = self.refreshAtlas();
         try self.ensureScratch();
         // Caller has already bound the active target's dmabuf FBO; we
         // render straight into it. Each dmabuf retains its own pixels
@@ -620,7 +437,7 @@ pub const Renderer = struct {
         var rows_buf: [MAX_SNAPSHOT_ROWS]row_build.RowDraw = undefined;
         var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
         const row_build_t0 = perf.Timer.now();
-        var built = try row_build.buildSnapshot(
+        const built = try row_build.buildSnapshot(
             snapshot,
             self.allocator,
             self.rowMetrics(),
@@ -637,221 +454,34 @@ pub const Renderer = struct {
         );
         phase_row_build_ns += row_build_t0.elapsedNs();
 
-        // Pass 1 had glyph misses; try a single sync atlas extension.
-        // On success: refresh state and re-build. On miss/failure: ship
-        // partial — the user sees gaps for the missing glyphs but the
-        // rest of the frame paints normally.
-        if (!misses.isEmpty()) {
-            const result = self.atlas_ref.extend(atlas, misses.text()) catch |err| blk: {
-                if (self.debug_log_atlas) std.debug.print("scrgo[gpu-renderer]: atlas extend failed: {}\n", .{err});
-                break :blk .missing;
-            };
-            if (result == .extended) {
-                self.scene.reset();
-                self.ephemeral_blobs.releaseAll();
-                misses.clear();
-                atlas = self.refreshAtlas();
-                const rebuild_t0 = perf.Timer.now();
-                built = try row_build.buildSnapshot(
-                    snapshot,
-                    self.allocator,
-                    self.rowMetrics(),
-                    &self.row_cache,
-                    &self.builder,
-                    atlas,
-                    self.atlas_ref,
-                    self.last_atlas_identity,
-                    self.scratch_rects,
-                    rows_buf[0..],
-                    sel_buf[0..],
-                    &self.ephemeral_blobs,
-                    misses,
-                );
-                phase_row_build_ns += rebuild_t0.elapsedNs();
-            } else if (self.debug_log_atlas) {
-                std.debug.print("scrgo[gpu-renderer]: atlas extend missing for {} bytes\n", .{misses.text().len});
-            }
-        }
+        // Misses on the freshly-shaped blob are reported via `misses`
+        // upward. The GPU worker (gpu_renderer.zig) hands them to the
+        // async atlas thread (`atlas_thread.requestMany`) so the next
+        // frame's atlas snapshot will include them. We deliberately do
+        // NOT extend the atlas synchronously and re-shape this frame:
+        // the old path doubled the per-frame row-build cost whenever a
+        // new glyph showed up, which on a workload like tmatrix (a
+        // steady trickle of fresh codepoints) means every-other frame
+        // is twice as expensive and blows the vsync budget. Shipping
+        // partial-glyph content for one frame is invisible at 60 Hz
+        // when the surrounding cells are turning over anyway.
 
-        // Any rows whose cache entry got evicted this frame (had_misses,
-        // or a rebound that couldn't satisfy the new atlas) have stale
-        // pixels in every dmabuf that painted them — the new shape
-        // would otherwise be skipped by the content_hash dirty check.
-        // Clear those slots before computeDirty so it picks them up.
-        const invalidations = self.row_cache.drainInvalidations();
-        last_invalidation_count = invalidations.len;
-        if (invalidations.len > 0) {
-            for (&self.targets) |*t| t.clearEvicted(invalidations);
-        }
-        self.row_cache.clearInvalidations();
-        self.releaseStaleLeases();
-
-        const dirty = self.computeDirty(built);
-        self.recordDirtyStats(built, dirty);
-
-        try self.flushDraw(built, dirty, snapshot.header.default_bg, snapshot.header.default_fg);
+        try self.flushDraw(built, snapshot.header.default_bg, snapshot.header.default_fg);
         self.ephemeral_blobs.releaseAll();
         frame_stats.record(frame_timer.elapsedUs());
     }
 
-    /// Decide which rows have to be repainted onto the canvas this
-    /// frame. The canvas keeps prior pixels intact, so rows whose blob
-    /// pointer is unchanged from the last paint already look right and
-    /// can be skipped. Cursor moves dirty both the cell-it-left and
-    /// the cell-it-arrived-at. Selection changes dirty every row that
-    /// was in the prior selection or is in the new one. If the canvas
-    /// isn't seeded yet we just dirty everything.
-    fn computeDirty(self: *Renderer, built: row_build.BuiltSnapshot) []const usize {
-        const row_count = built.rows.len;
-        const target = &self.targets[self.active_target];
-        if (!target.seeded) {
-            for (0..row_count) |i| self.dirty_rows_buf[i] = i;
-            return self.dirty_rows_buf[0..row_count];
-        }
-
-        // Compare by content_hash, not blob pointer. Blob pointers can
-        // be recycled by the heap allocator after the row cache evicts
-        // an entry (LRU sweep), so two unrelated blobs may share an
-        // address across frames — a false-negative dirty bit, with
-        // stale pixels staying on screen. Content hashes are stable
-        // and the values we already plumb through.
-        var marked: [MAX_SNAPSHOT_ROWS]bool = [_]bool{false} ** MAX_SNAPSHOT_ROWS;
-        for (built.rows, 0..) |row, i| {
-            if (target.row_blobs[i] == null or target.row_hashes[i] != row.content_hash) {
-                marked[i] = true;
-            }
-        }
-
-        const new_cursor_id = packCursorId(built.cursor);
-        if (new_cursor_id != target.cursor_id) {
-            if (cursorRowFromId(target.cursor_id)) |r| {
-                if (r < row_count) marked[r] = true;
-            }
-            if (cursorRowFromId(new_cursor_id)) |r| {
-                if (r < row_count) marked[r] = true;
-            }
-        }
-
-        // Scrollbar state changes invalidate the right-edge stripe on
-        // every painted row. Mark all rows dirty when the overlay
-        // appears, disappears, or its geometry shifts; once stable
-        // (steady alpha + thumb position) we skip the extra repaint.
-        const new_scrollbar_id = packScrollbarId(built.scrollbar);
-        if (new_scrollbar_id != target.scrollbar_id) {
-            for (0..row_count) |i| marked[i] = true;
-        }
-        if (built.selection_id != target.selection_id) {
-            // Mark every row covered by the new selection. We also have
-            // to repaint rows that were covered by the *previous*
-            // selection so a stale band doesn't linger. The previous
-            // spans aren't stored, so we mark them via the cached
-            // row hash list: any row touched last time the selection
-            // was non-zero needs a fresh paint anyway, but since
-            // selection_id == 0 might be the new state too, fall back
-            // to marking all painted rows when the prior selection
-            // existed but we can't enumerate it.
-            for (built.selection_spans) |span| {
-                if (span.row < row_count) marked[span.row] = true;
-            }
-            if (target.selection_id != 0) {
-                for (target.selection_rows[0..@min(target.selection_row_count, row_count)]) |r| {
-                    if (r < row_count) marked[r] = true;
-                }
-            }
-        }
-
-        var n: usize = 0;
-        for (marked[0..row_count], 0..) |is_dirty, i| {
-            if (is_dirty) {
-                self.dirty_rows_buf[n] = i;
-                n += 1;
-            }
-        }
-        return self.dirty_rows_buf[0..n];
-    }
-
-    /// Compare the built frame against the prior frame and tally how many
-    /// rows would have been dirty under a canvas-preserving scheme. Pure
-    /// measurement; mutates only the prev-frame snapshot fields and the
-    /// global counters.
-    fn recordDirtyStats(self: *Renderer, built: row_build.BuiltSnapshot, dirty: []const usize) void {
-        const new_count = built.rows.len;
-        const new_cursor_id = packCursorId(built.cursor);
-
-        const is_first_frame = self.prev_row_count == 0;
-        const atlas_changed = !is_first_frame and self.prev_atlas_identity != self.last_atlas_identity;
-        const atlas_hard = atlas_changed and last_invalidation_count > 0;
-        if (is_first_frame) dirty_repaint_first_frame += 1;
-        if (atlas_changed) dirty_repaint_atlas_changed += 1;
-        if (atlas_hard) dirty_repaint_atlas_hard += 1;
-
-        const total_dirty = dirty.len;
-        dirty_frames_examined += 1;
-        dirty_rows_visible_total += new_count;
-        dirty_rows_content_only_total += total_dirty;
-        dirty_rows_with_cursor_total += total_dirty;
-        if (is_first_frame or !self.targets[self.active_target].seeded) dirty_full_repaint_frames += 1;
-
-        if (total_dirty == 0) {
-            dirty_bucket_0 += 1;
-        } else if (total_dirty == 1) {
-            dirty_bucket_1 += 1;
-        } else if (total_dirty <= 4) {
-            dirty_bucket_2_4 += 1;
-        } else if (total_dirty <= 25) {
-            dirty_bucket_5_25 += 1;
-        } else {
-            dirty_bucket_26plus += 1;
-        }
-
-        _ = new_cursor_id;
-        self.prev_row_count = new_count;
-        self.prev_atlas_identity = self.last_atlas_identity;
-    }
-
-    fn flushDraw(self: *Renderer, built: row_build.BuiltSnapshot, dirty: []const usize, default_bg: Rgb, default_fg: Rgb) !void {
-        const default_bg_color = default_bg.toFloat4(1.0);
-        // Cursor's row is always in `dirty` whenever the cursor changed,
-        // so we can locate "cursor's dirty row" by membership: if the
-        // cursor row is in `dirty`, we emit the cursor rect; otherwise
-        // the existing canvas already shows it correctly.
-        const cursor_row: ?usize = if (built.cursor) |c| @intCast(c.cell_y) else null;
-        const cursor_in_dirty: bool = if (cursor_row) |r| containsIndex(dirty, r) else false;
-
-        const target = &self.targets[self.active_target];
-
-        // No-op frame: this dmabuf already shows the right pixels.
-        // Skip the entire snail pass; the caller commits the buffer
-        // unchanged.
-        if (dirty.len == 0 and target.seeded) return;
-
-        // Build the per-frame rect picture from the dirty rows + cursor.
-        // Non-dirty rows already have their decoration rects baked into
-        // the canvas from a prior frame.
+    fn flushDraw(self: *Renderer, built: row_build.BuiltSnapshot, default_bg: Rgb, default_fg: Rgb) !void {
+        // Full-frame repaint every frame: paint the background, every
+        // row's bg/decoration rects, every row's glyphs, the cursor,
+        // any selection bands, and the scrollbar. We rely on snail's
+        // `backdrop = .clear` to seed the output to the bg color so we
+        // don't have to emit a per-row bg fill.
         const picture_t0 = perf.Timer.now();
         var picture_builder = snail.PathPictureBuilder.init(self.allocator);
         defer picture_builder.deinit();
 
-        // For each dirty row, paint a default-bg fill across the row's
-        // full width before its cell-bg rects + glyphs. Without this,
-        // a row's default-bg cells contribute no rect, so any prior
-        // pixels there (most importantly a cursor that just moved off
-        // this row) survive the repaint. The fill erases them.
-        // Skipped when the buffer isn't seeded yet — backdrop=.clear
-        // is doing the same job globally.
-        const row_w = self.viewport_w;
-        if (target.seeded) {
-            for (dirty) |i| {
-                const row_draw = built.rows[i];
-                try picture_builder.addFilledRect(
-                    .{ .x = 0, .y = row_draw.row_y, .w = row_w, .h = self.cell_height },
-                    .{ .paint = .{ .solid = default_bg_color } },
-                    .identity,
-                );
-            }
-        }
-        for (dirty) |i| {
-            const row_draw = built.rows[i];
+        for (built.rows) |row_draw| {
             for (row_draw.rects) |r| {
                 if (r.w <= 0.0 or r.h <= 0.0) continue;
                 try picture_builder.addFilledRect(
@@ -861,15 +491,10 @@ pub const Renderer = struct {
                 );
             }
         }
-        // Paint selection highlight on top of cell bgs but before
-        // glyphs, so the band covers the cell color and the text is
-        // legible over it. The dirty mask already includes every row
-        // the selection touches (see computeDirty), so we don't have
-        // to emit highlight rects for non-dirty rows.
+        // Selection highlight: covers cell bg, text reads on top of it.
         if (built.selection_spans.len > 0) {
             const sel_color = render_common.selectionFillColor(default_bg);
             for (built.selection_spans) |span| {
-                if (!containsIndex(dirty, @intCast(span.row))) continue;
                 const x0 = @as(f32, @floatFromInt(span.start_col)) * self.cell_width;
                 const y0 = @as(f32, @floatFromInt(span.row)) * self.cell_height;
                 const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * self.cell_width;
@@ -880,9 +505,7 @@ pub const Renderer = struct {
                 );
             }
         }
-        if (cursor_in_dirty) {
-            if (built.cursor) |cursor| try self.emitCursor(&picture_builder, cursor);
-        }
+        if (built.cursor) |cursor| try self.emitCursor(&picture_builder, cursor);
 
         // Scrollbar overlay on the right edge. Paint last so it sits
         // on top of everything else. When the scrollbar is visible we
@@ -906,9 +529,7 @@ pub const Renderer = struct {
         // Picture is optional: a frame that paints only glyphs (no bg
         // rects, no cursor, no scrollbar) leaves the builder empty and
         // `freeze` errors with EmptyPicture. The text-only path still
-        // works — backdrop=.clear handles the bg seed when the buffer
-        // isn't yet seeded, and target.seeded frames hit the `dirty.len
-        // == 0` early-return above.
+        // works — backdrop=.clear gives us a clean default-bg canvas.
         var maybe_picture: ?snail.PathPicture = if (picture_builder.shapeCount() > 0) try picture_builder.freeze(.{
             .persistent_allocator = self.allocator,
             .scratch_allocator = self.allocator,
@@ -923,8 +544,7 @@ pub const Renderer = struct {
         }
 
         var override_index: usize = 0;
-        for (dirty) |i| {
-            const row_draw = built.rows[i];
+        for (built.rows) |row_draw| {
             if (row_draw.blob.glyphCount() == 0) continue;
             if (override_index >= self.overrides.len) break;
             self.overrides[override_index] = .{
@@ -940,12 +560,10 @@ pub const Renderer = struct {
                 .instances = slot,
             });
         }
-        if (cursor_in_dirty) {
-            if (built.cursor) |cursor| {
-                if (cursor.inverted_glyph) |blob| {
-                    try manifest.putTextBlob(TEXT_KEYS, blob);
-                    try self.scene.addText(.{ .blob = blob, .resources = TEXT_KEYS });
-                }
+        if (built.cursor) |cursor| {
+            if (cursor.inverted_glyph) |blob| {
+                try manifest.putTextBlob(TEXT_KEYS, blob);
+                try self.scene.addText(.{ .blob = blob, .resources = TEXT_KEYS });
             }
         }
 
@@ -966,44 +584,16 @@ pub const Renderer = struct {
         try draw_list.addScene(&prepared, &self.scene);
         phase_drawlist_ns += drawlist_t0.elapsedNs();
 
-        // Seeded buffer: preserve this dmabuf's prior pixels and paint
-        // dirty rows on top. First paint into a buffer (or post-
-        // invalidate): clear to the default bg so we don't sample
-        // undefined dmabuf memory.
-        const backdrop: snail.ResolveBackdrop = if (target.seeded)
-            .target
-        else
-            .{ .clear = default_bg.toFloat4(1.0) };
-
-        // Tighten the resolve region to the dirty band so snail's
-        // .target backdrop only reads (and re-encodes) the rows we
-        // actually touch.
-        const viewport_w_u: u32 = @intFromFloat(@max(self.viewport_w, 1.0));
-        const viewport_h_u: u32 = @intFromFloat(@max(self.viewport_h, 1.0));
-        const region: snail.ResolveRegion = blk: {
-            if (!target.seeded or dirty.len == 0) break :blk .full_target;
-            var lo: usize = std.math.maxInt(usize);
-            var hi: usize = 0;
-            for (dirty) |i| {
-                if (i < lo) lo = i;
-                if (i > hi) hi = i;
-            }
-            const y0_f: f32 = @as(f32, @floatFromInt(lo)) * self.cell_height;
-            const y1_f: f32 = @as(f32, @floatFromInt(hi + 1)) * self.cell_height;
-            const y0: u32 = @intFromFloat(@max(0.0, @floor(y0_f)));
-            const y1_clipped = @min(viewport_h_u, @as(u32, @intFromFloat(@ceil(y1_f))));
-            if (y1_clipped <= y0) break :blk .full_target;
-            break :blk .{ .pixel_rect = .{
-                .x = 0,
-                .y = @intCast(y0),
-                .w = viewport_w_u,
-                .h = y1_clipped - y0,
-            } };
-        };
-
+        // Every frame paints the entire viewport from scratch into the
+        // caller's dmabuf, so backdrop is always .clear (snail seeds
+        // the output with the default bg) and the resolve region is
+        // always the full target.
         const pass: snail.DrawPass = .{
             .state = self.drawState(),
-            .resolve = .{ .linear = .{ .backdrop = backdrop, .region = region } },
+            .resolve = .{ .linear = .{
+                .backdrop = .{ .clear = default_bg.toFloat4(1.0) },
+                .region = .full_target,
+            } },
         };
         // Per-frame scene stats so we can spot "GPU went blank" cases. Counts
         // include the rect-picture shape count, the number of text blobs
@@ -1021,29 +611,6 @@ pub const Renderer = struct {
 
         const draw_t0 = perf.Timer.now();
         try self.gl_renderer.drawPass(&prepared, &draw_list, pass);
-        target.seeded = true;
-        // Record what's now on this dmabuf so the *next* paint into the
-        // same buffer (after the swap chain rotates back) can compute
-        // its dirty set by blob-pointer comparison and so an atlas
-        // rebind can correlate evicted content hashes back to row
-        // indices that need re-painting.
-        for (built.rows, 0..) |row, i| {
-            target.row_blobs[i] = row.blob;
-            target.row_hashes[i] = row.content_hash;
-        }
-        for (built.rows.len..MAX_SNAPSHOT_ROWS) |i| {
-            target.row_blobs[i] = null;
-            target.row_hashes[i] = 0;
-        }
-        target.cursor_id = packCursorId(built.cursor);
-        target.selection_id = built.selection_id;
-        target.selection_row_count = 0;
-        for (built.selection_spans) |span| {
-            if (target.selection_row_count >= target.selection_rows.len) break;
-            target.selection_rows[target.selection_row_count] = span.row;
-            target.selection_row_count += 1;
-        }
-        target.scrollbar_id = packScrollbarId(built.scrollbar);
 
         // Block on the GPU pipeline before reading back. glFlush alone is
         // fire-and-forget; for a readback we need the FBO to actually have

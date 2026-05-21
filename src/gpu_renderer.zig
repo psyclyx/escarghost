@@ -16,6 +16,7 @@ const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const shared_dmabuf = @import("shared_dmabuf.zig");
 const terminal_mod = @import("terminal.zig");
+const row_build = @import("row_build.zig");
 const perf = @import("perf.zig");
 
 const c = @cImport({
@@ -85,6 +86,20 @@ fn monotonicNs() u64 {
     var ts: c.struct_timespec = undefined;
     if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
+}
+
+fn readRssKb() u64 {
+    var buf: [256]u8 = undefined;
+    const fd = c.open("/proc/self/statm", c.O_RDONLY);
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return 0;
+    // /proc/self/statm: size resident shared text lib data dt (in pages)
+    var it = std.mem.tokenizeAny(u8, buf[0..@intCast(n)], " \n");
+    _ = it.next() orelse return 0;
+    const resident_pages = std.fmt.parseInt(u64, it.next() orelse return 0, 10) catch return 0;
+    return resident_pages * 4; // 4 KiB pages → KiB
 }
 
 pub const ResponseTag = enum(u8) {
@@ -651,6 +666,7 @@ pub const Frontend = struct {
         const warn_slow_budget_ms = render_env.parseWarnSlowMs(
             if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
         );
+        var diag_frame_counter: u64 = 0;
 
         // Phase 1: EGL + snail.Renderer init (no deps needed)
         var egl = OffscreenEgl.init() catch |err| {
@@ -828,6 +844,29 @@ pub const Frontend = struct {
 
                     const render_timer = perf.Timer.now();
                     const draw_t0 = monotonicNs();
+
+                    // Snapshot the renderer's phase accumulators so the
+                    // slow-frame print can show a per-phase breakdown
+                    // (row build / picture build / atlas upload /
+                    // drawlist build / GL submit) instead of one opaque
+                    // "draw" number. Cheap reads; we always take them
+                    // so the hot path stays branch-free even when the
+                    // warning is disabled.
+                    const phase_row_base = renderer_mod.Renderer.phase_row_build_ns;
+                    const phase_pic_base = renderer_mod.Renderer.phase_picture_ns;
+                    const phase_upload_base = renderer_mod.Renderer.phase_upload_ns;
+                    const phase_drawlist_base = renderer_mod.Renderer.phase_drawlist_ns;
+                    const phase_draw_base = renderer_mod.Renderer.phase_draw_ns;
+                    const row_lookup_base = row_build.phase_row_lookup_ns;
+                    const row_rebuild_base = row_build.phase_row_rebuild_ns;
+                    const row_hit_base = row_build.phase_row_hit_count;
+                    const row_miss_base = row_build.phase_row_miss_count;
+                    const row_shape_base = row_build.phase_row_shape_ns;
+                    const row_finish_base = row_build.phase_row_finish_ns;
+                    const row_store_base = row_build.phase_row_store_ns;
+                    const row_evict_count_base = row_build.phase_row_store_evict_count;
+                    const row_evict_ns_base = row_build.phase_row_store_evict_ns;
+
                     const target = &active_allocator.targets[request.buffer_index];
                     c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
                     c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
@@ -862,6 +901,23 @@ pub const Frontend = struct {
                         if (self.atlas_thread) |at| at.requestMany(&misses);
                     }
 
+                    // Block on the GPU until every command issued by
+                    // drawSnapshot has actually written the dmabuf.
+                    // drawSnapshot ends with glFlush, which only queues
+                    // commands; the moment we send the .frame response,
+                    // main calls wl_surface_attach + commit and the
+                    // compositor is free to scan out the dmabuf. Without
+                    // this wait the compositor can sample partially
+                    // written or stale pixels — visible as old frames
+                    // briefly snapping back over the latest content.
+                    const gpu_wait_t0 = monotonicNs();
+                    const fence_sync = c.glFenceSync(c.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                    if (fence_sync != null) {
+                        _ = c.glClientWaitSync(fence_sync, c.GL_SYNC_FLUSH_COMMANDS_BIT, std.math.maxInt(u64));
+                        c.glDeleteSync(fence_sync);
+                    }
+                    const gpu_wait_elapsed_ns = monotonicNs() - gpu_wait_t0;
+
                     gpuDebug(timer, "render complete buffer={} in {d:.1}ms", .{
                         request.buffer_index,
                         render_timer.elapsedMs(),
@@ -872,17 +928,64 @@ pub const Frontend = struct {
                         .snapshot_slot = request.snapshot_slot,
                         .serial = request.serial,
                     });
+
+                    // Periodic state dump: print cache stats + RSS once
+                    // per second-ish so we can correlate row-build creep
+                    // with cache size / resident memory growth without
+                    // needing a slow-frame trigger.
+                    diag_frame_counter += 1;
+                    if (diag_frame_counter % 60 == 0) {
+                        const cs = r.cacheStats();
+                        const rss_kb = readRssKb();
+                        std.debug.print("scrgo[diag] frame={} cache.entries={} cache.bytes={} cache.identities={} rss_kb={}\n", .{
+                            diag_frame_counter,
+                            cs.entries,
+                            cs.cache_bytes,
+                            cs.identities,
+                            rss_kb,
+                        });
+                    }
+
                     if (warn_slow_budget_ms) |budget_ms| {
                         const draw_elapsed_ns = monotonicNs() - draw_t0;
                         const frame_elapsed_ns = cells_elapsed_ns + draw_elapsed_ns;
                         const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
                         if (frame_elapsed_ns > budget_ns) {
                             const ms_f = @as(f64, std.time.ns_per_ms);
-                            std.debug.print("scrgo: slow gpu frame {d:.1}ms (budget {}ms) — cells {d:.1}ms + draw {d:.1}ms\n", .{
+                            const phase_row = renderer_mod.Renderer.phase_row_build_ns - phase_row_base;
+                            const phase_pic = renderer_mod.Renderer.phase_picture_ns - phase_pic_base;
+                            const phase_upload = renderer_mod.Renderer.phase_upload_ns - phase_upload_base;
+                            const phase_drawlist = renderer_mod.Renderer.phase_drawlist_ns - phase_drawlist_base;
+                            const phase_draw = renderer_mod.Renderer.phase_draw_ns - phase_draw_base;
+                            const row_lookup = row_build.phase_row_lookup_ns - row_lookup_base;
+                            const row_rebuild = row_build.phase_row_rebuild_ns - row_rebuild_base;
+                            const row_hits = row_build.phase_row_hit_count - row_hit_base;
+                            const row_misses = row_build.phase_row_miss_count - row_miss_base;
+                            const row_shape = row_build.phase_row_shape_ns - row_shape_base;
+                            const row_finish = row_build.phase_row_finish_ns - row_finish_base;
+                            const row_store = row_build.phase_row_store_ns - row_store_base;
+                            const row_evict_count = row_build.phase_row_store_evict_count - row_evict_count_base;
+                            const row_evict_ns = row_build.phase_row_store_evict_ns - row_evict_ns_base;
+                            std.debug.print("scrgo: slow gpu frame {d:.1}ms (budget {}ms) — cells {d:.1} + draw {d:.1} (row {d:.1} [lookup {d:.2} rebuild {d:.2} (shape {d:.2} finish {d:.2} store {d:.2} [evicts={} evict={d:.2}ms]) hit {} miss {}] pic {d:.1} upload {d:.1} dl {d:.1} gl {d:.1} fence {d:.1}) ms\n", .{
                                 @as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f,
                                 budget_ms,
                                 @as(f64, @floatFromInt(cells_elapsed_ns)) / ms_f,
                                 @as(f64, @floatFromInt(draw_elapsed_ns)) / ms_f,
+                                @as(f64, @floatFromInt(phase_row)) / ms_f,
+                                @as(f64, @floatFromInt(row_lookup)) / ms_f,
+                                @as(f64, @floatFromInt(row_rebuild)) / ms_f,
+                                @as(f64, @floatFromInt(row_shape)) / ms_f,
+                                @as(f64, @floatFromInt(row_finish)) / ms_f,
+                                @as(f64, @floatFromInt(row_store)) / ms_f,
+                                row_evict_count,
+                                @as(f64, @floatFromInt(row_evict_ns)) / ms_f,
+                                row_hits,
+                                row_misses,
+                                @as(f64, @floatFromInt(phase_pic)) / ms_f,
+                                @as(f64, @floatFromInt(phase_upload)) / ms_f,
+                                @as(f64, @floatFromInt(phase_drawlist)) / ms_f,
+                                @as(f64, @floatFromInt(phase_draw)) / ms_f,
+                                @as(f64, @floatFromInt(gpu_wait_elapsed_ns)) / ms_f,
                             });
                         }
                     }
