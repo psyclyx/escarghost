@@ -857,15 +857,10 @@ pub const Frontend = struct {
                     const phase_upload_base = renderer_mod.Renderer.phase_upload_ns;
                     const phase_drawlist_base = renderer_mod.Renderer.phase_drawlist_ns;
                     const phase_draw_base = renderer_mod.Renderer.phase_draw_ns;
-                    const row_lookup_base = row_build.phase_row_lookup_ns;
                     const row_rebuild_base = row_build.phase_row_rebuild_ns;
-                    const row_hit_base = row_build.phase_row_hit_count;
-                    const row_miss_base = row_build.phase_row_miss_count;
+                    const row_count_base = row_build.phase_row_count;
                     const row_shape_base = row_build.phase_row_shape_ns;
                     const row_finish_base = row_build.phase_row_finish_ns;
-                    const row_store_base = row_build.phase_row_store_ns;
-                    const row_evict_count_base = row_build.phase_row_store_evict_count;
-                    const row_evict_ns_base = row_build.phase_row_store_evict_ns;
 
                     const target = &active_allocator.targets[request.buffer_index];
                     c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
@@ -929,19 +924,14 @@ pub const Frontend = struct {
                         .serial = request.serial,
                     });
 
-                    // Periodic state dump: print cache stats + RSS once
-                    // per second-ish so we can correlate row-build creep
-                    // with cache size / resident memory growth without
-                    // needing a slow-frame trigger.
+                    // Periodic state dump: print RSS once per second-ish
+                    // so we can correlate row-build creep with resident
+                    // memory growth without needing a slow-frame trigger.
                     diag_frame_counter += 1;
                     if (diag_frame_counter % 60 == 0) {
-                        const cs = r.cacheStats();
                         const rss_kb = readRssKb();
-                        std.debug.print("scrgo[diag] frame={} cache.entries={} cache.bytes={} cache.identities={} rss_kb={}\n", .{
+                        std.debug.print("scrgo[diag] frame={} rss_kb={}\n", .{
                             diag_frame_counter,
-                            cs.entries,
-                            cs.cache_bytes,
-                            cs.identities,
                             rss_kb,
                         });
                     }
@@ -957,30 +947,20 @@ pub const Frontend = struct {
                             const phase_upload = renderer_mod.Renderer.phase_upload_ns - phase_upload_base;
                             const phase_drawlist = renderer_mod.Renderer.phase_drawlist_ns - phase_drawlist_base;
                             const phase_draw = renderer_mod.Renderer.phase_draw_ns - phase_draw_base;
-                            const row_lookup = row_build.phase_row_lookup_ns - row_lookup_base;
                             const row_rebuild = row_build.phase_row_rebuild_ns - row_rebuild_base;
-                            const row_hits = row_build.phase_row_hit_count - row_hit_base;
-                            const row_misses = row_build.phase_row_miss_count - row_miss_base;
+                            const row_count = row_build.phase_row_count - row_count_base;
                             const row_shape = row_build.phase_row_shape_ns - row_shape_base;
                             const row_finish = row_build.phase_row_finish_ns - row_finish_base;
-                            const row_store = row_build.phase_row_store_ns - row_store_base;
-                            const row_evict_count = row_build.phase_row_store_evict_count - row_evict_count_base;
-                            const row_evict_ns = row_build.phase_row_store_evict_ns - row_evict_ns_base;
-                            std.debug.print("scrgo: slow gpu frame {d:.1}ms (budget {}ms) — cells {d:.1} + draw {d:.1} (row {d:.1} [lookup {d:.2} rebuild {d:.2} (shape {d:.2} finish {d:.2} store {d:.2} [evicts={} evict={d:.2}ms]) hit {} miss {}] pic {d:.1} upload {d:.1} dl {d:.1} gl {d:.1} fence {d:.1}) ms\n", .{
+                            std.debug.print("scrgo: slow gpu frame {d:.1}ms (budget {}ms) — cells {d:.1} + draw {d:.1} (row {d:.1} [rebuild {d:.2} (shape {d:.2} finish {d:.2}) rows {}] pic {d:.1} upload {d:.1} dl {d:.1} gl {d:.1} fence {d:.1}) ms\n", .{
                                 @as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f,
                                 budget_ms,
                                 @as(f64, @floatFromInt(cells_elapsed_ns)) / ms_f,
                                 @as(f64, @floatFromInt(draw_elapsed_ns)) / ms_f,
                                 @as(f64, @floatFromInt(phase_row)) / ms_f,
-                                @as(f64, @floatFromInt(row_lookup)) / ms_f,
                                 @as(f64, @floatFromInt(row_rebuild)) / ms_f,
                                 @as(f64, @floatFromInt(row_shape)) / ms_f,
                                 @as(f64, @floatFromInt(row_finish)) / ms_f,
-                                @as(f64, @floatFromInt(row_store)) / ms_f,
-                                row_evict_count,
-                                @as(f64, @floatFromInt(row_evict_ns)) / ms_f,
-                                row_hits,
-                                row_misses,
+                                row_count,
                                 @as(f64, @floatFromInt(phase_pic)) / ms_f,
                                 @as(f64, @floatFromInt(phase_upload)) / ms_f,
                                 @as(f64, @floatFromInt(phase_drawlist)) / ms_f,

@@ -64,12 +64,9 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     atlas_ref: *atlas_ref_mod.AtlasRef,
-    /// One lease per atlas snapshot identity that still has live blobs
-    /// in `row_cache`. The current snapshot is always present, keyed by
-    /// `last_atlas_identity`. Older entries are kept around so cached
-    /// blobs can be lazily rebound on lookup (the rebind path
-    /// dereferences both the blob's old atlas and the new one); we drop
-    /// each older entry the frame its cache count drops to zero.
+    /// Retained leases on every atlas snapshot identity we've ever
+    /// rendered against. The current snapshot is keyed by
+    /// `last_atlas_identity`; older entries are not currently released.
     atlas_leases: std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease),
 
     gl_renderer: snail.Gles30Renderer,
@@ -78,8 +75,6 @@ pub const Renderer = struct {
 
     last_atlas_gen: u64 = 0,
     last_atlas_identity: u64 = 0,
-
-    row_cache: row_build.RowCache,
 
     scratch_rects: []row_build.ColoredRect = &.{},
     overrides: [MAX_OVERRIDES]snail.Override = undefined,
@@ -149,7 +144,6 @@ pub const Renderer = struct {
             .builder = builder,
             .last_atlas_gen = atlas_ref.loadGeneration(),
             .last_atlas_identity = initial_identity,
-            .row_cache = row_build.RowCache.init(allocator, 32 * 1024 * 1024),
             .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
             .cell_width = cell_width,
             .cell_height = cell_height,
@@ -161,7 +155,6 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
-        self.row_cache.deinit();
         self.ephemeral_blobs.deinit();
         if (self.scratch_ready) self.allocator.free(self.scratch_rects);
         self.draw_buf.deinit(self.allocator);
@@ -305,10 +298,6 @@ pub const Renderer = struct {
         self.debug_log_atlas = options.atlas;
     }
 
-    pub fn cacheStats(self: *const Renderer) row_build.RowCache.Stats {
-        return self.row_cache.stats();
-    }
-
     /// Resize the drawable. Pure window-resize; cell metrics are unchanged.
     pub fn setViewport(self: *Renderer, w: u32, h: u32) void {
         if (self.viewport_w == @as(f32, @floatFromInt(w)) and self.viewport_h == @as(f32, @floatFromInt(h))) return;
@@ -316,22 +305,16 @@ pub const Renderer = struct {
         self.viewport_h = @floatFromInt(h);
     }
 
-    /// Update font metrics. Each cached `TextBlob` bakes `placement.em` into
-    /// its per-instance Transform2D, so any metrics change invalidates the
-    /// entire row cache. No-op when metrics are unchanged.
+    /// Update font metrics. No-op when metrics are unchanged.
     pub fn setMetrics(self: *Renderer, font_size: f32, cell_width: f32, cell_height: f32) void {
         if (self.font_size == font_size and self.cell_width == cell_width and self.cell_height == cell_height) return;
         self.font_size = font_size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
-        self.row_cache.clear();
     }
 
-    /// Pick up the latest atlas snapshot. Cached blobs are migrated
-    /// lazily via `RowCache.getCurrent` during `buildSnapshot`, so this
-    /// only installs the new lease + rebuilds the builder. Old leases
-    /// are released in `releaseStaleLeases` after the build completes,
-    /// once we know which identities still have live blobs.
+    /// Pick up the latest atlas snapshot. Installs the new lease and
+    /// rebuilds the builder against the fresh atlas.
     fn refreshAtlas(self: *Renderer) *const snail.TextAtlas {
         var next_lease = self.atlas_ref.acquire();
         const atlas = next_lease.get();
@@ -441,11 +424,9 @@ pub const Renderer = struct {
             snapshot,
             self.allocator,
             self.rowMetrics(),
-            &self.row_cache,
             &self.builder,
             atlas,
             self.atlas_ref,
-            self.last_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
             sel_buf[0..],

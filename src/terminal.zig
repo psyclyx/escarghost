@@ -14,12 +14,6 @@ fn fromGhosttyRgb(rgb: c.GhosttyColorRgb) Rgb {
     return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
 }
 
-pub const Dirty = enum {
-    false_,
-    partial,
-    full,
-};
-
 pub const CursorVisualStyle = enum {
     bar,
     block,
@@ -36,22 +30,6 @@ pub const CursorInfo = struct {
     blinking: bool,
 };
 
-pub const CellStyle = extern struct {
-    size: usize = @sizeOf(CellStyle),
-    fg_color: c.GhosttyStyleColor = .{ .tag = c.GHOSTTY_STYLE_COLOR_NONE, .value = undefined },
-    bg_color: c.GhosttyStyleColor = .{ .tag = c.GHOSTTY_STYLE_COLOR_NONE, .value = undefined },
-    underline_color: c.GhosttyStyleColor = .{ .tag = c.GHOSTTY_STYLE_COLOR_NONE, .value = undefined },
-    bold: bool = false,
-    italic: bool = false,
-    faint: bool = false,
-    blink: bool = false,
-    inverse: bool = false,
-    invisible: bool = false,
-    strikethrough: bool = false,
-    overline: bool = false,
-    underline: c_int = 0,
-};
-
 pub const RenderColors = struct {
     foreground: Rgb,
     background: Rgb,
@@ -66,8 +44,6 @@ pub const Terminal = struct {
     row_cells: c.GhosttyRenderStateRowCells,
     key_encoder: c.GhosttyKeyEncoder,
     key_event: c.GhosttyKeyEvent,
-    mouse_encoder: c.GhosttyMouseEncoder,
-    mouse_event: c.GhosttyMouseEvent,
 
     pty_fd: std.posix.fd_t = -1,
     title: []const u8 = "",
@@ -132,15 +108,6 @@ pub const Terminal = struct {
 
         if (c.ghostty_key_event_new(null, &self.key_event) != c.GHOSTTY_SUCCESS)
             return error.KeyEventInitFailed;
-        errdefer c.ghostty_key_event_free(self.key_event);
-
-        // Create mouse encoder + event
-        if (c.ghostty_mouse_encoder_new(null, &self.mouse_encoder) != c.GHOSTTY_SUCCESS)
-            return error.MouseEncoderInitFailed;
-        errdefer c.ghostty_mouse_encoder_free(self.mouse_encoder);
-
-        if (c.ghostty_mouse_event_new(null, &self.mouse_event) != c.GHOSTTY_SUCCESS)
-            return error.MouseEventInitFailed;
         // no more errdefer needed after last init
 
         self.pty_fd = -1;
@@ -168,8 +135,6 @@ pub const Terminal = struct {
     }
 
     pub fn deinit(self: *Terminal) void {
-        c.ghostty_mouse_event_free(self.mouse_event);
-        c.ghostty_mouse_encoder_free(self.mouse_encoder);
         c.ghostty_key_event_free(self.key_event);
         c.ghostty_key_encoder_free(self.key_encoder);
         c.ghostty_render_state_row_cells_free(self.row_cells);
@@ -219,29 +184,6 @@ pub const Terminal = struct {
     pub fn updateRenderState(self: *Terminal) !void {
         if (c.ghostty_render_state_update(self.render_state, self.handle) != c.GHOSTTY_SUCCESS)
             return error.RenderStateUpdateFailed;
-    }
-
-    /// Get the raw row identity handle for the current row iterator position.
-    /// Compare between frames to detect row reuse (scroll detection).
-    pub fn getRowId(self: *Terminal) u64 {
-        var raw: c.GhosttyRow = 0;
-        _ = c.ghostty_render_state_row_get(
-            self.row_iterator,
-            c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
-            @ptrCast(&raw),
-        );
-        return raw;
-    }
-
-    pub fn getDirty(self: *Terminal) Dirty {
-        var dirty: c.GhosttyRenderStateDirty = c.GHOSTTY_RENDER_STATE_DIRTY_FALSE;
-        _ = c.ghostty_render_state_get(self.render_state, c.GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
-        return switch (dirty) {
-            c.GHOSTTY_RENDER_STATE_DIRTY_FALSE => .false_,
-            c.GHOSTTY_RENDER_STATE_DIRTY_PARTIAL => .partial,
-            c.GHOSTTY_RENDER_STATE_DIRTY_FULL => .full,
-            else => .full,
-        };
     }
 
     pub fn resetDirty(self: *Terminal) void {
@@ -330,10 +272,6 @@ pub const Terminal = struct {
 
     pub fn nextCell(self: *Terminal) bool {
         return c.ghostty_render_state_row_cells_next(self.row_cells);
-    }
-
-    pub fn selectCell(self: *Terminal, col: u16) bool {
-        return c.ghostty_render_state_row_cells_select(self.row_cells, col) == c.GHOSTTY_SUCCESS;
     }
 
     pub const CellInfo = struct {
@@ -532,33 +470,6 @@ pub const Terminal = struct {
         _ = c.ghostty_key_encoder_encode(self.key_encoder, self.key_event, &encode_buf, encode_buf.len, &written);
         if (written == 0) return null;
         return encode_buf[0..written];
-    }
-
-    var mouse_encode_buf: [128]u8 = undefined;
-
-    pub fn encodeMouse(
-        self: *Terminal,
-        action: c.GhosttyMouseAction,
-        button: c.GhosttyMouseButton,
-        mods: c.GhosttyMods,
-        x: f64,
-        y: f64,
-    ) ?[]const u8 {
-        _ = c.ghostty_mouse_encoder_setopt_from_terminal(self.mouse_encoder, self.handle);
-
-        _ = c.ghostty_mouse_event_set_action(self.mouse_event, action);
-        if (action == c.GHOSTTY_MOUSE_ACTION_MOTION) {
-            _ = c.ghostty_mouse_event_clear_button(self.mouse_event);
-        } else {
-            _ = c.ghostty_mouse_event_set_button(self.mouse_event, button);
-        }
-        _ = c.ghostty_mouse_event_set_mods(self.mouse_event, mods);
-        _ = c.ghostty_mouse_event_set_position(self.mouse_event, .{ .x = x, .y = y });
-
-        var written: usize = 0;
-        _ = c.ghostty_mouse_encoder_encode(self.mouse_encoder, self.mouse_event, &mouse_encode_buf, mouse_encode_buf.len, &written);
-        if (written == 0) return null;
-        return mouse_encode_buf[0..written];
     }
 
     pub fn getTitle(self: *Terminal) []const u8 {

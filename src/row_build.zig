@@ -18,27 +18,16 @@ const atlas_ref_mod = @import("atlas_ref.zig");
 const perf = @import("perf.zig");
 const Rgb = color.Rgb;
 
-/// Sub-phase counters for `buildSnapshot`. Split the row-build wall time
-/// into "cache lookup + rebind" (hit path) and "shape + store" (miss
-/// path) so a slow-frame warning can attribute drift to one or the other.
-/// Single writer (the GPU worker thread, which is also the sole caller
-/// of buildSnapshot); diagnostic-only readers are benign.
-pub var phase_row_lookup_ns: u64 = 0;
+/// Sub-phase counters for `buildSnapshot`. Single writer (the GPU
+/// worker thread, sole caller of buildSnapshot); diagnostic-only readers
+/// are benign. `phase_row_rebuild_ns` is the total per-row work across
+/// the frame; `phase_row_shape_ns` and `phase_row_finish_ns` further
+/// split that into the HB shape walk and the blob finalize + rect dupe.
+/// `phase_row_count` is the number of rows built in the frame.
 pub var phase_row_rebuild_ns: u64 = 0;
-pub var phase_row_hit_count: u64 = 0;
-pub var phase_row_miss_count: u64 = 0;
-/// Further split of the rebuild path: HB shape walk, blob finalize +
-/// rect dupe, and cache store (which includes LRU eviction). Lets the
-/// slow-frame line show which sub-step in the miss path is creeping.
 pub var phase_row_shape_ns: u64 = 0;
 pub var phase_row_finish_ns: u64 = 0;
-pub var phase_row_store_ns: u64 = 0;
-/// Total time spent inside the LRU eviction loop and the count of
-/// `evictLru` iterations across all stores in the frame. Lets the
-/// slow-frame line surface whether per-store cost growth is from
-/// excessive evictions vs per-eviction work.
-pub var phase_row_store_evict_ns: u64 = 0;
-pub var phase_row_store_evict_count: u64 = 0;
+pub var phase_row_count: u64 = 0;
 
 pub const baseline_factor: f32 = 0.8;
 pub const MAX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 3;
@@ -65,19 +54,6 @@ pub const BuildResult = struct {
     rect_count: usize,
     had_misses: bool,
 };
-
-/// FNV-1a over the row's cells. Stable per cell-content; the cache key.
-pub fn hashSnapshotRow(snapshot: *const render_snapshot.SharedSnapshot, start_index: usize, cols: u16) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    const m: u64 = 0x100000001b3;
-    var i: usize = 0;
-    while (i < cols and start_index + i < snapshot.header.cell_count) : (i += 1) {
-        const cell = snapshot.cells[start_index + i];
-        const bytes = std.mem.asBytes(&cell);
-        for (bytes) |b| h = (h ^ b) *% m;
-    }
-    return h;
-}
 
 /// Accumulates an entire row's renderable text in one HB-shapeable
 /// buffer along with the per-byte mapping back to the source cell
@@ -329,373 +305,6 @@ pub fn buildRow(
     return .{ .rect_count = rect_count, .had_misses = had_misses };
 }
 
-/// One cached row's drawables. Y coordinates are row-local; the caller
-/// translates by row_y at submit. The Row, its blob, and its rect slice
-/// are all heap-allocated so the hashmap can rehash mid-frame without
-/// invalidating the `*Row` / `*const TextBlob` pointers that the caller
-/// (or the per-frame Scene) is already holding. The `lru_*` links form
-/// an intrusive doubly-linked list owned by the enclosing RowCache; do
-/// not touch them outside cache code.
-/// Sentinel for "no slot" in the index-based LRU links and free list.
-const NIL_SLOT: u32 = std.math.maxInt(u32);
-
-/// Slot allocations are grouped into fixed-size chunks. Each chunk is a
-/// stable heap allocation (we never realloc), so any pointer taken into
-/// a slot (in particular `&row.blob` for `RowDraw.blob`) remains valid
-/// even when the pool grows. Chunk size is a tradeoff: smaller chunks
-/// waste less memory on under-utilization, larger chunks reduce the
-/// per-chunk header overhead and amortize allocations.
-const SLOT_CHUNK_SIZE: u32 = 256;
-const SLOT_CHUNK_SHIFT: u5 = 8; // log2(SLOT_CHUNK_SIZE)
-const SLOT_CHUNK_MASK: u32 = SLOT_CHUNK_SIZE - 1;
-
-const SlotChunk = [SLOT_CHUNK_SIZE]Row;
-
-pub const Row = struct {
-    blob: snail.TextBlob,
-    rects: []ColoredRect,
-    content_hash: u64,
-    atlas_identity: u64,
-    had_misses: bool,
-    byte_size: usize,
-    /// Doubly-linked LRU. `NIL_SLOT` = no neighbor. When a slot is on
-    /// the free list (not in the cache), `lru_next` doubles as the
-    /// next-free index and `lru_prev` is meaningless.
-    lru_prev: u32 = NIL_SLOT,
-    lru_next: u32 = NIL_SLOT,
-};
-
-/// Per-row TextBlob+rect cache. One instance per renderer (no
-/// cross-thread sharing); each row records the atlas snapshot identity
-/// it was shaped against, so atlas extensions can rebind (or evict)
-/// each row lazily on the next lookup rather than sweeping the whole
-/// cache.
-///
-/// Row storage is a chunked slot pool: rows live in fixed-size chunks
-/// owned by `chunks`, addressed by `u32` indices. The HashMap maps
-/// content hashes to slot indices, and the LRU links are slot indices
-/// too — no per-row heap allocations on hot paths. Variable-size
-/// payloads (the blob's glyphs slice, the rects slice) still flow
-/// through `allocator`, but the highest-frequency alloc (the `Row`
-/// struct itself) is amortized over the chunk allocation.
-///
-/// LRU order: `lru_head` is the next eviction candidate, `lru_tail`
-/// the most-recently-used; touching/storing/evicting are O(1).
-pub const RowCache = struct {
-    allocator: std.mem.Allocator,
-    map: std.AutoHashMap(u64, u32),
-    cache_bytes: usize = 0,
-    cache_budget: usize,
-    entries_by_identity: std.AutoHashMap(u64, usize),
-    invalidations: std.ArrayList(u64),
-
-    /// Stable-pointer chunks of `Row` storage. Each `*SlotChunk` is its
-    /// own allocation and never moves; the pool grows by appending new
-    /// chunks. Slot `i` lives at `chunks.items[i >> SLOT_CHUNK_SHIFT][i & SLOT_CHUNK_MASK]`.
-    chunks: std.ArrayList(*SlotChunk),
-    /// Number of slots ever handed out from chunks (used to find the
-    /// next slot when the free list is empty). Slots `[0, allocated_slots)`
-    /// are either in the cache or on the free list.
-    allocated_slots: u32 = 0,
-    /// Head of the free list of evicted slots, or `NIL_SLOT` when
-    /// every allocated slot is in use.
-    free_head: u32 = NIL_SLOT,
-
-    lru_head: u32 = NIL_SLOT,
-    lru_tail: u32 = NIL_SLOT,
-
-    pub fn init(allocator: std.mem.Allocator, budget_bytes: usize) RowCache {
-        return .{
-            .allocator = allocator,
-            .map = std.AutoHashMap(u64, u32).init(allocator),
-            .cache_budget = budget_bytes,
-            .entries_by_identity = std.AutoHashMap(u64, usize).init(allocator),
-            .invalidations = .empty,
-            .chunks = .empty,
-        };
-    }
-
-    pub fn deinit(self: *RowCache) void {
-        self.clear();
-        self.map.deinit();
-        self.entries_by_identity.deinit();
-        self.invalidations.deinit(self.allocator);
-        for (self.chunks.items) |chunk| self.allocator.destroy(chunk);
-        self.chunks.deinit(self.allocator);
-    }
-
-    pub const Stats = struct {
-        entries: usize,
-        cache_bytes: usize,
-        identities: usize,
-    };
-
-    pub fn stats(self: *const RowCache) Stats {
-        return .{
-            .entries = self.map.count(),
-            .cache_bytes = self.cache_bytes,
-            .identities = self.entries_by_identity.count(),
-        };
-    }
-
-    pub fn clear(self: *RowCache) void {
-        // Walk every live slot (those reachable from the LRU list) and
-        // destroy its payload. Don't touch the free list — those slots
-        // hold no payload.
-        var idx = self.lru_head;
-        while (idx != NIL_SLOT) {
-            const row = self.slot(idx);
-            const next = row.lru_next;
-            row.blob.deinit();
-            self.allocator.free(row.rects);
-            idx = next;
-        }
-        self.map.clearRetainingCapacity();
-        self.entries_by_identity.clearRetainingCapacity();
-        self.invalidations.clearRetainingCapacity();
-        self.cache_bytes = 0;
-        self.lru_head = NIL_SLOT;
-        self.lru_tail = NIL_SLOT;
-        // Reset the pool: every slot is now free.
-        self.allocated_slots = 0;
-        self.free_head = NIL_SLOT;
-    }
-
-    pub fn entriesForIdentity(self: *const RowCache, identity: u64) usize {
-        return self.entries_by_identity.get(identity) orelse 0;
-    }
-
-    pub fn drainInvalidations(self: *RowCache) []const u64 {
-        return self.invalidations.items;
-    }
-
-    pub fn clearInvalidations(self: *RowCache) void {
-        self.invalidations.clearRetainingCapacity();
-    }
-
-    /// Resolve a slot index to its `Row`. Slot pointers are stable for
-    /// the lifetime of the cache: chunks are never reallocated.
-    pub fn slot(self: *const RowCache, index: u32) *Row {
-        return &self.chunks.items[index >> SLOT_CHUNK_SHIFT][index & SLOT_CHUNK_MASK];
-    }
-
-    /// Look up a row by content hash, transparently migrating its blob
-    /// onto the current atlas snapshot if it was shaped against an older
-    /// one. Returns null on outright miss, on a stale `had_misses` entry
-    /// (always re-shape so a freshly-extended atlas can fill the gaps),
-    /// or on rebind failure. Both eviction paths queue `key` into
-    /// `invalidations` so the caller can clear any downstream paint
-    /// state keyed by the same content hash before the replacement row
-    /// gets painted.
-    pub fn getCurrent(
-        self: *RowCache,
-        key: u64,
-        current_atlas: *const snail.TextAtlas,
-        current_identity: u64,
-    ) ?*Row {
-        const idx = self.map.get(key) orelse return null;
-        const row = self.slot(idx);
-        if (row.had_misses) {
-            self.queueInvalidation(key);
-            self.evictSlot(idx);
-            return null;
-        }
-        if (row.atlas_identity == current_identity) {
-            self.touchLru(idx);
-            return row;
-        }
-        const new_blob = row.blob.rebound(self.allocator, current_atlas) catch {
-            self.queueInvalidation(key);
-            self.evictSlot(idx);
-            return null;
-        };
-        const old_identity = row.atlas_identity;
-        row.blob.deinit();
-        row.blob = new_blob;
-        row.atlas_identity = current_identity;
-        self.decrementIdentity(old_identity);
-        self.incrementIdentity(current_identity) catch {
-            self.queueInvalidation(key);
-            self.evictSlot(idx);
-            return null;
-        };
-        self.touchLru(idx);
-        return row;
-    }
-
-    /// Per-entry memory overhead independent of glyph/rect payload.
-    /// Without this, a blank row (no rects, no glyphs) charges 0 against
-    /// the budget — the LRU keeps growing such rows forever and the
-    /// content-byte eviction loop walks past them without freeing any
-    /// budget bytes. Sized to roughly cover the slot + HashMap entry
-    /// per row.
-    const baseline_byte_overhead: usize = @sizeOf(Row) + 32;
-
-    /// Take ownership of a freshly-built blob+rects under `key`. Returns
-    /// the inserted row, or null if the underlying allocation fails (in
-    /// which case `blob` and `rects` are deinit/freed before return so
-    /// the caller never has to clean up after a failed store).
-    pub fn store(
-        self: *RowCache,
-        key: u64,
-        blob: snail.TextBlob,
-        rects: []ColoredRect,
-        atlas_identity: u64,
-        had_misses: bool,
-    ) ?*Row {
-        if (self.map.get(key)) |stale_idx| self.evictSlot(stale_idx);
-
-        const byte_size = baseline_byte_overhead + rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
-        const idx = self.acquireSlot() catch {
-            var b = blob;
-            b.deinit();
-            self.allocator.free(rects);
-            return null;
-        };
-        const row = self.slot(idx);
-        row.* = .{
-            .blob = blob,
-            .rects = rects,
-            .content_hash = key,
-            .atlas_identity = atlas_identity,
-            .had_misses = had_misses,
-            .byte_size = byte_size,
-        };
-        self.map.put(key, idx) catch {
-            row.blob.deinit();
-            self.allocator.free(row.rects);
-            self.releaseSlot(idx);
-            return null;
-        };
-        self.cache_bytes += byte_size;
-        self.appendLru(idx);
-        self.incrementIdentity(atlas_identity) catch {
-            _ = self.map.remove(key);
-            self.unlinkLru(idx);
-            self.cache_bytes -= byte_size;
-            row.blob.deinit();
-            self.allocator.free(row.rects);
-            self.releaseSlot(idx);
-            return null;
-        };
-
-        // Loop is bounded by entries-added-this-store (1) plus the
-        // standing surplus from prior stores. With `baseline_byte_overhead`
-        // charging every entry, each eviction makes guaranteed progress
-        // and the loop converges in well under the cap during normal
-        // operation.
-        const evict_t0 = perf.Timer.now();
-        var guard: usize = 0;
-        while (self.cache_bytes > self.cache_budget and guard < 256) : (guard += 1) {
-            self.evictLru();
-        }
-        phase_row_store_evict_ns += evict_t0.elapsedNs();
-        phase_row_store_evict_count += guard;
-        return row;
-    }
-
-    pub fn evict(self: *RowCache, key: u64) void {
-        const idx = self.map.get(key) orelse return;
-        self.evictSlot(idx);
-    }
-
-    /// Drop the slot at `idx` from the cache and return its slot to the
-    /// pool. Frees the row's payload (glyphs slice via `blob.deinit`,
-    /// rects slice via the allocator).
-    fn evictSlot(self: *RowCache, idx: u32) void {
-        const row = self.slot(idx);
-        _ = self.map.remove(row.content_hash);
-        self.cache_bytes -= row.byte_size;
-        self.decrementIdentity(row.atlas_identity);
-        self.unlinkLru(idx);
-        row.blob.deinit();
-        self.allocator.free(row.rects);
-        self.releaseSlot(idx);
-    }
-
-    fn queueInvalidation(self: *RowCache, key: u64) void {
-        self.invalidations.append(self.allocator, key) catch {};
-    }
-
-    fn incrementIdentity(self: *RowCache, identity: u64) !void {
-        const gop = try self.entries_by_identity.getOrPut(identity);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-    }
-
-    fn decrementIdentity(self: *RowCache, identity: u64) void {
-        const count = self.entries_by_identity.getPtr(identity) orelse return;
-        if (count.* > 0) count.* -= 1;
-        if (count.* == 0) _ = self.entries_by_identity.remove(identity);
-    }
-
-    fn evictLru(self: *RowCache) void {
-        if (self.lru_head == NIL_SLOT) return;
-        self.evictSlot(self.lru_head);
-    }
-
-    /// Acquire a fresh slot. Pops from the free list when possible;
-    /// otherwise allocates from the current chunk, growing the pool by
-    /// one chunk when the current one is full.
-    fn acquireSlot(self: *RowCache) !u32 {
-        if (self.free_head != NIL_SLOT) {
-            const idx = self.free_head;
-            self.free_head = self.slot(idx).lru_next;
-            return idx;
-        }
-        const chunk_idx = self.allocated_slots >> SLOT_CHUNK_SHIFT;
-        if (chunk_idx >= self.chunks.items.len) {
-            const new_chunk = try self.allocator.create(SlotChunk);
-            self.chunks.append(self.allocator, new_chunk) catch |err| {
-                self.allocator.destroy(new_chunk);
-                return err;
-            };
-        }
-        const idx = self.allocated_slots;
-        self.allocated_slots += 1;
-        return idx;
-    }
-
-    /// Return a slot to the free list. The slot's payload must already
-    /// be released; we only repurpose `lru_next` as the free-list link.
-    fn releaseSlot(self: *RowCache, idx: u32) void {
-        const row = self.slot(idx);
-        row.lru_next = self.free_head;
-        self.free_head = idx;
-    }
-
-    fn appendLru(self: *RowCache, idx: u32) void {
-        const row = self.slot(idx);
-        row.lru_prev = self.lru_tail;
-        row.lru_next = NIL_SLOT;
-        if (self.lru_tail != NIL_SLOT) self.slot(self.lru_tail).lru_next = idx;
-        self.lru_tail = idx;
-        if (self.lru_head == NIL_SLOT) self.lru_head = idx;
-    }
-
-    fn unlinkLru(self: *RowCache, idx: u32) void {
-        const row = self.slot(idx);
-        if (row.lru_prev != NIL_SLOT) {
-            self.slot(row.lru_prev).lru_next = row.lru_next;
-        } else {
-            self.lru_head = row.lru_next;
-        }
-        if (row.lru_next != NIL_SLOT) {
-            self.slot(row.lru_next).lru_prev = row.lru_prev;
-        } else {
-            self.lru_tail = row.lru_prev;
-        }
-        row.lru_prev = NIL_SLOT;
-        row.lru_next = NIL_SLOT;
-    }
-
-    fn touchLru(self: *RowCache, idx: u32) void {
-        if (idx == self.lru_tail) return;
-        self.unlinkLru(idx);
-        self.appendLru(idx);
-    }
-};
-
 /// Per-frame stash for heap-allocated `TextBlob`s + `ColoredRect`
 /// slices that the rendered scene references by pointer. Released in
 /// bulk at end of frame; both backends own one.
@@ -746,19 +355,13 @@ pub const EphemeralBlobs = struct {
     }
 };
 
-/// Output of `buildSnapshot`: the per-row draw list (cached blob + row_y)
-/// and an optional cursor overlay. Backends iterate this to emit the four
+/// Output of `buildSnapshot`: the per-row draw list (blob + row_y) and
+/// an optional cursor overlay. Backends iterate this to emit the four
 /// passes (clear → bg/decoration rects → cursor rect → text scene).
-///
-/// Carries `blob` and `rects` directly rather than `*Row`: `cache.store`
-/// can rehash the underlying `std.AutoHashMap` mid-build and invalidate
-/// previously-returned `*Row` pointers, but the heap-allocated `blob` and
-/// `rects` themselves are stable across rehash.
 pub const RowDraw = struct {
     blob: *const snail.TextBlob,
     rects: []ColoredRect,
     row_y: f32,
-    content_hash: u64,
 };
 
 pub const CursorOverlay = struct {
@@ -787,19 +390,15 @@ pub const BuiltSnapshot = struct {
     rows: []const RowDraw,
     cursor: ?CursorOverlay,
     selection_spans: []const SelectionSpan,
-    /// Stable identity of the selection for dirty tracking. Two
-    /// selections that produce the same painted band hash to the same
-    /// value. Zero = no selection.
-    selection_id: u64,
     /// Optional right-edge scrollbar overlay. Renderers paint a thin
     /// band on top of everything else when present.
     scrollbar: ?render_snapshot.ScrollbarOverlay,
 };
 
-/// Walk a snapshot row-by-row, hit the row cache, and capture cursor
+/// Walk a snapshot row-by-row, shape each row's text, and capture cursor
 /// state in one pass. Backends own the four submit passes (see
 /// docs/row-render-design.md for the contract); this layer owns
-/// iteration, caching, and the per-frame inverted-glyph build.
+/// iteration and the per-frame inverted-glyph build.
 ///
 /// `selection_spans_out` receives any selection rectangles produced
 /// from `snapshot.selection`. Cap is `MAX_SELECTION_SPANS`.
@@ -807,11 +406,9 @@ pub fn buildSnapshot(
     snapshot: *const render_snapshot.SharedSnapshot,
     allocator: std.mem.Allocator,
     metrics: Metrics,
-    cache: *RowCache,
     builder: *snail.TextBlobBuilder,
     atlas: *const snail.TextAtlas,
     atlas_ref: *atlas_ref_mod.AtlasRef,
-    atlas_identity: u64,
     scratch_rects: []ColoredRect,
     rows_out: []RowDraw,
     selection_spans_out: []SelectionSpan,
@@ -850,18 +447,13 @@ pub fn buildSnapshot(
             }
         }
 
-        _ = cache;
-        _ = atlas_identity;
-
-        const content_hash = hashSnapshotRow(snapshot, row_start_index, cols);
         const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
 
-        // No row cache: shape every row every frame. For workloads where
-        // every row's content changes per frame (e.g. tmatrix), the
-        // cache hit rate was 0% and the lookup + store path was pure
-        // overhead. For stable text the shape work would be redundant
-        // — that's a known tradeoff; we'd reinstate caching in a form
-        // that doesn't churn the allocator if it ever matters.
+        // Shape every row every frame. A prior content-hash-keyed cache
+        // was removed: on workloads where every row's content changes
+        // per frame (e.g. tmatrix) the hit rate was 0% and the lookup +
+        // store path was pure overhead; on stable text the per-frame
+        // shape work is the known tradeoff.
         const rebuild_t0 = perf.Timer.now();
         builder.reset();
         const shape_t0 = perf.Timer.now();
@@ -886,10 +478,10 @@ pub fn buildSnapshot(
         try blob_stash.stashRects(rects);
         phase_row_finish_ns += finish_t0.elapsedNs();
         phase_row_rebuild_ns += rebuild_t0.elapsedNs();
-        phase_row_miss_count += 1;
+        phase_row_count += 1;
         cell_index = next_index;
 
-        rows_out[row_count] = .{ .blob = blob_ptr, .rects = rects, .row_y = row_y, .content_hash = content_hash };
+        rows_out[row_count] = .{ .blob = blob_ptr, .rects = rects, .row_y = row_y };
         row_count += 1;
     }
 
@@ -928,7 +520,6 @@ pub fn buildSnapshot(
         .rows = rows_out[0..row_count],
         .cursor = cursor,
         .selection_spans = spans,
-        .selection_id = packSelectionId(snapshot.selection, spans),
         .scrollbar = snapshot.scrollbar,
     };
 }
@@ -1044,24 +635,6 @@ fn expandSnapshotWord(
         .start = .{ .row = cell.row, .col = w.start },
         .end = .{ .row = cell.row, .col = w.end },
     };
-}
-
-/// Pack the resolved selection into a u64 for fast equality checks.
-/// Renderers use this to detect "the highlight band hasn't moved" so
-/// they can skip repainting selection-covered rows. Hashes the span
-/// list so spans of different rows / extents always differ.
-fn packSelectionId(snapshot: ?selection_mod.Snapshot, spans: []const SelectionSpan) u64 {
-    if (snapshot == null or spans.len == 0) return 0;
-    var h: u64 = 0xcbf29ce484222325;
-    const m: u64 = 0x100000001b3;
-    h = (h ^ @intFromEnum(snapshot.?.mode)) *% m;
-    for (spans) |s| {
-        h = (h ^ @as(u64, s.row)) *% m;
-        h = (h ^ @as(u64, s.start_col)) *% m;
-        h = (h ^ @as(u64, s.end_col)) *% m;
-    }
-    // Reserve 0 for "no selection".
-    return if (h == 0) 1 else h;
 }
 
 fn buildInvertedGlyph(

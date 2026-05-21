@@ -157,11 +157,10 @@ pub const SnapshotRenderer = struct {
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
 
-    /// One lease per atlas identity still referenced by `row_cache`.
-    /// The current snapshot's lease is keyed by `builder_atlas_identity`;
-    /// older entries stay until the row cache stops holding blobs on
-    /// them, so the lazy rebind path in `RowCache.getCurrent` can safely
-    /// dereference each blob's old atlas. `null` until the first
+    /// Retained lease for the current atlas snapshot, keyed by
+    /// `builder_atlas_identity`. Older entries are dropped at end of
+    /// frame in `releaseStaleLeases` — nothing outlives the frame that
+    /// would still reference them. `null` until the first
     /// `ensureBuilderForAtlas` call seeds it.
     atlas_leases: ?std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease) = null,
     builder_atlas_identity: u64 = 0,
@@ -173,13 +172,9 @@ pub const SnapshotRenderer = struct {
     scratch_rects: []row_build.ColoredRect,
     config: render_config.RenderConfig,
 
-    row_cache: row_build.RowCache,
     /// Per-frame ephemeral blobs (cursor inversion). Bulk-released after
     /// each frame.
     ephemeral_blobs: row_build.EphemeralBlobs,
-    /// Last metrics applied to the cache. Any change invalidates every
-    /// cached blob because `placement.em` is baked per-glyph.
-    cached_metrics: ?row_build.Metrics = null,
 
     pub fn init(allocator: std.mem.Allocator) !SnapshotRenderer {
         const config = render_config.loadFromEnv();
@@ -205,13 +200,11 @@ pub const SnapshotRenderer = struct {
             .builder = builder,
             .scratch_rects = scratch_rects,
             .config = config,
-            .row_cache = row_build.RowCache.init(allocator, 32 * 1024 * 1024),
             .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
         };
     }
 
     pub fn deinit(self: *SnapshotRenderer) void {
-        self.row_cache.deinit();
         self.ephemeral_blobs.deinit();
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
@@ -232,11 +225,11 @@ pub const SnapshotRenderer = struct {
         if (self.builder_atlas_identity != 0) self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
 
-        // Stash a lease for the new snapshot. We don't touch the cache
-        // here — RowCache.getCurrent rebinds (or evicts) stale entries
-        // lazily on lookup. `releaseStaleLeases` (called after each
-        // frame's build) drops any retained lease whose identity has
-        // no surviving cache entries.
+        // Stash a lease for the new snapshot. `releaseStaleLeases`
+        // (called after each frame's build) drops any retained lease
+        // that isn't the current builder identity — ephemeral blobs are
+        // released at end of frame so nothing else references the old
+        // atlas.
         if (self.atlas_leases == null) {
             self.atlas_leases = std.AutoHashMap(u64, atlas_ref_mod.AtlasRef.Lease).init(self.allocator);
         }
@@ -251,8 +244,10 @@ pub const SnapshotRenderer = struct {
         self.builder_atlas_identity = id;
     }
 
-    /// Release any retained lease whose snapshot no longer has cached
-    /// blobs referencing it. Called after each frame's build.
+    /// Release any retained lease that isn't the current builder
+    /// identity. Called after each frame's build; ephemeral blobs are
+    /// released at end of frame so nothing else references the old
+    /// atlas.
     fn releaseStaleLeases(self: *SnapshotRenderer) void {
         const leases = if (self.atlas_leases) |*m| m else return;
         var stale_buf: [32]u64 = undefined;
@@ -261,7 +256,6 @@ pub const SnapshotRenderer = struct {
         while (it.next()) |entry| {
             const id = entry.key_ptr.*;
             if (id == self.builder_atlas_identity) continue;
-            if (self.row_cache.entriesForIdentity(id) != 0) continue;
             if (n >= stale_buf.len) break;
             stale_buf[n] = id;
             n += 1;
@@ -366,15 +360,6 @@ pub const SnapshotRenderer = struct {
             .cell_height = cell_height,
             .font_size = font_size,
         };
-        if (self.cached_metrics) |prev| {
-            if (prev.cell_width != metrics.cell_width or
-                prev.cell_height != metrics.cell_height or
-                prev.font_size != metrics.font_size)
-            {
-                self.row_cache.clear();
-            }
-        }
-        self.cached_metrics = metrics;
 
         self.scene.reset();
 
@@ -385,11 +370,9 @@ pub const SnapshotRenderer = struct {
             snapshot,
             self.allocator,
             metrics,
-            &self.row_cache,
             &self.builder,
             self.currentAtlas(),
             atlas_lease.ref,
-            self.builder_atlas_identity,
             self.scratch_rects,
             rows_buf[0..],
             sel_buf[0..],
@@ -414,11 +397,9 @@ pub const SnapshotRenderer = struct {
                     snapshot,
                     self.allocator,
                     metrics,
-                    &self.row_cache,
                     &self.builder,
                     self.currentAtlas(),
                     atlas_lease.ref,
-                    self.builder_atlas_identity,
                     self.scratch_rects,
                     rows_buf[0..],
                     sel_buf[0..],
@@ -429,10 +410,6 @@ pub const SnapshotRenderer = struct {
             }
         }
 
-        // CPU path rewrites the whole SHM buffer each frame, so there's
-        // no per-target dirty bookkeeping to invalidate. Still drain so
-        // the cache's list doesn't grow unbounded.
-        self.row_cache.clearInvalidations();
         self.releaseStaleLeases();
 
         try self.flushDraw(built, default_bg, snapshot.header.default_fg, width, height, cell_width, cell_height);

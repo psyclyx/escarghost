@@ -106,25 +106,3 @@ pub const SharedBuffer = struct {
     }
 };
 
-pub const MappedBuffer = struct {
-    desc: BufferDesc,
-    map_ptr: ?*anyopaque,
-
-    pub fn map(desc: BufferDesc) !MappedBuffer {
-        const mapped = c.mmap(null, desc.size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, desc.fd, 0);
-        if (mapped == c.MAP_FAILED) return error.MmapFailed;
-        return .{
-            .desc = desc,
-            .map_ptr = mapped,
-        };
-    }
-
-    pub fn destroy(self: *MappedBuffer) void {
-        if (self.map_ptr) |map_ptr| _ = c.munmap(map_ptr, self.desc.size);
-    }
-
-    pub fn bytes(self: *MappedBuffer) []u8 {
-        const ptr: [*]u8 = @ptrCast(self.map_ptr.?);
-        return ptr[0..self.desc.size];
-    }
-};

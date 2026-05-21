@@ -28,13 +28,6 @@ pub const BufferDesc = extern struct {
 // of fence-wait time.
 pub const MaxBuffers = 3;
 
-pub const ReadyMessage = extern struct {
-    tag: u8 = 1,
-    buffer_count: u8 = 0,
-    reserved: [6]u8 = [_]u8{0} ** 6,
-    buffers: [MaxBuffers]BufferDesc = [_]BufferDesc{.{}} ** MaxBuffers,
-};
-
 pub const FrontendBuffer = struct {
     desc: BufferDesc,
     wl_buffer: ?*wl.wl_buffer,
