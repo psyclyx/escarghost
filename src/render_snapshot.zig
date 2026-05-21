@@ -50,6 +50,10 @@ pub const Header = struct {
     cursor_in_viewport: u8 = 0,
     cursor_has_color: u8 = 0,
     reserved: u8 = 0,
+    /// Absolute screen-y of viewport row 0. Used by selection
+    /// resolution to convert anchor/head screen coordinates back into
+    /// viewport rows. Zero when there's no scrollback.
+    viewport_offset: u32 = 0,
 };
 
 /// Scrollbar overlay sampled at snapshot time. Null = no scrollback
@@ -193,6 +197,14 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atl
     snapshot.header.cols = max_cols;
     snapshot.header.rows = row_count;
     snapshot.header.cell_count = @intCast(cell_index);
+
+    // Capture the viewport's position in the scrollback so selection
+    // resolution downstream can recover the original screen y of
+    // each anchored cell. `scrollbar()` returns offset = viewport
+    // top in screen-row coords; zero when the viewport sits at the
+    // start of an empty scrollback.
+    const sb = term.scrollbar();
+    snapshot.header.viewport_offset = @intCast(@min(sb.offset, std.math.maxInt(u32)));
 }
 
 /// Convenience: prepare + captureCells on the same thread. Used by the

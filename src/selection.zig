@@ -1,22 +1,29 @@
 //! Terminal text selection state machine. Owned by main.zig and updated
 //! from mouse events. The selection itself is a (start_cell, end_cell, mode)
-//! triple in *viewport* coordinates (row 0 = top of visible viewport), which
-//! both renderers can highlight directly. Scrolling the viewport does not
-//! shift the highlighted region — selection follows the screen, not the
-//! scrollback, to keep the implementation small. That's an acceptable
-//! compromise for the first cut; future work could anchor the selection to
-//! ghostty GridRefs and survive scrolling.
+//! triple where each cell's `row` is the *absolute screen y* (0 at the top
+//! of scrollback, increasing downward). The renderer subtracts the snapshot's
+//! viewport_offset to map back to viewport rows, so the highlighted region
+//! stays anchored to the underlying text as new output scrolls it through
+//! the viewport — scrolling neither moves nor wipes the selection.
 //!
 //! The state machine handles drag (char), double-click (word), and
 //! triple-click (line) modes, plus shift+click extend. Word boundaries
 //! are detected from a small predicate over codepoints; line mode
 //! always selects whole rows. The renderer treats the selection as an
 //! ordered (top-left → bottom-right) rect band.
+//!
+//! Rows that scroll out of the scrollback budget shift the screen-y of
+//! everything still in scrollback. Once an endpoint scrolls off the
+//! top, its screen-y goes effectively negative; the renderer clamps
+//! that to row 0 (highlight clips to the visible portion).
 
 const std = @import("std");
 
 pub const Cell = struct {
-    row: u16,
+    /// Absolute screen y. Counts from 0 at the top of the scrollback
+    /// buffer downward. Wider than the viewport (u32) so we can address
+    /// the full scrollback even when it grows past 65k rows.
+    row: u32,
     col: u16,
 
     pub fn lessThan(a: Cell, b: Cell) bool {
@@ -148,7 +155,7 @@ pub const State = struct {
         const dt = now_ms - self.last_click_ms;
         const is_same_cell = if (last_cell) |lc|
             (@abs(@as(i32, cell.col) - @as(i32, lc.col)) <= SAME_CELL_TOLERANCE and
-                @abs(@as(i32, cell.row) - @as(i32, lc.row)) <= SAME_CELL_TOLERANCE)
+                @abs(@as(i64, cell.row) - @as(i64, lc.row)) <= SAME_CELL_TOLERANCE)
         else
             false;
         if (is_same_cell and dt >= 0 and dt <= MAX_CLICK_INTERVAL_MS) {
@@ -373,4 +380,16 @@ test "State.toSnapshot returns a populated snapshot after a drag" {
     try std.testing.expect(snap.mode == .char);
     try std.testing.expect(Cell.eql(snap.anchor, .{ .row = 1, .col = 2 }));
     try std.testing.expect(Cell.eql(snap.head, .{ .row = 3, .col = 5 }));
+}
+
+test "Cell.row fits screen-y values larger than u16" {
+    // Selection anchors are absolute screen-y, which can grow past
+    // 65k once scrollback fills up. Make sure Cell can carry that
+    // and ordering survives.
+    var s = State{};
+    s.beginPrimary(.{ .row = 100_000, .col = 5 }, false, 0);
+    s.updateDrag(.{ .row = 50_000, .col = 0 });
+    const ord = s.range.?.ordered();
+    try std.testing.expectEqual(@as(u32, 50_000), ord.start.row);
+    try std.testing.expectEqual(@as(u32, 100_000), ord.end.row);
 }

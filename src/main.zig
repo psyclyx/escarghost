@@ -548,9 +548,12 @@ const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
-/// Convert surface-local pixel coords to terminal cell coords. Returns
-/// null when metrics aren't ready yet (early startup). Clamps to the
-/// grid so a drag past the window edge still produces a valid cell.
+/// Convert surface-local pixel coords to a selection cell anchored in
+/// absolute screen coordinates (row 0 = top of scrollback). Returns
+/// null when metrics aren't ready yet (early startup). Clamps the
+/// viewport portion to the grid so a drag past the window edge still
+/// produces a valid cell, then offsets by the current viewport top so
+/// the resulting Cell stays valid as the terminal scrolls.
 fn pixelToCell(x: f64, y: f64) ?selection_mod.Cell {
     if (g_cell_width <= 0 or g_cell_height <= 0) return null;
     const term_cols = g_term.colCount();
@@ -561,8 +564,10 @@ fn pixelToCell(x: f64, y: f64) ?selection_mod.Cell {
     const col_i = @as(i32, @intFromFloat(@max(0.0, col_f)));
     const row_i = @as(i32, @intFromFloat(@max(0.0, row_f)));
     const col: u16 = @intCast(@min(@as(i32, term_cols - 1), col_i));
-    const row: u16 = @intCast(@min(@as(i32, term_rows - 1), row_i));
-    return .{ .row = row, .col = col };
+    const view_row: u16 = @intCast(@min(@as(i32, term_rows - 1), row_i));
+    const sb = g_term.scrollbar();
+    const screen_y: u32 = @intCast(@min(sb.offset + view_row, std.math.maxInt(u32)));
+    return .{ .row = screen_y, .col = col };
 }
 
 fn nowMs() i64 {
@@ -684,16 +689,24 @@ fn writePasteToPty(text: []const u8) void {
     markRenderDirty();
 }
 
-/// Read the current row's codepoints into `out` from the live terminal
-/// render state. Returns the column count actually read (≤ out.len).
-/// Used by selection extraction to expand word selections and to trim
-/// trailing whitespace at copy time.
-fn fetchRowCodepoints(target_row: u16, out: []u32) usize {
+/// Read the codepoints of the row at absolute screen-y `target_screen_y`
+/// into `out` (UTF-32). Returns the column count actually read. Only
+/// rows currently inside the viewport are reachable from the render
+/// state, so screen rows above or below the viewport return 0 — copy
+/// of scrolled-off selection regions falls back to whatever portion
+/// is visible.
+fn fetchRowCodepoints(target_screen_y: u32, out: []u32) usize {
+    const sb = g_term.scrollbar();
+    if (target_screen_y < sb.offset) return 0;
+    const view_row_u64 = target_screen_y - sb.offset;
+    if (view_row_u64 >= sb.len) return 0;
+    const view_row: u16 = @intCast(view_row_u64);
+
     g_term.updateRenderState() catch return 0;
     g_term.beginRowIteration();
     var row_idx: u16 = 0;
     while (g_term.nextRow()) : (row_idx += 1) {
-        if (row_idx != target_row) continue;
+        if (row_idx != view_row) continue;
         g_term.beginCellIteration();
         var col: usize = 0;
         while (g_term.nextCell() and col < out.len) : (col += 1) {
@@ -707,74 +720,68 @@ fn fetchRowCodepoints(target_row: u16, out: []u32) usize {
 
 /// Allocate and fill a UTF-8 buffer with the currently-selected text.
 /// Returns null when there's nothing to copy. Caller frees with the
-/// same allocator. Word and line modes are resolved live from the
-/// terminal's current render state (matches what's on screen).
+/// same allocator. Walks rows in absolute screen-y space; rows that
+/// have scrolled out of the viewport can't be fetched from the
+/// render state, so the extracted text covers only the visible
+/// portion of the selection in that case.
 fn extractSelectionText(allocator: std.mem.Allocator) !?[]u8 {
     const snap = g_selection.toSnapshot() orelse return null;
     const cols = g_term.colCount();
     const rows = g_term.rowCount();
     if (cols == 0 or rows == 0) return null;
 
-    // Resolve the selection into per-row spans (inclusive end_col).
-    // Char mode uses the snapshot's raw anchor/head; word mode
-    // expands each endpoint to a word boundary using the row's
-    // codepoints; line mode covers full rows.
-    var spans_buf: [render_snapshot.MaxRows]selection_mod.RowSpan = undefined;
-    var n_spans: usize = 0;
     var row_cp_buf: [render_snapshot.MaxCols]u32 = undefined;
+
+    // Resolve word/line modes to a (start_cell, end_cell) range in
+    // screen-y space, then walk that range row-by-row.
+    var start_cell: selection_mod.Cell = undefined;
+    var end_cell: selection_mod.Cell = undefined;
+    var force_full_row_band = false;
 
     switch (snap.mode) {
         .char => {
             const ord = snap.ordered();
-            const start = clampCell(ord.start, rows, cols);
-            const end = clampCell(ord.end, rows, cols);
-            var row: u16 = start.row;
-            while (row <= end.row and n_spans < spans_buf.len) : (row += 1) {
-                const sc: u16 = if (row == start.row) start.col else 0;
-                const ec: u16 = if (row == end.row) end.col else cols - 1;
-                if (ec >= sc) {
-                    spans_buf[n_spans] = .{ .row = row, .start_col = sc, .end_col = ec };
-                    n_spans += 1;
-                }
-            }
+            start_cell = .{ .row = ord.start.row, .col = @min(ord.start.col, cols - 1) };
+            end_cell = .{ .row = ord.end.row, .col = @min(ord.end.col, cols - 1) };
         },
         .word => {
-            const a_words = expandWordLive(snap.anchor, cols, &row_cp_buf);
-            const h_words = expandWordLive(snap.head, cols, &row_cp_buf);
-            const start_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(a_words.start, h_words.start)) a_words.start else h_words.start;
-            const end_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(a_words.end, h_words.end)) h_words.end else a_words.end;
-            const start = clampCell(start_cell, rows, cols);
-            const end = clampCell(end_cell, rows, cols);
-            var row: u16 = start.row;
-            while (row <= end.row and n_spans < spans_buf.len) : (row += 1) {
-                const sc: u16 = if (row == start.row) start.col else 0;
-                const ec: u16 = if (row == end.row) end.col else cols - 1;
-                spans_buf[n_spans] = .{ .row = row, .start_col = sc, .end_col = ec };
-                n_spans += 1;
-            }
+            const a = expandWordLive(snap.anchor, cols, &row_cp_buf);
+            const h = expandWordLive(snap.head, cols, &row_cp_buf);
+            start_cell = if (selection_mod.Cell.lessThan(a.start, h.start)) a.start else h.start;
+            end_cell = if (selection_mod.Cell.lessThan(a.end, h.end)) h.end else a.end;
+            start_cell.col = @min(start_cell.col, cols - 1);
+            end_cell.col = @min(end_cell.col, cols - 1);
         },
         .line => {
             const ord = snap.ordered();
-            const start_row: u16 = @min(ord.start.row, rows - 1);
-            const end_row: u16 = @min(ord.end.row, rows - 1);
-            var row: u16 = start_row;
-            while (row <= end_row and n_spans < spans_buf.len) : (row += 1) {
-                spans_buf[n_spans] = .{ .row = row, .start_col = 0, .end_col = cols - 1 };
-                n_spans += 1;
-            }
+            start_cell = .{ .row = ord.start.row, .col = 0 };
+            end_cell = .{ .row = ord.end.row, .col = cols - 1 };
+            force_full_row_band = true;
         },
     }
-
-    if (n_spans == 0) return null;
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    var i: usize = 0;
-    while (i < n_spans) : (i += 1) {
-        const span_raw = spans_buf[i];
-        const row_n = fetchRowCodepoints(span_raw.row, row_cp_buf[0..cols]);
+    var first_emitted = true;
+    var row: u32 = start_cell.row;
+    while (row <= end_cell.row) : (row += 1) {
+        const sc_raw: u16 = if (!force_full_row_band and row == start_cell.row) start_cell.col else 0;
+        const ec_raw: u16 = if (!force_full_row_band and row == end_cell.row) end_cell.col else cols - 1;
+        if (ec_raw < sc_raw) continue;
+        const span_raw: selection_mod.RowSpan = .{ .row = 0, .start_col = sc_raw, .end_col = ec_raw };
+        const row_n = fetchRowCodepoints(row, row_cp_buf[0..cols]);
+        // No content for this row (scrolled off, or empty): still
+        // emit a line break so multi-row selections preserve their
+        // structure; skip the cell loop.
+        if (row_n == 0) {
+            if (!first_emitted) try out.append(allocator, '\n');
+            first_emitted = false;
+            continue;
+        }
         const span = selection_mod.trimSpanRight(row_cp_buf[0..row_n], span_raw);
+        if (!first_emitted) try out.append(allocator, '\n');
+        first_emitted = false;
         var col: u16 = span.start_col;
         while (col <= span.end_col) : (col += 1) {
             const cp: u32 = if (col < row_n) row_cp_buf[col] else ' ';
@@ -782,15 +789,10 @@ fn extractSelectionText(allocator: std.mem.Allocator) !?[]u8 {
             const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch continue;
             try out.appendSlice(allocator, tmp[0..n]);
         }
-        if (i + 1 < n_spans) try out.append(allocator, '\n');
     }
 
     if (out.items.len == 0) return null;
     return try out.toOwnedSlice(allocator);
-}
-
-fn clampCell(cell: selection_mod.Cell, rows: u16, cols: u16) selection_mod.Cell {
-    return .{ .row = @min(cell.row, rows - 1), .col = @min(cell.col, cols - 1) };
 }
 
 fn expandWordLive(cell: selection_mod.Cell, cols: u16, row_cp_buf: *[render_snapshot.MaxCols]u32) struct { start: selection_mod.Cell, end: selection_mod.Cell } {

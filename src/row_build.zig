@@ -677,10 +677,9 @@ pub fn buildSnapshot(
 }
 
 /// Translate the snapshot's anchor/head + mode into the per-row column
-/// ranges the renderer paints. Char mode walks the band between the
-/// ordered endpoints; word mode expands each endpoint to a word
-/// boundary using the row's codepoints; line mode covers full rows.
-/// Returns a slice of `spans_out` populated up to its capacity.
+/// ranges the renderer paints. Selection cells store *absolute screen y*;
+/// this helper subtracts the snapshot's viewport_offset to recover
+/// viewport rows and clips off-screen portions of the band.
 fn resolveSelectionSpans(
     snapshot: *const render_snapshot.SharedSnapshot,
     spans_out: []SelectionSpan,
@@ -690,28 +689,35 @@ fn resolveSelectionSpans(
     const sel = snapshot.selection orelse return spans_out[0..0];
     if (rows == 0 or cols == 0 or spans_out.len == 0) return spans_out[0..0];
 
+    const offset: i64 = snapshot.header.viewport_offset;
+    const view_rows: i64 = rows;
     var n: usize = 0;
+
     switch (sel.mode) {
         .char => {
             const ord = sel.ordered();
-            const start = clampCell(ord.start, rows, cols);
-            const end = clampCell(ord.end, rows, cols);
-            var row: u16 = start.row;
-            while (row <= end.row and n < spans_out.len) : (row += 1) {
-                const start_col: u16 = if (row == start.row) start.col else 0;
-                const end_col: u16 = if (row == end.row) end.col else cols - 1;
-                if (end_col >= start_col) {
-                    spans_out[n] = .{ .row = row, .start_col = start_col, .end_col = end_col };
+            // Convert screen-y to viewport row; entire band may be
+            // off-screen above or below — in which case n stays 0.
+            const start_vy = @as(i64, ord.start.row) - offset;
+            const end_vy = @as(i64, ord.end.row) - offset;
+            if (end_vy < 0 or start_vy >= view_rows) return spans_out[0..0];
+
+            const clip_start_vy = @max(@as(i64, 0), start_vy);
+            const clip_end_vy = @min(view_rows - 1, end_vy);
+            var row_vy: i64 = clip_start_vy;
+            while (row_vy <= clip_end_vy and n < spans_out.len) : (row_vy += 1) {
+                // start_col only applies on the *real* first row of
+                // the selection; if we clipped that off, the visible
+                // first row begins at col 0.
+                const sc: u16 = if (row_vy == start_vy) @min(ord.start.col, cols - 1) else 0;
+                const ec: u16 = if (row_vy == end_vy) @min(ord.end.col, cols - 1) else cols - 1;
+                if (ec >= sc) {
+                    spans_out[n] = .{ .row = @intCast(row_vy), .start_col = sc, .end_col = ec };
                     n += 1;
                 }
             }
         },
         .word => {
-            // Expand anchor / head independently to their word
-            // boundaries, then build the band using the expanded
-            // endpoints. This matches what xterm / kitty do: a
-            // double-click selects one word, a double-click-drag
-            // grows the selection word-by-word.
             const anchor_word = expandSnapshotWord(snapshot, sel.anchor, cols);
             const head_word = expandSnapshotWord(snapshot, sel.head, cols);
             const start_cell: selection_mod.Cell = if (selection_mod.Cell.lessThan(anchor_word.start, head_word.start))
@@ -722,23 +728,29 @@ fn resolveSelectionSpans(
                 head_word.end
             else
                 anchor_word.end;
-            const start = clampCell(start_cell, rows, cols);
-            const end = clampCell(end_cell, rows, cols);
-            var row: u16 = start.row;
-            while (row <= end.row and n < spans_out.len) : (row += 1) {
-                const start_col: u16 = if (row == start.row) start.col else 0;
-                const end_col: u16 = if (row == end.row) end.col else cols - 1;
-                spans_out[n] = .{ .row = row, .start_col = start_col, .end_col = end_col };
+            const start_vy = @as(i64, start_cell.row) - offset;
+            const end_vy = @as(i64, end_cell.row) - offset;
+            if (end_vy < 0 or start_vy >= view_rows) return spans_out[0..0];
+            const clip_start_vy = @max(@as(i64, 0), start_vy);
+            const clip_end_vy = @min(view_rows - 1, end_vy);
+            var row_vy: i64 = clip_start_vy;
+            while (row_vy <= clip_end_vy and n < spans_out.len) : (row_vy += 1) {
+                const sc: u16 = if (row_vy == start_vy) @min(start_cell.col, cols - 1) else 0;
+                const ec: u16 = if (row_vy == end_vy) @min(end_cell.col, cols - 1) else cols - 1;
+                spans_out[n] = .{ .row = @intCast(row_vy), .start_col = sc, .end_col = ec };
                 n += 1;
             }
         },
         .line => {
             const ord = sel.ordered();
-            const start_row: u16 = @min(ord.start.row, rows - 1);
-            const end_row: u16 = @min(ord.end.row, rows - 1);
-            var row: u16 = start_row;
-            while (row <= end_row and n < spans_out.len) : (row += 1) {
-                spans_out[n] = .{ .row = row, .start_col = 0, .end_col = cols - 1 };
+            const start_vy = @as(i64, ord.start.row) - offset;
+            const end_vy = @as(i64, ord.end.row) - offset;
+            if (end_vy < 0 or start_vy >= view_rows) return spans_out[0..0];
+            const clip_start_vy: u16 = @intCast(@max(@as(i64, 0), start_vy));
+            const clip_end_vy: u16 = @intCast(@min(view_rows - 1, end_vy));
+            var row_vy: u16 = clip_start_vy;
+            while (row_vy <= clip_end_vy and n < spans_out.len) : (row_vy += 1) {
+                spans_out[n] = .{ .row = row_vy, .start_col = 0, .end_col = cols - 1 };
                 n += 1;
             }
         },
@@ -746,37 +758,34 @@ fn resolveSelectionSpans(
     return spans_out[0..n];
 }
 
-fn clampCell(cell: selection_mod.Cell, rows: u16, cols: u16) selection_mod.Cell {
-    return .{
-        .row = @min(cell.row, rows - 1),
-        .col = @min(cell.col, cols - 1),
-    };
-}
-
-/// Expand `cell` to a word range using the snapshot's row codepoints.
-/// Falls back to a single-cell range when the row is out of bounds.
+/// Expand `cell` (in screen coords) to a word range using the
+/// snapshot's row codepoints. Returns the cell unchanged when the
+/// row is outside the captured viewport — word expansion needs the
+/// row content, which the snapshot only has for visible rows.
 fn expandSnapshotWord(
     snapshot: *const render_snapshot.SharedSnapshot,
     cell: selection_mod.Cell,
     cols: u16,
 ) struct { start: selection_mod.Cell, end: selection_mod.Cell } {
-    const row = cell.row;
-    if (row >= snapshot.header.rows) {
+    const offset: i64 = snapshot.header.viewport_offset;
+    const view_row_i = @as(i64, cell.row) - offset;
+    if (view_row_i < 0 or view_row_i >= snapshot.header.rows) {
         return .{
-            .start = .{ .row = row, .col = cell.col },
-            .end = .{ .row = row, .col = cell.col },
+            .start = .{ .row = cell.row, .col = cell.col },
+            .end = .{ .row = cell.row, .col = cell.col },
         };
     }
+    const view_row: u16 = @intCast(view_row_i);
     var row_codepoints: [render_snapshot.MaxCols]u32 = undefined;
-    const row_start: usize = @as(usize, row) * @as(usize, cols);
+    const row_start: usize = @as(usize, view_row) * @as(usize, cols);
     var col: u16 = 0;
     while (col < cols and row_start + col < snapshot.header.cell_count) : (col += 1) {
         row_codepoints[col] = snapshot.cells[row_start + col].codepoint;
     }
     const w = selection_mod.expandWord(row_codepoints[0..col], cell.col);
     return .{
-        .start = .{ .row = row, .col = w.start },
-        .end = .{ .row = row, .col = w.end },
+        .start = .{ .row = cell.row, .col = w.start },
+        .end = .{ .row = cell.row, .col = w.end },
     };
 }
 
