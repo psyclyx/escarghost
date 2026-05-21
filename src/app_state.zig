@@ -1,0 +1,156 @@
+const std = @import("std");
+const selection_mod = @import("selection.zig");
+const clipboard_mod = @import("clipboard.zig");
+const terminal_mod = @import("terminal.zig");
+const pty_mod = @import("pty.zig");
+const wayland_mod = @import("wayland.zig");
+const atlas_ref_mod = @import("atlas_ref.zig");
+const atlas_owner = @import("atlas_owner.zig");
+const cpu_worker = @import("cpu_worker.zig");
+const gpu_renderer = @import("gpu_renderer.zig");
+const render_env = @import("render_env.zig");
+const diagnostics = @import("diagnostics.zig");
+
+pub const RenderPath = enum {
+    cpu,
+    gpu,
+};
+
+/// Exponential backoff with jitter for restarting the GPU thread after
+/// failure. Stamps a `deadline_ns` when a retry is scheduled; the event
+/// loop polls `.due()` each iteration. Lives on `AppState.render` so
+/// debug hotkeys in input can poke it without depending on render_loop.
+pub const GpuRestartBackoff = struct {
+    initial_delay_ms: u32 = 0,
+    max_delay_ms: u32 = 0,
+    jitter_percent: u32 = 0,
+    deadline_ns: ?u64 = null,
+    attempts: u32 = 0,
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
+
+    pub fn init(initial_delay_ms: u32, max_delay_ms: u32, jitter_percent: u32) GpuRestartBackoff {
+        return .{
+            .initial_delay_ms = initial_delay_ms,
+            .max_delay_ms = @max(initial_delay_ms, max_delay_ms),
+            .jitter_percent = jitter_percent,
+            .prng = std.Random.DefaultPrng.init(diagnostics.monotonicNowNs()),
+        };
+    }
+
+    pub fn clear(self: *GpuRestartBackoff) void {
+        self.deadline_ns = null;
+        self.attempts = 0;
+    }
+
+    pub fn scheduleImmediate(self: *GpuRestartBackoff) void {
+        self.deadline_ns = diagnostics.monotonicNowNs();
+    }
+
+    pub fn scheduleRetry(self: *GpuRestartBackoff) void {
+        const shift = @min(self.attempts, 31);
+        const scaled = (@as(u64, self.initial_delay_ms) << @intCast(shift));
+        const capped = @min(scaled, @as(u64, self.max_delay_ms));
+        const base_delay_ms: u32 = @intCast(capped);
+        const jitter_pct = @min(self.jitter_percent, 1000);
+        const jitter_span = @as(u64, base_delay_ms) * jitter_pct / 100;
+        const min_delay: u32 = @intCast(base_delay_ms -| @as(u32, @intCast(@min(jitter_span, base_delay_ms))));
+        const max_delay: u32 = @intCast(@min(@as(u64, self.max_delay_ms), @as(u64, base_delay_ms) + jitter_span));
+        const delay_ms = if (min_delay < max_delay)
+            self.prng.random().intRangeAtMost(u32, min_delay, max_delay)
+        else
+            min_delay;
+
+        self.deadline_ns = diagnostics.monotonicNowNs() + @as(u64, delay_ms) * std.time.ns_per_ms;
+        self.attempts +|= 1;
+    }
+
+    pub fn due(self: *const GpuRestartBackoff) bool {
+        const deadline_ns = self.deadline_ns orelse return false;
+        return diagnostics.monotonicNowNs() >= deadline_ns;
+    }
+
+    pub fn timeoutMs(self: *const GpuRestartBackoff) ?c_int {
+        const deadline_ns = self.deadline_ns orelse return null;
+        const now_ns = diagnostics.monotonicNowNs();
+        if (deadline_ns <= now_ns) return 0;
+        const delta_ns = deadline_ns - now_ns;
+        const delta_ms = @max(@as(u64, 1), delta_ns / std.time.ns_per_ms);
+        return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
+    }
+};
+
+/// Non-owning pointers to long-lived subsystems. Each field is left
+/// undefined until the corresponding subsystem has been initialized in
+/// main()'s startup phases; clipboard is optional because the
+/// compositor may not advertise the data-device manager.
+pub const Refs = struct {
+    term: *terminal_mod.Terminal = undefined,
+    pty: *pty_mod.Pty = undefined,
+    wayland: *wayland_mod.Wayland = undefined,
+    atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
+    clipboard: ?*clipboard_mod.Manager = null,
+    gpu: *gpu_renderer.Frontend = undefined,
+    cpu: *cpu_worker.Frontend = undefined,
+    atlas_thread: *atlas_owner.Frontend = undefined,
+};
+
+pub const Metrics = struct {
+    font_size: f32 = 14.0,
+    base_font_size: f32 = 14.0,
+    cell_width: f32 = 0,
+    cell_height: f32 = 0,
+    viewport_w: u32 = 0,
+    viewport_h: u32 = 0,
+    scroll_lines: u32 = 3,
+};
+
+pub const RenderState = struct {
+    needs_redraw: bool = false,
+    gpu_snapshot_dirty: bool = false,
+    gpu_reconfigure_requested: bool = false,
+    render_serial: u32 = 0,
+    target_render_path: RenderPath = .gpu,
+    active_render_path: RenderPath = .cpu,
+    gpu_restart: GpuRestartBackoff = .{},
+    buffer_starvation_start_ns: u64 = 0,
+};
+
+/// Mouse + selection state. `pointer_x/y` is in surface pixels
+/// (already converted from Wayland's fixed-point form).
+pub const InputState = struct {
+    selection: selection_mod.State = .{},
+    pointer_x: f64 = 0,
+    pointer_y: f64 = 0,
+    pointer_in_surface: bool = false,
+    /// Monotonic-ns deadline for the scrollbar fade. Bumped by scroll
+    /// events and right-edge hover; once `monotonicNowNs() >=` this,
+    /// the next render hides the overlay.
+    scrollbar_visible_until_ns: u64 = 0,
+    /// Tracks whether the previous render observed a visible scrollbar.
+    /// Lets the hide-timeout know whether it still needs to redirty.
+    scrollbar_was_visible: bool = false,
+};
+
+/// Drain-phase tracking. After the PTY child exits we keep looping
+/// until a frame containing its final output has been committed; these
+/// two flags tell us when that has happened so we can exit instead of
+/// waiting on the 250 ms watchdog.
+pub const Lifecycle = struct {
+    first_pty_data_seen: bool = false,
+    first_content_painted: bool = false,
+};
+
+pub const DebugFlags = struct {
+    renderer_debug: render_env.RendererDebug = .{},
+    warn_slow_budget_ms: ?u32 = null,
+};
+
+pub const AppState = struct {
+    refs: Refs = .{},
+    metrics: Metrics = .{},
+    render: RenderState = .{},
+    input: InputState = .{},
+    lifecycle: Lifecycle = .{},
+    diag: diagnostics.Diagnostics = .{},
+    debug: DebugFlags = .{},
+};

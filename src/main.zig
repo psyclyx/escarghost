@@ -15,6 +15,7 @@ const selection_mod = @import("selection.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const clipboard_mod = @import("clipboard.zig");
 const diagnostics = @import("diagnostics.zig");
+const app_state = @import("app_state.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
