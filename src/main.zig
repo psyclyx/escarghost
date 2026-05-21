@@ -293,6 +293,7 @@ const RenderPath = enum {
 };
 
 var g_renderer_debug: render_env.RendererDebug = .{};
+var g_warn_slow_budget_ms: ?u32 = null;
 
 fn rendererDebugOptions() render_env.RendererDebug {
     if (getenv("SCRGO_LOG")) |value|
@@ -926,7 +927,7 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mo
             // Track how long we're stuck without a released buffer
             // so we can see at exit whether compositor release
             // latency is the throughput bottleneck.
-            if (g_renderer_debug.commits) {
+            if (g_renderer_debug.commits or g_warn_slow_budget_ms != null) {
                 const now = monotonicNowNs();
                 if (g_buffer_starvation_start_ns == 0) g_buffer_starvation_start_ns = now;
             }
@@ -935,9 +936,21 @@ fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mo
         error.NotReady, error.Busy, error.NoFreeSnapshot => return,
         else => return,
     };
-    if (g_renderer_debug.commits and g_buffer_starvation_start_ns != 0) {
-        gpu_renderer.bufferStarvationAccumNs += monotonicNowNs() - g_buffer_starvation_start_ns;
-        gpu_renderer.bufferStarvationCount += 1;
+    if (g_buffer_starvation_start_ns != 0) {
+        const starvation_ns = monotonicNowNs() - g_buffer_starvation_start_ns;
+        if (g_renderer_debug.commits) {
+            gpu_renderer.bufferStarvationAccumNs += starvation_ns;
+            gpu_renderer.bufferStarvationCount += 1;
+        }
+        if (g_warn_slow_budget_ms) |budget_ms| {
+            const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
+            if (starvation_ns > budget_ns) {
+                std.debug.print("scrgo: buffer starvation {d:.1}ms (budget {}ms) — compositor hadn't released a dmabuf\n", .{
+                    @as(f64, @floatFromInt(starvation_ns)) / @as(f64, std.time.ns_per_ms),
+                    budget_ms,
+                });
+            }
+        }
         g_buffer_starvation_start_ns = 0;
     }
     if (debugRenderersEnabled()) {
@@ -1055,6 +1068,7 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
     g_renderer_debug = rendererDebugOptions();
+    g_warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
     wayland_mod.Wayland.log_frame_events = g_renderer_debug.frames;
     // Background memory poller (SCRGO_LOG=commits). Mirrors what the
     // bench's poller thread sees from outside the process.

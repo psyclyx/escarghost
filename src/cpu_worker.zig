@@ -261,6 +261,10 @@ pub const Frontend = struct {
         };
         defer ctx.deinit();
 
+        const warn_slow_budget_ms = render_env.parseWarnSlowMs(
+            if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
+        );
+
         while (true) {
             _ = c.pthread_mutex_lock(&self.mutex);
             while (!self.request_pending and !self.stop_requested) {
@@ -351,6 +355,15 @@ pub const Frontend = struct {
                         .snapshot_slot = snapshot_slot,
                         .serial = request.serial,
                     });
+                    if (warn_slow_budget_ms) |budget_ms| {
+                        const elapsed_ms = timer.elapsedMs();
+                        if (elapsed_ms > @as(f64, @floatFromInt(budget_ms))) {
+                            std.debug.print("scrgo: slow cpu frame {d:.1}ms (budget {}ms)\n", .{
+                                elapsed_ms,
+                                budget_ms,
+                            });
+                        }
+                    }
                 },
             }
         }

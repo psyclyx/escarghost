@@ -81,6 +81,23 @@ pub fn parseRendererDebug(value: ?[]const u8) RendererDebug {
     return result;
 }
 
+/// Parses `SCRGO_WARN_SLOW_MS`. Returns the per-frame budget in
+/// milliseconds when warnings are enabled, or null when disabled.
+///
+/// - unset / "0" / "off" / "false" → disabled
+/// - "1" / "on" / "true"           → enabled with default 16 ms budget
+/// - integer N                      → enabled with N ms budget
+pub fn parseWarnSlowMs(value: ?[]const u8) ?u32 {
+    const raw = value orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (eql(trimmed, "0") or eql(trimmed, "off") or eql(trimmed, "false")) return null;
+    if (eql(trimmed, "1") or eql(trimmed, "on") or eql(trimmed, "true")) return 16;
+    const parsed = std.fmt.parseInt(u32, trimmed, 10) catch return null;
+    if (parsed == 0) return null;
+    return parsed;
+}
+
 pub const RuntimeFlags = struct {
     reset_atlas_each_frame: bool = false,
 };

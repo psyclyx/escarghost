@@ -191,6 +191,18 @@ const OffscreenEgl = struct {
         if (c.eglMakeCurrent(self.display, self.surface, self.surface, self.context) == c.EGL_FALSE)
             return error.EglMakeCurrentFailed;
         gpuDebug(timer, "egl current", .{});
+        if (gpuDebugEnabled()) {
+            const vendor = c.glGetString(c.GL_VENDOR);
+            const renderer = c.glGetString(c.GL_RENDERER);
+            const gl_version = c.glGetString(c.GL_VERSION);
+            const glsl_version = c.glGetString(c.GL_SHADING_LANGUAGE_VERSION);
+            std.debug.print("scrgo[gpu-renderer]: GL_VENDOR={s} GL_RENDERER={s} GL_VERSION={s} GLSL_VERSION={s}\n", .{
+                if (vendor) |v| std.mem.sliceTo(v, 0) else "?",
+                if (renderer) |r| std.mem.sliceTo(r, 0) else "?",
+                if (gl_version) |v| std.mem.sliceTo(v, 0) else "?",
+                if (glsl_version) |v| std.mem.sliceTo(v, 0) else "?",
+            });
+        }
 
         self.create_image = @ptrCast(c.eglGetProcAddress("eglCreateImageKHR"));
         self.destroy_image = @ptrCast(c.eglGetProcAddress("eglDestroyImageKHR"));
@@ -636,6 +648,10 @@ pub const Frontend = struct {
         const timer = perf.Timer.now();
         gpuDebug(timer, "thread start", .{});
 
+        const warn_slow_budget_ms = render_env.parseWarnSlowMs(
+            if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
+        );
+
         // Phase 1: EGL + snail.Renderer init (no deps needed)
         var egl = OffscreenEgl.init() catch |err| {
             gpuDebug(timer, "egl init failed: {}", .{err});
@@ -806,10 +822,12 @@ pub const Frontend = struct {
                             continue;
                         };
                     }
-                    captureCellsAccumNs += monotonicNs() - cells_t0;
+                    const cells_elapsed_ns = monotonicNs() - cells_t0;
+                    captureCellsAccumNs += cells_elapsed_ns;
                     captureCellsCount += 1;
 
                     const render_timer = perf.Timer.now();
+                    const draw_t0 = monotonicNs();
                     const target = &active_allocator.targets[request.buffer_index];
                     c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
                     c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
@@ -854,6 +872,20 @@ pub const Frontend = struct {
                         .snapshot_slot = request.snapshot_slot,
                         .serial = request.serial,
                     });
+                    if (warn_slow_budget_ms) |budget_ms| {
+                        const draw_elapsed_ns = monotonicNs() - draw_t0;
+                        const frame_elapsed_ns = cells_elapsed_ns + draw_elapsed_ns;
+                        const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
+                        if (frame_elapsed_ns > budget_ns) {
+                            const ms_f = @as(f64, std.time.ns_per_ms);
+                            std.debug.print("scrgo: slow gpu frame {d:.1}ms (budget {}ms) — cells {d:.1}ms + draw {d:.1}ms\n", .{
+                                @as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f,
+                                budget_ms,
+                                @as(f64, @floatFromInt(cells_elapsed_ns)) / ms_f,
+                                @as(f64, @floatFromInt(draw_elapsed_ns)) / ms_f,
+                            });
+                        }
+                    }
                 },
             }
         }
