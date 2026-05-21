@@ -232,6 +232,51 @@ test "scrollbar getter reports total/offset/len once content overflows" {
     try testing.expectEqual(sb1.total - sb1.len, sb1.offset);
 }
 
+test "fillRowFromScreen reads rows that have scrolled into scrollback" {
+    // Regression guard for selection extraction across scrollback:
+    // feed 50 unique lines into a 5-row terminal, then verify that
+    // the rows now sitting in scrollback are still reachable via the
+    // grid_ref walker (the visible viewport only shows the last 5).
+    const allocator = testing.allocator;
+    var cfg = try loadConfig(allocator);
+    defer cfg.deinit(allocator);
+
+    const cols: u16 = 40;
+    const rows: u16 = 5;
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(cols, rows, 5000, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var line: [16]u8 = undefined;
+        const written = try std.fmt.bufPrint(&line, "line {d:0>3}\r\n", .{i});
+        term.feedData(written);
+    }
+    try term.updateRenderState();
+
+    // Pick a row deep in scrollback. With 50 fed lines × scroll, the
+    // first line ("line 000") sits near the top of the scrollback.
+    var buf: [40]u32 = undefined;
+    const n = term.fillRowFromScreen(0, &buf);
+    try testing.expect(n > 0);
+
+    // Re-encode the prefix to ASCII to compare against expected.
+    var ascii: [40]u8 = undefined;
+    var ascii_len: usize = 0;
+    var col: usize = 0;
+    while (col < n and ascii_len < ascii.len) : (col += 1) {
+        const cp = buf[col];
+        if (cp < 0x80) {
+            ascii[ascii_len] = @intCast(cp);
+            ascii_len += 1;
+        }
+    }
+    var trim_end = ascii_len;
+    while (trim_end > 0 and ascii[trim_end - 1] == ' ') trim_end -= 1;
+    try testing.expectEqualStrings("line 000", ascii[0..trim_end]);
+}
+
 test "max_scrollback config in lines actually yields ~that many lines" {
     // Regression: ghostty's `max_scrollback` field is bytes, not lines
     // (its C header docstring lies). terminal.init now converts the

@@ -418,6 +418,49 @@ pub const Terminal = struct {
         });
     }
 
+    /// Fill `out` with the UTF-32 codepoints of the row at absolute
+    /// screen-y `screen_y`, where 0 is the top of the scrollback. Used
+    /// by selection text extraction to walk rows that aren't currently
+    /// in the viewport (and so aren't reachable from the render state
+    /// iterator).
+    ///
+    /// Cost: one O(scrollback) page-list traversal per row + O(cols)
+    /// cheap cell reads, by reusing the page node returned from the
+    /// initial grid_ref lookup (grid refs are just (node, x, y); cells
+    /// in the same row share node + y).
+    pub fn fillRowFromScreen(self: *Terminal, screen_y: u32, out: []u32) usize {
+        if (out.len == 0) return 0;
+        var ref: c.GhosttyGridRef = .{ .size = @sizeOf(c.GhosttyGridRef), .node = null, .x = 0, .y = 0 };
+        const pt: c.GhosttyPoint = .{
+            .tag = c.GHOSTTY_POINT_TAG_SCREEN,
+            .value = .{ .coordinate = .{ .x = 0, .y = screen_y } },
+        };
+        if (c.ghostty_terminal_grid_ref(self.handle, pt, &ref) != c.GHOSTTY_SUCCESS) return 0;
+
+        // Walk the row by mutating ref.x. Same node + same y =
+        // same row inside the page; only the column changes. Safe
+        // as long as no terminal mutation happens between the
+        // grid_ref lookup and these reads — we hold the main
+        // thread throughout, so callers must not interleave PTY
+        // writes between this call and consuming `out`.
+        var col: u16 = 0;
+        while (col < out.len) : (col += 1) {
+            ref.x = col;
+            var cell: c.GhosttyCell = 0;
+            if (c.ghostty_grid_ref_cell(&ref, &cell) != c.GHOSTTY_SUCCESS) break;
+            var has_text: bool = false;
+            _ = c.ghostty_cell_get(cell, c.GHOSTTY_CELL_DATA_HAS_TEXT, &has_text);
+            if (has_text) {
+                var cp: u32 = 0;
+                _ = c.ghostty_cell_get(cell, c.GHOSTTY_CELL_DATA_CODEPOINT, &cp);
+                out[col] = cp;
+            } else {
+                out[col] = ' ';
+            }
+        }
+        return col;
+    }
+
     pub fn isBracketedPaste(self: *Terminal) bool {
         var v: bool = false;
         // GHOSTTY_MODE_BRACKETED_PASTE is a non-ANSI mode (DEC 2004);

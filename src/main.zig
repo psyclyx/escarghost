@@ -690,40 +690,43 @@ fn writePasteToPty(text: []const u8) void {
 }
 
 /// Read the codepoints of the row at absolute screen-y `target_screen_y`
-/// into `out` (UTF-32). Returns the column count actually read. Only
-/// rows currently inside the viewport are reachable from the render
-/// state, so screen rows above or below the viewport return 0 — copy
-/// of scrolled-off selection regions falls back to whatever portion
-/// is visible.
+/// into `out` (UTF-32). Returns the column count actually read.
+/// Prefers the render-state iterator when the row is currently in
+/// the viewport (fast path) and falls back to the grid_ref-based
+/// scrollback walker for rows above or below the visible viewport.
 fn fetchRowCodepoints(target_screen_y: u32, out: []u32) usize {
     const sb = g_term.scrollbar();
-    if (target_screen_y < sb.offset) return 0;
-    const view_row_u64 = target_screen_y - sb.offset;
-    if (view_row_u64 >= sb.len) return 0;
-    const view_row: u16 = @intCast(view_row_u64);
-
-    g_term.updateRenderState() catch return 0;
-    g_term.beginRowIteration();
-    var row_idx: u16 = 0;
-    while (g_term.nextRow()) : (row_idx += 1) {
-        if (row_idx != view_row) continue;
-        g_term.beginCellIteration();
-        var col: usize = 0;
-        while (g_term.nextCell() and col < out.len) : (col += 1) {
-            const info = g_term.getCellInfo();
-            out[col] = if (info.has_text) info.codepoint else ' ';
+    // Fast path: row is inside the viewport — iterate the render
+    // state, which we already update once per frame.
+    if (target_screen_y >= sb.offset and target_screen_y - sb.offset < sb.len) {
+        const view_row: u16 = @intCast(target_screen_y - sb.offset);
+        g_term.updateRenderState() catch return 0;
+        g_term.beginRowIteration();
+        var row_idx: u16 = 0;
+        while (g_term.nextRow()) : (row_idx += 1) {
+            if (row_idx != view_row) continue;
+            g_term.beginCellIteration();
+            var col: usize = 0;
+            while (g_term.nextCell() and col < out.len) : (col += 1) {
+                const info = g_term.getCellInfo();
+                out[col] = if (info.has_text) info.codepoint else ' ';
+            }
+            return col;
         }
-        return col;
+        return 0;
     }
-    return 0;
+
+    // Slow path: row is in scrollback (above viewport) or the
+    // alternate-screen-but-history case (below viewport). Use the
+    // grid_ref walker to reach it.
+    return g_term.fillRowFromScreen(target_screen_y, out);
 }
 
 /// Allocate and fill a UTF-8 buffer with the currently-selected text.
 /// Returns null when there's nothing to copy. Caller frees with the
-/// same allocator. Walks rows in absolute screen-y space; rows that
-/// have scrolled out of the viewport can't be fetched from the
-/// render state, so the extracted text covers only the visible
-/// portion of the selection in that case.
+/// same allocator. Walks rows in absolute screen-y space; rows
+/// outside the viewport are fetched via the grid_ref walker
+/// (terminal.fillRowFromScreen) so copy works across scrollback.
 fn extractSelectionText(allocator: std.mem.Allocator) !?[]u8 {
     const snap = g_selection.toSnapshot() orelse return null;
     const cols = g_term.colCount();
