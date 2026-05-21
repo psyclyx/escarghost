@@ -265,17 +265,21 @@ pub fn buildRow(
 }
 
 /// One cached row's drawables. Y coordinates are row-local; the caller
-/// translates by row_y at submit. The blob is heap-allocated so the cache's
-/// underlying hashmap can rehash mid-frame without invalidating the
-/// `*const TextBlob` pointers that already live in the per-frame Scene.
+/// translates by row_y at submit. The Row, its blob, and its rect slice
+/// are all heap-allocated so the hashmap can rehash mid-frame without
+/// invalidating the `*Row` / `*const TextBlob` pointers that the caller
+/// (or the per-frame Scene) is already holding. The `lru_*` links form
+/// an intrusive doubly-linked list owned by the enclosing RowCache; do
+/// not touch them outside cache code.
 pub const Row = struct {
     blob: *snail.TextBlob,
     rects: []ColoredRect,
     content_hash: u64,
     atlas_identity: u64,
     had_misses: bool,
-    last_used_frame: u64,
     byte_size: usize,
+    lru_prev: ?*Row = null,
+    lru_next: ?*Row = null,
 };
 
 /// Per-row TextBlob+rect cache shared between backends. One instance per
@@ -289,12 +293,17 @@ pub const Row = struct {
 /// released the moment the cache stops referencing it. Metrics changes
 /// (font size, DPI) invalidate the entire cache because each cached
 /// blob bakes `placement.em` into its per-instance `Transform2D`.
+///
+/// LRU order is tracked via an intrusive doubly-linked list across the
+/// `Row` allocations themselves: `lru_head` is the next eviction
+/// candidate, `lru_tail` the most-recently-used. Touching a row on
+/// lookup or storing a new one moves it to the tail in O(1); evicting
+/// pops the head in O(1).
 pub const RowCache = struct {
     allocator: std.mem.Allocator,
-    map: std.AutoHashMap(u64, Row),
+    map: std.AutoHashMap(u64, *Row),
     cache_bytes: usize = 0,
     cache_budget: usize,
-    frame_counter: u64 = 0,
     /// Count of cached rows whose blob is bound to each atlas snapshot
     /// identity. Caller reads this via `entriesForIdentity` to decide
     /// when each snapshot's lease can be safely released.
@@ -307,11 +316,16 @@ pub const RowCache = struct {
     /// check (content_hash unchanged) and the dmabuf would keep
     /// showing stale glyphs.
     invalidations: std.ArrayList(u64),
+    /// Oldest entry; next eviction candidate. Null when cache is empty.
+    lru_head: ?*Row = null,
+    /// Most-recently-used entry; new stores append here. Null when
+    /// cache is empty.
+    lru_tail: ?*Row = null,
 
     pub fn init(allocator: std.mem.Allocator, budget_bytes: usize) RowCache {
         return .{
             .allocator = allocator,
-            .map = std.AutoHashMap(u64, Row).init(allocator),
+            .map = std.AutoHashMap(u64, *Row).init(allocator),
             .cache_budget = budget_bytes,
             .entries_by_identity = std.AutoHashMap(u64, usize).init(allocator),
             .invalidations = .empty,
@@ -327,17 +341,13 @@ pub const RowCache = struct {
 
     pub fn clear(self: *RowCache) void {
         var it = self.map.valueIterator();
-        while (it.next()) |row| destroyRow(self.allocator, row);
+        while (it.next()) |row_pp| destroyRow(self.allocator, row_pp.*);
         self.map.clearRetainingCapacity();
         self.entries_by_identity.clearRetainingCapacity();
         self.invalidations.clearRetainingCapacity();
         self.cache_bytes = 0;
-    }
-
-    /// Begin a new frame; entries inherit this counter on store so the
-    /// LRU sweep can find genuinely-old rows.
-    pub fn beginFrame(self: *RowCache) void {
-        self.frame_counter += 1;
+        self.lru_head = null;
+        self.lru_tail = null;
     }
 
     /// Number of cached rows currently bound to `identity`. The caller
@@ -377,32 +387,32 @@ pub const RowCache = struct {
         current_atlas: *const snail.TextAtlas,
         current_identity: u64,
     ) ?*Row {
-        const row = self.map.getPtr(key) orelse return null;
+        const row = self.map.get(key) orelse return null;
         if (row.had_misses) {
             self.queueInvalidation(key);
-            self.evict(key);
+            self.evictRow(row);
             return null;
         }
         if (row.atlas_identity == current_identity) {
-            row.last_used_frame = self.frame_counter;
+            self.touchLru(row);
             return row;
         }
         const new_blob = row.blob.rebound(self.allocator, current_atlas) catch {
             self.queueInvalidation(key);
-            self.evict(key);
+            self.evictRow(row);
             return null;
         };
         const old_identity = row.atlas_identity;
         row.blob.deinit();
         row.blob.* = new_blob;
         row.atlas_identity = current_identity;
-        row.last_used_frame = self.frame_counter;
         self.decrementIdentity(old_identity);
         self.incrementIdentity(current_identity) catch {
             self.queueInvalidation(key);
-            self.evict(key);
+            self.evictRow(row);
             return null;
         };
+        self.touchLru(row);
         return row;
     }
 
@@ -418,12 +428,7 @@ pub const RowCache = struct {
         atlas_identity: u64,
         had_misses: bool,
     ) ?*Row {
-        if (self.map.fetchRemove(key)) |kv| {
-            var stale = kv.value;
-            self.cache_bytes -= stale.byte_size;
-            self.decrementIdentity(stale.atlas_identity);
-            destroyRow(self.allocator, &stale);
-        }
+        if (self.map.get(key)) |stale| self.evictRow(stale);
 
         const byte_size = rects.len * @sizeOf(ColoredRect) + blob.glyphCount() * 24;
         const blob_slot = self.allocator.create(snail.TextBlob) catch {
@@ -433,23 +438,35 @@ pub const RowCache = struct {
             return null;
         };
         blob_slot.* = blob;
-        self.map.put(key, .{
-            .blob = blob_slot,
-            .rects = rects,
-            .content_hash = key,
-            .atlas_identity = atlas_identity,
-            .had_misses = had_misses,
-            .last_used_frame = self.frame_counter,
-            .byte_size = byte_size,
-        }) catch {
+        const row = self.allocator.create(Row) catch {
             blob_slot.deinit();
             self.allocator.destroy(blob_slot);
             self.allocator.free(rects);
             return null;
         };
+        row.* = .{
+            .blob = blob_slot,
+            .rects = rects,
+            .content_hash = key,
+            .atlas_identity = atlas_identity,
+            .had_misses = had_misses,
+            .byte_size = byte_size,
+        };
+        self.map.put(key, row) catch {
+            destroyRow(self.allocator, row);
+            return null;
+        };
         self.cache_bytes += byte_size;
+        self.appendLru(row);
         self.incrementIdentity(atlas_identity) catch {
-            self.evict(key);
+            // Roll back the put so we don't keep a Row whose identity
+            // bookkeeping is wrong. `evictRow` undoes everything we
+            // just did (map, lru, cache_bytes) except identity
+            // counting, which we never bumped — that's intentional.
+            _ = self.map.remove(key);
+            self.unlinkLru(row);
+            self.cache_bytes -= byte_size;
+            destroyRow(self.allocator, row);
             return null;
         };
 
@@ -457,16 +474,22 @@ pub const RowCache = struct {
         while (self.cache_bytes > self.cache_budget and guard < 32) : (guard += 1) {
             self.evictLru();
         }
-        return self.map.getPtr(key);
+        return row;
     }
 
     pub fn evict(self: *RowCache, key: u64) void {
-        if (self.map.fetchRemove(key)) |kv| {
-            var row = kv.value;
-            self.cache_bytes -= row.byte_size;
-            self.decrementIdentity(row.atlas_identity);
-            destroyRow(self.allocator, &row);
-        }
+        const row = self.map.get(key) orelse return;
+        self.evictRow(row);
+    }
+
+    /// Drop `row` from the cache. Caller must hold a valid pointer;
+    /// `getCurrent` and `evict` are the usual entry points.
+    fn evictRow(self: *RowCache, row: *Row) void {
+        _ = self.map.remove(row.content_hash);
+        self.cache_bytes -= row.byte_size;
+        self.decrementIdentity(row.atlas_identity);
+        self.unlinkLru(row);
+        destroyRow(self.allocator, row);
     }
 
     fn queueInvalidation(self: *RowCache, key: u64) void {
@@ -486,16 +509,37 @@ pub const RowCache = struct {
     }
 
     fn evictLru(self: *RowCache) void {
-        var oldest_key: ?u64 = null;
-        var oldest_frame: u64 = std.math.maxInt(u64);
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.last_used_frame < oldest_frame) {
-                oldest_frame = entry.value_ptr.last_used_frame;
-                oldest_key = entry.key_ptr.*;
-            }
-        }
-        if (oldest_key) |k| self.evict(k);
+        const oldest = self.lru_head orelse return;
+        self.evictRow(oldest);
+    }
+
+    /// Append `row` at the tail (most-recently-used end). Assumes the
+    /// row is not currently in the list (its links are null, e.g.
+    /// fresh from `store`).
+    fn appendLru(self: *RowCache, row: *Row) void {
+        row.lru_prev = self.lru_tail;
+        row.lru_next = null;
+        if (self.lru_tail) |t| t.lru_next = row;
+        self.lru_tail = row;
+        if (self.lru_head == null) self.lru_head = row;
+    }
+
+    /// Detach `row` from the list. Safe whether or not the row is the
+    /// head/tail; the links are zeroed so `appendLru` can re-insert.
+    fn unlinkLru(self: *RowCache, row: *Row) void {
+        if (row.lru_prev) |p| p.lru_next = row.lru_next else self.lru_head = row.lru_next;
+        if (row.lru_next) |n| n.lru_prev = row.lru_prev else self.lru_tail = row.lru_prev;
+        row.lru_prev = null;
+        row.lru_next = null;
+    }
+
+    /// Move `row` to the most-recently-used end. No-op when already
+    /// there, which is the steady-state case for a hot row hit twice
+    /// without any intervening stores.
+    fn touchLru(self: *RowCache, row: *Row) void {
+        if (row == self.lru_tail) return;
+        self.unlinkLru(row);
+        self.appendLru(row);
     }
 };
 
@@ -503,6 +547,7 @@ fn destroyRow(allocator: std.mem.Allocator, row: *Row) void {
     row.blob.deinit();
     allocator.destroy(row.blob);
     allocator.free(row.rects);
+    allocator.destroy(row);
 }
 
 /// Per-frame stash of heap-allocated `TextBlob`s that the scene records
@@ -615,8 +660,6 @@ pub fn buildSnapshot(
     blob_stash: *EphemeralBlobs,
     misses: *glyph_misses.Set,
 ) !BuiltSnapshot {
-    cache.beginFrame();
-
     const header = snapshot.header;
     const default_fg = header.default_fg;
     const default_bg = header.default_bg;
