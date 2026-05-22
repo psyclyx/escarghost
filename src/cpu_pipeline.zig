@@ -8,7 +8,7 @@ const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
-const render_config = @import("render_config.zig");
+const render_env = @import("render_env.zig");
 const render_common = @import("render_common.zig");
 const row_build = @import("row_build.zig");
 const color = @import("color.zig");
@@ -170,14 +170,14 @@ pub const CpuPipeline = struct {
     overrides: [render_snapshot.MaxRows + 4]snail.Override = undefined,
     manifest_entries: [MANIFEST_CAP]snail.ResourceManifest.Entry = undefined,
     scratch_rects: []row_build.ColoredRect,
-    config: render_config.RenderConfig,
+    config: render_env.RenderConfig,
 
     /// Per-frame ephemeral blobs (cursor inversion). Bulk-released after
     /// each frame.
     ephemeral_blobs: row_build.EphemeralBlobs,
 
     pub fn init(allocator: std.mem.Allocator) !CpuPipeline {
-        const config = render_config.loadFromEnv();
+        const config = render_env.loadRenderConfigFromEnv();
 
         // Buffer is reinit'd per frame with the SHM map. Target encoding /
         // subpixel order / resolve strategy are all per-frame state on the
@@ -501,7 +501,7 @@ pub const CpuPipeline = struct {
                     .pixel_height = @floatFromInt(viewport_h),
                     .encoding = .srgb_pixels_on_linear_attachment,
                 },
-                .raster = .{ .subpixel_order = render_config.effectiveSubpixelOrder(self.config) },
+                .raster = .{ .subpixel_order = render_env.effectiveSubpixelOrder(self.config) },
             },
             .resolve = .{ .linear = .{
                 // Snail owns the whole pixel now — seed with the default bg

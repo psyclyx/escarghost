@@ -3,7 +3,6 @@ const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
-const render_config = @import("render_config.zig");
 const render_common = @import("render_common.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const row_build = @import("row_build.zig");
@@ -94,7 +93,7 @@ pub const GpuPipeline = struct {
     font_size: f32,
     viewport_w: f32,
     viewport_h: f32,
-    config: render_config.RenderConfig,
+    config: render_env.RenderConfig,
 
     scratch_ready: bool = false,
     debug_log_renderers: bool = false,
@@ -147,7 +146,7 @@ pub const GpuPipeline = struct {
             .font_size = font_size,
             .viewport_w = 0,
             .viewport_h = 0,
-            .config = render_config.loadFromEnv(),
+            .config = render_env.loadRenderConfigFromEnv(),
         };
     }
 
@@ -382,7 +381,7 @@ pub const GpuPipeline = struct {
                 // attachment.
                 .encoding = .srgb_pixels_on_linear_attachment,
             },
-            .raster = .{ .subpixel_order = render_config.effectiveSubpixelOrder(self.config) },
+            .raster = .{ .subpixel_order = render_env.effectiveSubpixelOrder(self.config) },
         };
     }
 
