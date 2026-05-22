@@ -380,7 +380,7 @@ pub const GpuPipeline = struct {
                 // attachment.
                 .encoding = .srgb_pixels_on_linear_attachment,
             },
-            .raster = .{ .subpixel_order = render_env.effectiveSubpixelOrder(self.config) },
+            .raster = render_env.effectiveRasterOptions(self.config),
         };
     }
 

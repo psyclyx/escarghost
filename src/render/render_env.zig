@@ -134,6 +134,13 @@ pub const RenderConfig = struct {
     /// background forces subpixel off because the destination under
     /// glyph rasterization is no longer guaranteed to be solid.
     background_alpha: f32 = 1.0,
+    /// Exponent applied to analytic edge coverage at the rasterizer.
+    /// 1.0 is identity (gamma-correct linear blend); values <1.0
+    /// thicken glyph stems (stem-darkening), >1.0 thins them. Used to
+    /// compensate for the visual thinning that gamma-correct blending
+    /// produces vs. the sRGB-domain blending users are used to from
+    /// FreeType/CoreText.
+    coverage_exponent: f32 = 1.0,
 };
 
 /// Parse one of "rgb" / "bgr" / "vrgb" / "vbgr" / "none" (case-insensitive).
@@ -148,12 +155,28 @@ pub fn parseSubpixelOrder(value: ?[]const u8) snail.SubpixelOrder {
     return .none;
 }
 
-/// Read SCRGO_SUBPIXEL from the environment. Future env knobs (e.g.
-/// SCRGO_BG_ALPHA) plug in here.
+/// Parse `SCRGO_COVERAGE_EXPONENT`. Accepts a positive finite float;
+/// anything else (unset, empty, unparseable, non-positive, non-finite)
+/// returns 1.0 (identity). Hard-clamps to (0, 4.0] so a typo can't
+/// produce degenerate output.
+pub fn parseCoverageExponent(value: ?[]const u8) f32 {
+    const raw = value orelse return 1.0;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return 1.0;
+    const parsed = std.fmt.parseFloat(f32, trimmed) catch return 1.0;
+    if (!std.math.isFinite(parsed) or parsed <= 0.0) return 1.0;
+    return @min(parsed, 4.0);
+}
+
+/// Read SCRGO_SUBPIXEL / SCRGO_COVERAGE_EXPONENT from the environment.
+/// Future env knobs (e.g. SCRGO_BG_ALPHA) plug in here.
 pub fn loadRenderConfigFromEnv() RenderConfig {
     var config: RenderConfig = .{};
     if (c.getenv("SCRGO_SUBPIXEL")) |value| {
         config.subpixel_order = parseSubpixelOrder(std.mem.sliceTo(value, 0));
+    }
+    if (c.getenv("SCRGO_COVERAGE_EXPONENT")) |value| {
+        config.coverage_exponent = parseCoverageExponent(std.mem.sliceTo(value, 0));
     }
     return config;
 }
@@ -165,4 +188,14 @@ pub fn loadRenderConfigFromEnv() RenderConfig {
 pub fn effectiveSubpixelOrder(config: RenderConfig) snail.SubpixelOrder {
     if (config.background_alpha < 1.0) return .none;
     return config.subpixel_order;
+}
+
+/// Raster options to pass into snail at submit. Bundles the effective
+/// subpixel order with the configured coverage exponent so both
+/// backends share a single source of truth.
+pub fn effectiveRasterOptions(config: RenderConfig) snail.RasterOptions {
+    return .{
+        .subpixel_order = effectiveSubpixelOrder(config),
+        .coverage_transfer = .{ .exponent = config.coverage_exponent },
+    };
 }

@@ -529,7 +529,7 @@ pub const CpuPipeline = struct {
                     .pixel_height = @floatFromInt(viewport_h),
                     .encoding = .srgb_pixels_on_linear_attachment,
                 },
-                .raster = .{ .subpixel_order = render_env.effectiveSubpixelOrder(self.config) },
+                .raster = render_env.effectiveRasterOptions(self.config),
             },
             .resolve = .{ .linear = .{
                 // Snail owns the whole pixel now — seed with the default bg
