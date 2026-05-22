@@ -34,7 +34,7 @@ const MANIFEST_CAP: usize = 2;
 
 /// Pack RGBA bytes into a u32 matching `WL_SHM_FORMAT_ABGR8888` on a
 /// little-endian host (byte order in memory: R, G, B, A). Used by the
-/// splash blitter below; the per-frame SnapshotRenderer no longer touches
+/// splash blitter below; the per-frame CpuPipeline no longer touches
 /// pixels directly.
 inline fn abgrPixel(r: u8, g: u8, b: u8, a: u8) u32 {
     return (@as(u32, a) << 24) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | r;
@@ -42,7 +42,7 @@ inline fn abgrPixel(r: u8, g: u8, b: u8, a: u8) u32 {
 
 /// Wayland SHM buffer + a minimal solid-color fill, used by the bootstrap
 /// splash before EGL is ready (cf. main.zig). The terminal render path no
-/// longer uses this — it goes through `SnapshotRenderer` below.
+/// longer uses this — it goes through `CpuPipeline` below.
 pub const ShmFrame = struct {
     map_ptr: ?*anyopaque,
     map_size: usize,
@@ -150,7 +150,7 @@ pub var phase_draw_ns: u64 = 0;
 pub var phase_frame_count: u64 = 0;
 
 /// Persistent CPU renderer + scene state. One instance per CPU worker thread.
-pub const SnapshotRenderer = struct {
+pub const CpuPipeline = struct {
     allocator: std.mem.Allocator,
 
     cpu: snail.CpuRenderer,
@@ -176,7 +176,7 @@ pub const SnapshotRenderer = struct {
     /// each frame.
     ephemeral_blobs: row_build.EphemeralBlobs,
 
-    pub fn init(allocator: std.mem.Allocator) !SnapshotRenderer {
+    pub fn init(allocator: std.mem.Allocator) !CpuPipeline {
         const config = render_config.loadFromEnv();
 
         // Buffer is reinit'd per frame with the SHM map. Target encoding /
@@ -204,7 +204,7 @@ pub const SnapshotRenderer = struct {
         };
     }
 
-    pub fn deinit(self: *SnapshotRenderer) void {
+    pub fn deinit(self: *CpuPipeline) void {
         self.ephemeral_blobs.deinit();
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
@@ -214,7 +214,7 @@ pub const SnapshotRenderer = struct {
         self.allocator.free(self.scratch_rects);
     }
 
-    fn ensureBuilderForAtlas(self: *SnapshotRenderer, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
+    fn ensureBuilderForAtlas(self: *CpuPipeline, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
         const atlas = atlas_lease.get();
         const id = atlas.snapshotIdentity();
         if (id == self.builder_atlas_identity) return;
@@ -225,7 +225,7 @@ pub const SnapshotRenderer = struct {
         self.builder_atlas_identity = id;
     }
 
-    fn currentAtlas(self: *SnapshotRenderer) *const snail.TextAtlas {
+    fn currentAtlas(self: *CpuPipeline) *const snail.TextAtlas {
         const lease = if (self.atlas_lease) |*l| l else unreachable;
         return lease.get();
     }
@@ -292,7 +292,7 @@ pub const SnapshotRenderer = struct {
     /// whose glyphs weren't in the atlas — caller forwards to the atlas
     /// thread for extension.
     pub fn renderToMemory(
-        self: *SnapshotRenderer,
+        self: *CpuPipeline,
         map_ptr: *anyopaque,
         width: u32,
         height: u32,
@@ -372,7 +372,7 @@ pub const SnapshotRenderer = struct {
     }
 
     fn extendAtlas(
-        self: *SnapshotRenderer,
+        self: *CpuPipeline,
         atlas_lease: *const atlas_ref_mod.AtlasRef.Lease,
         baseline: *const snail.TextAtlas,
         miss_text: []const u8,
@@ -387,7 +387,7 @@ pub const SnapshotRenderer = struct {
     }
 
     fn flushDraw(
-        self: *SnapshotRenderer,
+        self: *CpuPipeline,
         built: row_build.BuiltSnapshot,
         default_bg: Rgb,
         default_fg: Rgb,

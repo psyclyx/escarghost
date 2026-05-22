@@ -1,5 +1,5 @@
 //! Shared row-building primitives used by both the GPU (renderer.zig) and
-//! CPU (shm_render.zig) paths. Iterates a row's cells, accumulates same-fg
+//! CPU (cpu_pipeline.zig) paths. Iterates a row's cells, accumulates same-fg
 //! text into HarfBuzz-shaped runs, coalesces background spans, and emits
 //! underline / strikethrough decoration rects.
 //!

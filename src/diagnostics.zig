@@ -2,7 +2,7 @@ const std = @import("std");
 const render_env = @import("render_env.zig");
 const wayland_mod = @import("wayland.zig");
 const gpu_pipeline = @import("gpu_pipeline.zig");
-const shm_render = @import("shm_render.zig");
+const cpu_pipeline = @import("cpu_pipeline.zig");
 const gpu_worker = @import("gpu_worker.zig");
 
 const c = @cImport({
@@ -285,16 +285,16 @@ pub const Diagnostics = struct {
                     },
                 );
             }
-            if (shm_render.phase_frame_count > 0) {
+            if (cpu_pipeline.phase_frame_count > 0) {
                 std.debug.print(
                     "scrgo: cpu pipeline  frames={}  row_build={d:.1}ms  picture={d:.1}ms  upload={d:.1}ms  drawlist={d:.1}ms  draw={d:.1}ms\n",
                     .{
-                        shm_render.phase_frame_count,
-                        @as(f64, @floatFromInt(shm_render.phase_row_build_ns)) / ms_f,
-                        @as(f64, @floatFromInt(shm_render.phase_picture_ns)) / ms_f,
-                        @as(f64, @floatFromInt(shm_render.phase_upload_ns)) / ms_f,
-                        @as(f64, @floatFromInt(shm_render.phase_drawlist_ns)) / ms_f,
-                        @as(f64, @floatFromInt(shm_render.phase_draw_ns)) / ms_f,
+                        cpu_pipeline.phase_frame_count,
+                        @as(f64, @floatFromInt(cpu_pipeline.phase_row_build_ns)) / ms_f,
+                        @as(f64, @floatFromInt(cpu_pipeline.phase_picture_ns)) / ms_f,
+                        @as(f64, @floatFromInt(cpu_pipeline.phase_upload_ns)) / ms_f,
+                        @as(f64, @floatFromInt(cpu_pipeline.phase_drawlist_ns)) / ms_f,
+                        @as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f,
                     },
                 );
             }

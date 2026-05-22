@@ -5,7 +5,7 @@ const atlas_owner = @import("atlas_owner.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const shared_shm = @import("shared_shm.zig");
-const shm_render = @import("shm_render.zig");
+const cpu_pipeline = @import("cpu_pipeline.zig");
 const perf = @import("perf.zig");
 
 const c = @cImport({
@@ -255,7 +255,7 @@ pub const Frontend = struct {
         if (cpuRendererDebugEnabled()) {
             std.debug.print("scrgo[cpu-renderer] thread running\n", .{});
         }
-        var ctx = shm_render.SnapshotRenderer.init(std.heap.smp_allocator) catch |err| {
+        var ctx = cpu_pipeline.CpuPipeline.init(std.heap.smp_allocator) catch |err| {
             std.debug.print("scrgo[cpu-renderer]: init failed: {}\n", .{err});
             return;
         };

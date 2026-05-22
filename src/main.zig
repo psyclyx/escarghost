@@ -4,7 +4,7 @@ const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
 const gpu_pipeline = @import("gpu_pipeline.zig");
-const shm_render = @import("shm_render.zig");
+const cpu_pipeline = @import("cpu_pipeline.zig");
 const render_env = @import("render_env.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("scrgo: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
         }
     } else if (wl.shm) |shm| {
-        var bg_frame = shm_render.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
+        var bg_frame = cpu_pipeline.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
         if (bg_frame) |*frame| {
             frame.fillBackground(cfg.background);
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
