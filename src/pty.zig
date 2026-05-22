@@ -60,7 +60,10 @@ pub const Pty = struct {
                 c_argv[i] = bufs[i][0..arg.len :0];
             }
 
-            _ = c.execv(c_argv[0].?, @ptrCast(&c_argv));
+            // execvp searches $PATH so `-e echo` resolves to /usr/bin/echo
+            // without the caller spelling the absolute path. Falls back to
+            // exec(127) on lookup failure, same as a shell does.
+            _ = c.execvp(c_argv[0].?, @ptrCast(&c_argv));
             c._exit(127);
         }
 

@@ -146,7 +146,7 @@ fn runRoundTripCase(cfg: *const config_mod.Config, case: Case) !void {
 
 test "PTY echo round-trip lands in the expected cells" {
     const allocator = testing.allocator;
-    var cfg = try config_mod.load(allocator);
+    var cfg = try config_mod.load(allocator, null);
     defer cfg.deinit(allocator);
 
     for (cases) |case| try runRoundTripCase(&cfg, case);
@@ -154,7 +154,7 @@ test "PTY echo round-trip lands in the expected cells" {
 
 test "encodeKey returns non-empty bytes for the common special keys" {
     const allocator = testing.allocator;
-    var cfg = try config_mod.load(allocator);
+    var cfg = try config_mod.load(allocator, null);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;

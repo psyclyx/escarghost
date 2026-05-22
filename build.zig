@@ -299,12 +299,25 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── headless tests (`zig build test`, plus per-suite aliases) ──────
+    const test_step = b.step("test", "Run all headless tests");
+
+    // cli.zig has no ghostty/snail/wayland deps — its tests can always run.
+    const cli_module = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    const cli_tests = b.addTest(.{ .root_module = cli_module });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    test_step.dependOn(&run_cli_tests.step);
+    b.step("test-cli", "Run CLI parser tests").dependOn(&run_cli_tests.step);
+
     if (vt_include != null and vt_static_lib != null) {
         const headless_opts: HeadlessOptions = .{
             .vt_include = vt_include.?,
             .vt_static_lib = vt_static_lib.?,
         };
-        const test_step = b.step("test", "Run all headless tests");
 
         const headless_module = createHeadlessModule(b, deps, headless_opts, "src/test/headless_test.zig");
         const headless_tests = b.addTest(.{ .root_module = headless_module });

@@ -33,7 +33,7 @@ const default_sequences = [_][]const u8{
 };
 
 fn loadConfig(allocator: std.mem.Allocator) !config_mod.Config {
-    return try config_mod.load(allocator);
+    return try config_mod.load(allocator, null);
 }
 
 const GridStats = struct {

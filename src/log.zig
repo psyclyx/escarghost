@@ -158,6 +158,14 @@ pub fn isScopeEnabled(scope: Scope) bool {
     return scope_enabled[@intFromEnum(scope)];
 }
 
+pub fn enableScope(scope: Scope) void {
+    scope_enabled[@intFromEnum(scope)] = true;
+}
+
+pub fn enableAllScopes() void {
+    for (&scope_enabled) |*e| e.* = true;
+}
+
 /// Set the ambient frame number for `scope`. Subsequent log calls in
 /// that scope will render `f#N`. Pass `null` to clear.
 pub fn setFrame(scope: Scope, frame: ?u64) void {

@@ -15,6 +15,7 @@ const app_state = @import("app_state.zig");
 const render_loop = @import("render_loop.zig");
 const input = @import("input.zig");
 const log = @import("log.zig");
+const cli = @import("cli.zig");
 
 const c = @cImport({
     @cInclude("poll.h");
@@ -36,6 +37,34 @@ pub fn main(init: std.process.Init) !void {
     state.diag.markStart();
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
+
+    // ── Parse CLI ──
+    var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv_list.deinit(allocator);
+    {
+        var it = std.process.Args.Iterator.init(init.minimal.args);
+        while (it.next()) |arg| try argv_list.append(allocator, arg);
+    }
+    const cli_args = cli.parse(argv_list.items) catch |err| {
+        var stdout = cli.fdWriter(1);
+        var stderr = cli.fdWriter(2);
+        switch (err) {
+            error.HelpRequested => {
+                cli.printUsage(&stdout.writer) catch {};
+                c._exit(0);
+            },
+            error.VersionRequested => {
+                stdout.writer.writeAll(cli.version_string ++ "\n") catch {};
+                c._exit(0);
+            },
+            error.BadArgs => {
+                stderr.writer.writeAll("scrgo: invalid arguments\n") catch {};
+                cli.printUsage(&stderr.writer) catch {};
+                c._exit(2);
+            },
+        }
+    };
+    cli.applyVerbosity(cli_args.verbosity);
 
     // Mesa hints — don't override if already set (0 = no overwrite)
     _ = c.setenv("MESA_NO_ERROR", "1", 0); // skip GL error checking
@@ -63,25 +92,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Parse -e flag for command execution
+    // Build the exec argv from the -e program + everything after `--`.
     var exec_argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer exec_argv.deinit(allocator);
-    {
-        var args_iter = std.process.Args.Iterator.init(init.minimal.args);
-        _ = args_iter.next(); // skip argv[0]
-        while (args_iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "-e")) {
-                // Everything after -e is the command
-                while (args_iter.next()) |cmd_arg| {
-                    try exec_argv.append(allocator, cmd_arg);
-                }
-                break;
-            }
-        }
+    if (cli_args.exec_program) |prog| {
+        try exec_argv.append(allocator, prog);
+        for (cli_args.exec_args) |a| try exec_argv.append(allocator, a);
     }
 
     // ── Phase 0: config + spawn GPU thread ──
-    var cfg = try config_mod.load(allocator);
+    var cfg = try config_mod.load(allocator, cli_args.config_path);
     defer cfg.deinit(allocator);
     state.debug.warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
     state.diag.trace_commits = render_env.parseTraceCommits(getenv("SCRGO_TRACE"));
@@ -90,7 +110,11 @@ pub fn main(init: std.process.Init) !void {
     const mem_thread = state.diag.startMemPollThread();
     defer state.diag.stopMemPollThread(mem_thread);
     const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
-    const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
+    const requested_render_path: render_env.RequestedRenderPath = if (cli_args.renderer) |r| switch (r) {
+        .auto => .auto,
+        .cpu => .cpu,
+        .gpu => .gpu,
+    } else render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
     log.info(.main, "startup", .{
         .reset_atlas = runtime_flags.reset_atlas_each_frame,
         .renderer = requested_render_path,

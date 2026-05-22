@@ -107,9 +107,20 @@ const base16_keys = [16][]const u8{
     "base0C", "base0D", "base0E", "base0F",
 };
 
-pub fn load(allocator: std.mem.Allocator) !Config {
+pub fn load(allocator: std.mem.Allocator, override_path: ?[]const u8) !Config {
     var cfg = defaults;
     cfg.shell = getenv("SHELL") orelse fallback_shell;
+
+    // CLI override beats the env lookup. When the override is provided
+    // we *don't* silently fall through on FileNotFound — the user
+    // explicitly asked for that path, so a missing file is an error.
+    if (override_path) |path| {
+        const data = try readFile(allocator, path);
+        defer allocator.free(data);
+        try parseJson(allocator, data, &cfg);
+        finalizePalette(&cfg);
+        return cfg;
+    }
 
     const config_path = try getConfigPath(allocator);
     defer if (config_path) |p| allocator.free(p);
