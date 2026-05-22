@@ -10,7 +10,7 @@ const std = @import("std");
 const snail = @import("snail");
 const gpu_pipeline = @import("gpu_pipeline.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
-const atlas_owner = @import("atlas_owner.zig");
+const atlas_worker = @import("atlas_worker.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
@@ -400,7 +400,7 @@ pub const GpuWorker = struct {
 
     // Set by main before spawning thread
     atlas_ref: ?*atlas_ref_mod.AtlasRef = null,
-    atlas_thread: ?*atlas_owner.Frontend = null,
+    atlas_thread: ?*atlas_worker.AtlasWorker = null,
 
     // Request state (protected by mutex)
     request_pending: bool = false,
@@ -469,7 +469,7 @@ pub const GpuWorker = struct {
     pub fn setSharedState(
         self: *GpuWorker,
         atlas_ref: *atlas_ref_mod.AtlasRef,
-        atlas_thread: *atlas_owner.Frontend,
+        atlas_thread: *atlas_worker.AtlasWorker,
     ) void {
         self.atlas_ref = atlas_ref;
         self.atlas_thread = atlas_thread;

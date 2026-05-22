@@ -6,7 +6,7 @@ const terminal_mod = @import("terminal.zig");
 const gpu_pipeline = @import("gpu_pipeline.zig");
 const cpu_pipeline = @import("cpu_pipeline.zig");
 const render_env = @import("render_env.zig");
-const atlas_owner = @import("atlas_owner.zig");
+const atlas_worker = @import("atlas_worker.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
 const gpu_worker = @import("gpu_worker.zig");
 const perf = @import("perf.zig");
@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Start atlas thread with font+atlas bootstrap — overlaps with Wayland init
-    var atlas_thread: atlas_owner.Frontend = .{};
+    var atlas_thread: atlas_worker.AtlasWorker = .{};
     try atlas_thread.startWithBootstrap(.{
         .allocator = allocator,
         .font_path_cfg = cfg.font_path,

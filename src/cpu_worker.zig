@@ -1,7 +1,7 @@
 const std = @import("std");
 const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
-const atlas_owner = @import("atlas_owner.zig");
+const atlas_worker = @import("atlas_worker.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const shared_shm = @import("shared_shm.zig");
@@ -64,7 +64,7 @@ const Request = struct {
 
 pub const Frontend = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
-    atlas_thread: ?*atlas_owner.Frontend = null,
+    atlas_thread: ?*atlas_worker.AtlasWorker = null,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
@@ -113,7 +113,7 @@ pub const Frontend = struct {
         self: *Frontend,
         shm_opaque: *anyopaque,
         atlas_ref: *atlas_ref_mod.AtlasRef,
-        atlas_thread: *atlas_owner.Frontend,
+        atlas_thread: *atlas_worker.AtlasWorker,
         width: u32,
         height: u32,
     ) !void {

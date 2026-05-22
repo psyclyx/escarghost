@@ -52,7 +52,7 @@ fn atlasDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("scrgo[atlas-owner] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
-pub const Frontend = struct {
+pub const AtlasWorker = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
@@ -72,11 +72,11 @@ pub const Frontend = struct {
     bootstrap_font_path: []const u8 = "",
     bootstrap_err: ?anyerror = null,
 
-    pub fn responseFd(self: *const Frontend) c_int {
+    pub fn responseFd(self: *const AtlasWorker) c_int {
         return self.response_fds[0];
     }
 
-    pub fn start(self: *Frontend, ref: *atlas_ref_mod.AtlasRef) !void {
+    pub fn start(self: *AtlasWorker, ref: *atlas_ref_mod.AtlasRef) !void {
         if (self.active) return;
         const timer = perf.Timer.now();
         self.* = .{
@@ -98,11 +98,11 @@ pub const Frontend = struct {
         }
 
         self.active = true;
-        self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
+        self.thread = try std.Thread.spawn(.{}, AtlasWorker.workerMain, .{self});
         atlasDebug(timer, "start", .{});
     }
 
-    pub fn startWithBootstrap(self: *Frontend, config: BootstrapConfig) !void {
+    pub fn startWithBootstrap(self: *AtlasWorker, config: BootstrapConfig) !void {
         if (self.active) return;
         const timer = perf.Timer.now();
         self.* = .{
@@ -124,11 +124,11 @@ pub const Frontend = struct {
         }
 
         self.active = true;
-        self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
+        self.thread = try std.Thread.spawn(.{}, AtlasWorker.workerMain, .{self});
         atlasDebug(timer, "start (bootstrap)", .{});
     }
 
-    pub fn stop(self: *Frontend) void {
+    pub fn stop(self: *AtlasWorker) void {
         if (!self.active) return;
         const timer = perf.Timer.now();
         {
@@ -151,7 +151,7 @@ pub const Frontend = struct {
         atlasDebug(timer, "stop", .{});
     }
 
-    pub fn requestMany(self: *Frontend, misses: *const glyph_misses.Set) void {
+    pub fn requestMany(self: *AtlasWorker, misses: *const glyph_misses.Set) void {
         if (!self.active or !self.prefetch_enabled or misses.isEmpty()) return;
         const timer = perf.Timer.now();
         _ = c.pthread_mutex_lock(&self.mutex);
@@ -162,7 +162,7 @@ pub const Frontend = struct {
         atlasDebug(timer, "queue {} bytes", .{self.pending.len});
     }
 
-    pub fn readResponse(self: *Frontend) !?Response {
+    pub fn readResponse(self: *AtlasWorker) !?Response {
         var response: Response = undefined;
         const rc = c.read(self.response_fds[0], &response, @sizeOf(Response));
         if (rc == 0) return null;
@@ -171,7 +171,7 @@ pub const Frontend = struct {
         return response;
     }
 
-    fn workerMain(self: *Frontend) void {
+    fn workerMain(self: *AtlasWorker) void {
         if (atlasDebugEnabled()) {
             std.debug.print("scrgo[atlas-owner] thread running\n", .{});
         }
@@ -252,7 +252,7 @@ pub const Frontend = struct {
         return true;
     }
 
-    fn runBootstrap(self: *Frontend, config: BootstrapConfig) !void {
+    fn runBootstrap(self: *AtlasWorker, config: BootstrapConfig) !void {
         const timer = perf.Timer.now();
         const alloc = config.allocator;
 

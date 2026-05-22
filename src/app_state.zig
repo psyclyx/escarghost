@@ -5,7 +5,7 @@ const terminal_mod = @import("terminal.zig");
 const pty_mod = @import("pty.zig");
 const wayland_mod = @import("wayland.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
-const atlas_owner = @import("atlas_owner.zig");
+const atlas_worker = @import("atlas_worker.zig");
 const cpu_worker = @import("cpu_worker.zig");
 const gpu_worker = @import("gpu_worker.zig");
 const render_env = @import("render_env.zig");
@@ -91,7 +91,7 @@ pub const Refs = struct {
     clipboard: ?*clipboard_mod.Manager = null,
     gpu: *gpu_worker.GpuWorker = undefined,
     cpu: *cpu_worker.Frontend = undefined,
-    atlas_thread: *atlas_owner.Frontend = undefined,
+    atlas_thread: *atlas_worker.AtlasWorker = undefined,
 };
 
 pub const Metrics = struct {
