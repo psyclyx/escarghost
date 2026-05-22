@@ -16,6 +16,7 @@ const render_snapshot = @import("render_snapshot.zig");
 const clipboard_mod = @import("clipboard.zig");
 const diagnostics = @import("diagnostics.zig");
 const app_state = @import("app_state.zig");
+const render_loop = @import("render_loop.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -58,19 +59,8 @@ var s_app: *app_state.AppState = undefined;
 const RenderPath = app_state.RenderPath;
 const GpuRestartBackoff = app_state.GpuRestartBackoff;
 
-/// Scrollbar overlay state. The scrollbar is shown on scroll events
-/// and when the pointer hovers near the right edge; otherwise hidden
-/// after a 1s idle. Animation is plain on/off — no per-frame
-/// interpolation, so we don't have to wake the render loop on a
-/// tight timer.
-const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 /// Hover detection: pointer is within this many pixels of the right edge.
 const SCROLLBAR_HOVER_WIDTH: f64 = 16.0;
-
-fn markFirstContentPaint() void {
-    if (s_app.lifecycle.first_content_painted or !s_app.lifecycle.first_pty_data_seen) return;
-    s_app.lifecycle.first_content_painted = true;
-}
 
 fn rendererDebugOptions() render_env.RendererDebug {
     if (getenv("SCRGO_LOG")) |value|
@@ -94,16 +84,9 @@ fn debugPtyEnabled() bool {
     return s_app.debug.renderer_debug.pty;
 }
 
-fn markRenderDirty() void {
-    s_app.render.render_serial +%= 1;
-    if (s_app.render.render_serial == 0) s_app.render.render_serial = 1;
-    s_app.render.needs_redraw = true;
-    s_app.render.gpu_snapshot_dirty = true;
-}
-
 fn debugKillActiveRenderer() void {
     if (s_app.render.active_render_path == .gpu and s_app.refs.gpu.active) {
-        noteGpuUnavailable(s_app.refs.gpu, &s_app.render.active_render_path, &s_app.render.gpu_restart);
+        render_loop.noteGpuUnavailable(s_app);
         std.debug.print("scrgo: debug: killed gpu renderer\n", .{});
     } else if (s_app.refs.cpu.active) {
         s_app.refs.cpu.stop();
@@ -130,7 +113,7 @@ fn debugClearAtlas() void {
     // change by allocating a fresh TextAtlas init from scratch using the
     // current atlas's font config bytes.
     _ = std.heap.smp_allocator;
-    markRenderDirty();
+    render_loop.markRenderDirty(s_app);
     std.debug.print("scrgo: debug: atlas clear (no-op in 0.4.x)\n", .{});
 }
 
@@ -156,32 +139,32 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
             // Scroll: Ctrl+Shift+Up/Down/PageUp/PageDown/Home/End
             xkb_syms.XKB_KEY_Up => {
                 s_app.refs.term.scrollViewport(-1);
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             xkb_syms.XKB_KEY_Down => {
                 s_app.refs.term.scrollViewport(1);
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             xkb_syms.XKB_KEY_Page_Up => {
                 s_app.refs.term.scrollViewport(-@as(isize, s_app.metrics.scroll_lines * 10));
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             xkb_syms.XKB_KEY_Page_Down => {
                 s_app.refs.term.scrollViewport(@as(isize, s_app.metrics.scroll_lines * 10));
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             xkb_syms.XKB_KEY_Home => {
                 s_app.refs.term.scrollToTop();
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             xkb_syms.XKB_KEY_End => {
                 s_app.refs.term.scrollToBottom();
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             // Copy: Ctrl+Shift+C
@@ -215,12 +198,12 @@ fn onKey(ev: wayland_mod.KeyEvent) void {
         switch (ev.keysym) {
             xkb_syms.XKB_KEY_Page_Up => {
                 s_app.refs.term.scrollViewport(-@as(isize, s_app.metrics.scroll_lines * 10));
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             xkb_syms.XKB_KEY_Page_Down => {
                 s_app.refs.term.scrollViewport(@as(isize, s_app.metrics.scroll_lines * 10));
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 return;
             },
             else => {},
@@ -304,15 +287,15 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
         .scroll => {
             const lines: isize = if (ev.scroll_dy > 0) @intCast(s_app.metrics.scroll_lines) else -@as(isize, @intCast(s_app.metrics.scroll_lines));
             s_app.refs.term.scrollViewport(lines);
-            bumpScrollbarVisibility();
-            markRenderDirty();
+            render_loop.bumpScrollbarVisibility(s_app);
+            render_loop.markRenderDirty(s_app);
         },
         .button_press => {
             const cell = pixelToCell(ev.x, ev.y) orelse return;
             switch (ev.button) {
                 BTN_LEFT => {
                     s_app.input.selection.beginPrimary(cell, ev.mods.shift, nowMs());
-                    markRenderDirty();
+                    render_loop.markRenderDirty(s_app);
                 },
                 BTN_MIDDLE => {
                     // Middle-click paste: read primary selection and
@@ -333,7 +316,7 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
                     if (had_selection and s_app.input.selection.range != null) {
                         copyToPrimary();
                     }
-                    markRenderDirty();
+                    render_loop.markRenderDirty(s_app);
                 },
                 else => {},
             }
@@ -341,20 +324,16 @@ fn onMouse(ev: wayland_mod.MouseEvent) void {
         .motion => {
             const near_right_edge = @as(f64, @floatFromInt(s_app.metrics.viewport_w)) - ev.x <= SCROLLBAR_HOVER_WIDTH;
             if (near_right_edge) {
-                bumpScrollbarVisibility();
-                markRenderDirty();
+                render_loop.bumpScrollbarVisibility(s_app);
+                render_loop.markRenderDirty(s_app);
             }
             if (s_app.input.selection.dragging) {
                 const cell = pixelToCell(ev.x, ev.y) orelse return;
                 s_app.input.selection.updateDrag(cell);
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
             }
         },
     }
-}
-
-fn bumpScrollbarVisibility() void {
-    s_app.input.scrollbar_visible_until_ns = monotonicNowNs() + SCROLLBAR_HIDE_DELAY_NS;
 }
 
 /// Copy the current selection to the regular clipboard (Ctrl+Shift+C).
@@ -401,7 +380,7 @@ fn writePasteToPty(text: []const u8) void {
     defer allocator.free(encoded);
     s_app.refs.pty.write(encoded) catch {};
     s_app.refs.term.scrollToBottom();
-    markRenderDirty();
+    render_loop.markRenderDirty(s_app);
 }
 
 /// Read the codepoints of the row at absolute screen-y `target_screen_y`
@@ -525,54 +504,6 @@ fn expandWordLive(cell: selection_mod.Cell, cols: u16, row_cp_buf: *[render_snap
     };
 }
 
-/// Compute the scrollbar overlay for this snapshot. Returns null when
-/// there's no scrollback or the visibility window has elapsed. The
-/// renderer paints the overlay as a thin band on the right edge.
-fn currentScrollbarOverlay() ?render_snapshot.ScrollbarOverlay {
-    const sb = s_app.refs.term.scrollbar();
-    if (sb.total == 0 or sb.len == 0 or sb.total <= sb.len) {
-        s_app.input.scrollbar_was_visible = false;
-        return null;
-    }
-    const now = monotonicNowNs();
-    if (now >= s_app.input.scrollbar_visible_until_ns) {
-        s_app.input.scrollbar_was_visible = false;
-        return null;
-    }
-    const total_f: f32 = @floatFromInt(sb.total);
-    const offset_f: f32 = @floatFromInt(sb.offset);
-    const len_f: f32 = @floatFromInt(sb.len);
-    s_app.input.scrollbar_was_visible = true;
-    return .{
-        // Alpha is binary for the first cut — visible vs not. Fading
-        // adds per-frame redraw cost that we can layer in later.
-        .alpha = 0.7,
-        .thumb_offset = offset_f / total_f,
-        .thumb_size = @max(0.04, len_f / total_f),
-    };
-}
-
-/// Time until the scrollbar should be hidden — feeds into poll_timeout
-/// so the main loop wakes in time to redraw the frame with the
-/// scrollbar gone. Returns null when the scrollbar is already hidden
-/// (no timer needed).
-fn scrollbarTimeoutMs() ?c_int {
-    if (!s_app.input.scrollbar_was_visible) return null;
-    const now = monotonicNowNs();
-    if (now >= s_app.input.scrollbar_visible_until_ns) return 0;
-    const delta_ns = s_app.input.scrollbar_visible_until_ns - now;
-    const delta_ms = delta_ns / std.time.ns_per_ms + 1;
-    return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
-}
-
-/// Called once per loop iteration. Marks a redraw if the scrollbar
-/// hide timer has elapsed and the previous frame still showed it.
-fn maybeScheduleScrollbarHide() void {
-    if (!s_app.input.scrollbar_was_visible) return;
-    if (monotonicNowNs() < s_app.input.scrollbar_visible_until_ns) return;
-    markRenderDirty();
-}
-
 fn zoomIn() void {
     s_app.metrics.font_size = @min(s_app.metrics.font_size + 1.0, 72.0);
     applyZoom();
@@ -601,7 +532,7 @@ fn applyZoom() void {
         s_app.refs.pty.resize(grid.cols, grid.rows, s_app.metrics.viewport_w, s_app.metrics.viewport_h);
     }
 
-    markRenderDirty();
+    render_loop.markRenderDirty(s_app);
     s_app.render.gpu_reconfigure_requested = true;
 }
 
@@ -612,116 +543,12 @@ fn onResize(w: u32, h: u32) void {
     s_app.metrics.viewport_h = h;
     s_app.refs.term.resize(grid.cols, grid.rows, @intFromFloat(s_app.metrics.cell_width), @intFromFloat(s_app.metrics.cell_height)) catch {};
     s_app.refs.pty.resize(grid.cols, grid.rows, w, h);
-    markRenderDirty();
+    render_loop.markRenderDirty(s_app);
     s_app.render.gpu_reconfigure_requested = true;
 }
 
 fn onFocus(focused: bool) void {
     _ = focused;
-}
-
-fn maybeQueueGpuRendererFrame(gpu: *gpu_renderer.Frontend, wl: *const wayland_mod.Wayland, term: *terminal_mod.Terminal) void {
-    if (s_app.render.target_render_path != .gpu) return;
-    if (!gpu.active or !gpu.ready or gpu.render_in_flight or !s_app.render.gpu_snapshot_dirty) return;
-    // Vsync-gate the GPU render. Without this we'd kick off the
-    // render whenever PTY produced fresh data — which lands at
-    // arbitrary phase inside the vsync window. If the data arrives
-    // 12 ms into a 16.7 ms vsync, our 5–7 ms of work finishes past
-    // the latch deadline and the commit slips to the *next* vsync,
-    // dropping a frame. Waiting for the frame callback re-bases the
-    // render to start at the vsync boundary so the whole budget is
-    // available for the work. (The CPU path already does this; the
-    // GPU path used to skip it for a marginal latency win that
-    // turned out not to be worth the missed frames.)
-    if (wl.frame_pending) return;
-    gpu.queueRender(term, s_app.render.render_serial, s_app.input.selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
-        error.NoFreeBuffer => {
-            // Track how long we're stuck without a released buffer
-            // so we can see at exit whether compositor release
-            // latency is the throughput bottleneck.
-            if (s_app.debug.renderer_debug.commits or s_app.debug.warn_slow_budget_ms != null) {
-                const now = monotonicNowNs();
-                if (s_app.render.buffer_starvation_start_ns == 0) s_app.render.buffer_starvation_start_ns = now;
-            }
-            return;
-        },
-        error.NotReady, error.Busy, error.NoFreeSnapshot => return,
-        else => return,
-    };
-    if (s_app.render.buffer_starvation_start_ns != 0) {
-        const starvation_ns = monotonicNowNs() - s_app.render.buffer_starvation_start_ns;
-        if (s_app.debug.renderer_debug.commits) {
-            gpu_renderer.bufferStarvationAccumNs += starvation_ns;
-            gpu_renderer.bufferStarvationCount += 1;
-        }
-        if (s_app.debug.warn_slow_budget_ms) |budget_ms| {
-            const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
-            if (starvation_ns > budget_ns) {
-                std.debug.print("scrgo: buffer starvation {d:.1}ms (budget {}ms) — compositor hadn't released a dmabuf\n", .{
-                    @as(f64, @floatFromInt(starvation_ns)) / @as(f64, std.time.ns_per_ms),
-                    budget_ms,
-                });
-            }
-        }
-        s_app.render.buffer_starvation_start_ns = 0;
-    }
-    if (debugRenderersEnabled()) {
-        std.debug.print("scrgo: queued gpu renderer frame serial={}\n", .{s_app.render.render_serial});
-    }
-    s_app.render.gpu_snapshot_dirty = false;
-}
-
-fn combineTimeout(a: c_int, b_opt: ?c_int) c_int {
-    const b = b_opt orelse return a;
-    if (a < 0) return b;
-    return @min(a, b);
-}
-
-fn renderActivePath(
-    active_path: RenderPath,
-    gpu: *const gpu_renderer.Frontend,
-    cpu: *cpu_renderer_worker.Frontend,
-    wl: *wayland_mod.Wayland,
-    term: *terminal_mod.Terminal,
-) void {
-    if (active_path != .cpu or !s_app.render.needs_redraw) return;
-    if (s_app.render.target_render_path == .gpu and gpu.active and gpu.ready) return;
-    // Same vsync throttle as the GPU path — wait for the compositor to
-    // ack the previous commit before queueing the next one.
-    if (wl.frame_pending) return;
-    if (cpu.active) {
-        const shm = wl.shm orelse return;
-        cpu.ensureBuffers(@ptrCast(shm), wl.width, wl.height) catch |err| switch (err) {
-            error.Busy => return,
-            else => return,
-        };
-        cpu.queueRender(term, s_app.metrics.viewport_w, s_app.metrics.viewport_h, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height, s_app.render.render_serial, s_app.input.selection.toSnapshot(), currentScrollbarOverlay()) catch |err| switch (err) {
-            error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
-            else => return,
-        };
-        s_app.render.needs_redraw = false;
-        if (debugFramesEnabled()) {
-            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, s_app.diag.elapsedMs() });
-        }
-        return;
-    }
-    s_app.render.needs_redraw = false;
-}
-
-fn noteGpuUnavailable(
-    gpu: *gpu_renderer.Frontend,
-    active_path: *RenderPath,
-    restart: *GpuRestartBackoff,
-) void {
-    gpu.stop();
-    if (debugRenderersEnabled()) {
-        std.debug.print("scrgo: gpu renderer unavailable, switching to cpu renderer and scheduling restart\n", .{});
-    }
-    if (active_path.* == .gpu) {
-        active_path.* = .cpu;
-        s_app.render.needs_redraw = true;
-    }
-    restart.scheduleRetry();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1010,7 +837,7 @@ pub fn main(init: std.process.Init) !void {
                 if (n == 0) break;
                 term.feedData(pty_buf[0..n]);
                 s_app.lifecycle.first_pty_data_seen = true;
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
             }
             draining = true;
             drain_deadline_ns = monotonicNowNs() + drain_timeout_ns;
@@ -1060,7 +887,7 @@ pub fn main(init: std.process.Init) !void {
             if (gpu.active and gpu.context_ready) {
                 gpu.requestConfigure(s_app.metrics.viewport_w, s_app.metrics.viewport_h, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height) catch |err| {
                     std.debug.print("scrgo: gpu renderer reconfigure failed: {}\n", .{err});
-                    noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
+                    render_loop.noteGpuUnavailable(s_app);
                     continue;
                 };
             } else if (s_app.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null) {
@@ -1068,9 +895,9 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        maybeScheduleScrollbarHide();
-        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
-        renderActivePath(state.render.active_render_path, &gpu, &cpu, &wl, &term);
+        render_loop.maybeScheduleScrollbarHide(s_app);
+        render_loop.maybeQueueGpuFrame(s_app);
+        render_loop.renderActivePath(s_app);
         wl.flush();
 
         // Key repeat timeout — wake up in time for next repeat event
@@ -1079,8 +906,8 @@ pub fn main(init: std.process.Init) !void {
             state.render.gpu_restart.timeoutMs()
         else
             null;
-        const scroll_timeout = scrollbarTimeoutMs();
-        const poll_timeout = combineTimeout(combineTimeout(repeat_timeout, restart_timeout), scroll_timeout);
+        const scroll_timeout = render_loop.scrollbarTimeoutMs(s_app);
+        const poll_timeout = render_loop.combineTimeout(render_loop.combineTimeout(repeat_timeout, restart_timeout), scroll_timeout);
 
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },
@@ -1129,7 +956,7 @@ pub fn main(init: std.process.Init) !void {
                         }
                         gpu.requestConfigure(s_app.metrics.viewport_w, s_app.metrics.viewport_h, s_app.metrics.font_size, s_app.metrics.cell_width, s_app.metrics.cell_height) catch |err| {
                             std.debug.print("scrgo: gpu renderer configure after context_ready failed: {}\n", .{err});
-                            noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
+                            render_loop.noteGpuUnavailable(s_app);
                             continue;
                         };
                     },
@@ -1137,7 +964,7 @@ pub fn main(init: std.process.Init) !void {
                         if (wl.linux_dmabuf) |linux_dmabuf| {
                             gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |err| {
                                 std.debug.print("scrgo: GPU dmabuf import failed: {}\n", .{err});
-                                noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
+                                render_loop.noteGpuUnavailable(s_app);
                                 continue;
                             };
                             s_app.render.gpu_snapshot_dirty = true;
@@ -1146,7 +973,7 @@ pub fn main(init: std.process.Init) !void {
                                 std.debug.print("scrgo: gpu renderer ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
                             }
                         } else {
-                            noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
+                            render_loop.noteGpuUnavailable(s_app);
                         }
                     },
                     .frame => {
@@ -1184,7 +1011,7 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                     gpu.first_frame_presented = true;
                                 }
-                                markFirstContentPaint();
+                                render_loop.markFirstContentPaint(s_app);
                             }
                             // Only clear the dirty bit if the snapshot we
                             // committed reflects the latest state. If PTY
@@ -1203,11 +1030,11 @@ pub fn main(init: std.process.Init) !void {
                     },
                     .failed => {
                         std.debug.print("scrgo: gpu renderer failed\n", .{});
-                        noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
+                        render_loop.noteGpuUnavailable(s_app);
                     },
                 }
             } else {
-                noteGpuUnavailable(&gpu, &state.render.active_render_path, &state.render.gpu_restart);
+                render_loop.noteGpuUnavailable(s_app);
             }
         }
 
@@ -1230,7 +1057,7 @@ pub fn main(init: std.process.Init) !void {
                                     s_app.diag.elapsedMs(),
                                 });
                             }
-                            markFirstContentPaint();
+                            render_loop.markFirstContentPaint(s_app);
                         } else if (debugFramesEnabled()) {
                             const reason: []const u8 = if (!buffer_ok)
                                 "bad buffer index"
@@ -1268,7 +1095,7 @@ pub fn main(init: std.process.Init) !void {
                                 resp.added_pages,
                             });
                         }
-                        markRenderDirty();
+                        render_loop.markRenderDirty(s_app);
                     },
                     .failed => {
                         std.debug.print("scrgo: atlas owner update failed for {} codepoints\n", .{resp.requested_count});
@@ -1281,8 +1108,8 @@ pub fn main(init: std.process.Init) !void {
         // After zoom/resize, draw before reading PTY so the reflowed
         // content is presented before the shell's SIGWINCH response
         // can clear the prompt line.
-        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
-        renderActivePath(state.render.active_render_path, &gpu, &cpu, &wl, &term);
+        render_loop.maybeQueueGpuFrame(s_app);
+        render_loop.renderActivePath(s_app);
 
         if (pollfds[1].revents & c.POLLIN != 0) {
             // Time-bounded drain: read until kernel buffer is empty OR
@@ -1331,7 +1158,7 @@ pub fn main(init: std.process.Init) !void {
                     s_app.diag.t_first_pty_ns = monotonicNowNs() - s_app.diag.commit_trace_start_ns;
                 }
                 s_app.lifecycle.first_pty_data_seen = true;
-                markRenderDirty();
+                render_loop.markRenderDirty(s_app);
                 if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
             }
         }
@@ -1348,10 +1175,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
-        renderActivePath(state.render.active_render_path, &gpu, &cpu, &wl, &term);
+        render_loop.maybeQueueGpuFrame(s_app);
+        render_loop.renderActivePath(s_app);
 
-        maybeQueueGpuRendererFrame(&gpu, &wl, &term);
+        render_loop.maybeQueueGpuFrame(s_app);
     }
 
     if (s_app.debug.renderer_debug.commits) {
