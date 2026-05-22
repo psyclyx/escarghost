@@ -157,6 +157,7 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     mod.linkSystemLibrary("gbm", .{});
     mod.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
     mod.linkSystemLibrary("fontconfig", .{});
+    mod.linkSystemLibrary("libpulse-simple", .{});
 
     mod.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });
     mod.addCSourceFile(.{ .file = b.path("protocol/xdg-decoration-protocol.c") });
@@ -337,6 +338,9 @@ pub fn build(b: *std.Build) void {
             .wayland_scanner = wayland_scanner.?,
         });
         const exe = b.addExecutable(.{ .name = "scrgo", .root_module = main_module });
+        // Keep symbols even in release modes so coredumps and gdb give
+        // readable backtraces. Strip in dist/CI if size ever matters.
+        exe.root_module.strip = false;
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
@@ -350,14 +354,10 @@ pub fn build(b: *std.Build) void {
     // ── headless tests (`zig build test`, plus per-suite aliases) ──────
     const test_step = b.step("test", "Run all headless tests");
 
-    // cli.zig + bell.zig have no ghostty/snail/wayland deps — their
-    // tests can always run.
-    inline for (.{
-        .{ .src = "src/cli.zig", .step = "test-cli", .desc = "Run CLI parser tests" },
-        .{ .src = "src/bell.zig", .step = "test-bell", .desc = "Run bell manager tests" },
-    }) |t| {
+    // cli.zig has no engine deps — tests always run.
+    {
         const mod = b.createModule(.{
-            .root_source_file = b.path(t.src),
+            .root_source_file = b.path("src/cli.zig"),
             .target = deps.target,
             .optimize = deps.optimize,
             .link_libc = true,
@@ -365,7 +365,22 @@ pub fn build(b: *std.Build) void {
         const tests = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(tests);
         test_step.dependOn(&run.step);
-        b.step(t.step, t.desc).dependOn(&run.step);
+        b.step("test-cli", "Run CLI parser tests").dependOn(&run.step);
+    }
+    // bell.zig pulls in libpulse for audio, so its test module needs
+    // the same linker arg.
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/bell.zig"),
+            .target = deps.target,
+            .optimize = deps.optimize,
+            .link_libc = true,
+        });
+        mod.linkSystemLibrary("libpulse-simple", .{});
+        const tests = b.addTest(.{ .root_module = mod });
+        const run = b.addRunArtifact(tests);
+        test_step.dependOn(&run.step);
+        b.step("test-bell", "Run bell manager tests").dependOn(&run.step);
     }
 
     if (vt_include != null and vt_static_lib != null) {

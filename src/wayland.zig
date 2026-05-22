@@ -173,6 +173,15 @@ pub const Wayland = struct {
         self.xkb_context = null;
         self.xkb_keymap = null;
         self.xkb_state = null;
+        // These previously escaped initialization because `wl` is
+        // declared `= undefined`. In release builds the garbage in
+        // `keymap_buf` looked non-null often enough that the first
+        // keymap event would munmap a random address and then segfault
+        // on the store. The struct's field defaults don't apply when
+        // the instance is built via `undefined` + per-field init, so
+        // any new field added here also has to be set explicitly.
+        self.keymap_buf = null;
+        self.pending_mods = null;
         self.configured = false;
         self.closed = false;
         self.frame_pending = false;
