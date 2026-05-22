@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 const c = @cImport({
     @cInclude("time.h");
 });
@@ -76,9 +77,9 @@ pub const FrameStats = struct {
         return sorted[idx];
     }
 
-    pub fn log(self: *const FrameStats, label: []const u8) void {
+    pub fn dump(self: *const FrameStats, label: []const u8) void {
         if (self.count == 0) return;
-        std.debug.print("{s}: avg={d:.1}µs max={d:.1}µs p99={d:.1}µs frames={}\n", .{
+        log.info(.diag, "{s} stats  avg_us={d:.1}  max_us={d:.1}  p99_us={d:.1}  frames={}", .{
             label, self.avgUs(), self.maxUs(), self.p99Us(), self.total_frames,
         });
     }

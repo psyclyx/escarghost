@@ -7,6 +7,7 @@ const render_snapshot = @import("render_snapshot.zig");
 const cpu_buffer = @import("cpu_buffer.zig");
 const cpu_pipeline = @import("cpu_pipeline.zig");
 const perf = @import("../perf.zig");
+const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
@@ -22,11 +23,6 @@ fn rendererDebugOptions() render_env.RendererDebug {
 
 fn cpuRendererDebugEnabled() bool {
     return rendererDebugOptions().renderers;
-}
-
-fn cpuRendererDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
-    if (!cpuRendererDebugEnabled()) return;
-    std.debug.print("scrgo[cpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
 pub const BufferCount = 2;
@@ -91,7 +87,6 @@ pub const Frontend = struct {
     // cond_wait until start() assigns it real work.
     pub fn spawnThread(self: *Frontend) !void {
         if (self.thread != null) return;
-        const timer = perf.Timer.now();
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
@@ -106,7 +101,7 @@ pub const Frontend = struct {
             self.response_fds = [_]c_int{-1} ** 2;
         }
         self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
-        cpuRendererDebug(timer, "spawn", .{});
+        if (cpuRendererDebugEnabled()) log.info(.cpu, "spawned", .{});
     }
 
     pub fn start(
@@ -118,18 +113,16 @@ pub const Frontend = struct {
         height: u32,
     ) !void {
         if (self.active) return;
-        const timer = perf.Timer.now();
         try self.spawnThread();
         self.atlas_ref = atlas_ref;
         self.atlas_thread = atlas_thread;
         try self.ensureBuffers(shm_opaque, width, height);
         self.active = true;
-        cpuRendererDebug(timer, "start {}x{}", .{ width, height });
+        if (cpuRendererDebugEnabled()) log.info(.cpu, "started  width={}  height={}", .{ width, height });
     }
 
     pub fn stop(self: *Frontend) void {
         if (!self.active) return;
-        const timer = perf.Timer.now();
         {
             _ = c.pthread_mutex_lock(&self.mutex);
             defer _ = c.pthread_mutex_unlock(&self.mutex);
@@ -149,13 +142,12 @@ pub const Frontend = struct {
         self.render_in_flight = false;
         self.stop_requested = false;
         self.snapshot_busy = [_]bool{false} ** SnapshotSlotCount;
-        cpuRendererDebug(timer, "stop", .{});
+        if (cpuRendererDebugEnabled()) log.info(.cpu, "stopped", .{});
     }
 
     pub fn ensureBuffers(self: *Frontend, shm_opaque: *anyopaque, width: u32, height: u32) !void {
         if (self.buffer_count > 0 and self.width == width and self.height == height) return;
         if (self.render_in_flight or self.request_pending) return error.Busy;
-        const timer = perf.Timer.now();
         self.destroyBuffers();
         errdefer self.destroyBuffers();
         for (0..BufferCount) |i| {
@@ -165,7 +157,7 @@ pub const Frontend = struct {
         }
         self.width = width;
         self.height = height;
-        cpuRendererDebug(timer, "buffers ready {}x{} count={}", .{ width, height, self.buffer_count });
+        if (cpuRendererDebugEnabled()) log.info(.cpu, "buffers ready  width={}  height={}  count={}", .{ width, height, self.buffer_count });
     }
 
     pub fn freeBufferIndex(self: *Frontend) ?u8 {
@@ -196,7 +188,6 @@ pub const Frontend = struct {
     ) !void {
         if (!self.active) return error.Inactive;
         if (self.render_in_flight or self.request_pending) return error.Busy;
-        const timer = perf.Timer.now();
         const buffer_index = self.freeBufferIndex() orelse return error.NoFreeBuffer;
         const snapshot_slot = self.freeSnapshotSlot() orelse return error.NoFreeSnapshot;
 
@@ -221,10 +212,10 @@ pub const Frontend = struct {
         self.request_pending = true;
         self.render_in_flight = true;
         _ = c.pthread_cond_signal(&self.cond);
-        cpuRendererDebug(timer, "queue frame buffer={} snapshot={} serial={} {}x{}", .{
+        log.setFrame(.cpu, serial);
+        if (cpuRendererDebugEnabled()) log.info(.cpu, "queue frame  buffer={}  snapshot={}  width={}  height={}", .{
             buffer_index,
             snapshot_slot,
-            serial,
             width,
             height,
         });
@@ -252,11 +243,9 @@ pub const Frontend = struct {
     }
 
     fn workerMain(self: *Frontend) void {
-        if (cpuRendererDebugEnabled()) {
-            std.debug.print("scrgo[cpu-renderer] thread running\n", .{});
-        }
-        var ctx = cpu_pipeline.CpuPipeline.init(std.heap.smp_allocator) catch |err| {
-            std.debug.print("scrgo[cpu-renderer]: init failed: {}\n", .{err});
+        if (cpuRendererDebugEnabled()) log.info(.cpu, "thread running", .{});
+        var ctx = cpu_pipeline.CpuPipeline.init(std.heap.smp_allocator) catch |e| {
+            log.err(.cpu, "init failed  err={s}", .{@errorName(e)});
             return;
         };
         defer ctx.deinit();
@@ -284,11 +273,10 @@ pub const Frontend = struct {
                     const timer = perf.Timer.now();
                     const buffer_index = request.buffer_index;
                     const snapshot_slot = request.snapshot_slot;
+                    log.setFrame(.cpu, request.serial);
                     if (buffer_index >= self.buffer_count or snapshot_slot >= SnapshotSlotCount) {
-                        cpuRendererDebug(timer, "reject frame buffer={} snapshot={} serial={}", .{
-                            buffer_index,
-                            snapshot_slot,
-                            request.serial,
+                        log.warn(.cpu, "reject frame  buffer={}  snapshot={}", .{
+                            buffer_index, snapshot_slot,
                         });
                         writeResponse(self.response_fds[1], .{
                             .tag = .failed,
@@ -301,10 +289,7 @@ pub const Frontend = struct {
 
                     const buffer = &self.buffers[buffer_index];
                     const map_ptr = buffer.map_ptr orelse {
-                        cpuRendererDebug(timer, "missing shm map buffer={} serial={}", .{
-                            buffer_index,
-                            request.serial,
-                        });
+                        log.warn(.cpu, "missing shm map  buffer={}", .{buffer_index});
                         writeResponse(self.response_fds[1], .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
@@ -327,10 +312,8 @@ pub const Frontend = struct {
                         request.font_size,
                         request.cell_width,
                         request.cell_height,
-                    ) catch |err| {
-                        cpuRendererDebug(timer, "render failed buffer={} serial={} err={}", .{
-                            buffer_index, request.serial, err,
-                        });
+                    ) catch |e| {
+                        log.err(.cpu, "render failed  buffer={}  err={s}", .{ buffer_index, @errorName(e) });
                         writeResponse(self.response_fds[1], .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
@@ -343,11 +326,9 @@ pub const Frontend = struct {
                     if (!misses.isEmpty()) {
                         if (self.atlas_thread) |thread| thread.requestMany(&misses);
                     }
-                    cpuRendererDebug(timer, "frame complete buffer={} snapshot={} serial={} in {d:.1}ms", .{
-                        buffer_index,
-                        snapshot_slot,
-                        request.serial,
-                        timer.elapsedMs(),
+                    const elapsed_ms = timer.elapsedMs();
+                    if (cpuRendererDebugEnabled()) log.info(.cpu, "frame complete  buffer={}  snapshot={}  elapsed_ms={d:.1}", .{
+                        buffer_index, snapshot_slot, elapsed_ms,
                     });
                     writeResponse(self.response_fds[1], .{
                         .tag = .frame,
@@ -356,11 +337,9 @@ pub const Frontend = struct {
                         .serial = request.serial,
                     });
                     if (warn_slow_budget_ms) |budget_ms| {
-                        const elapsed_ms = timer.elapsedMs();
                         if (elapsed_ms > @as(f64, @floatFromInt(budget_ms))) {
-                            std.debug.print("scrgo: slow cpu frame {d:.1}ms (budget {}ms)\n", .{
-                                elapsed_ms,
-                                budget_ms,
+                            log.warn(.cpu, "slow frame  elapsed_ms={d:.1}  budget_ms={}", .{
+                                elapsed_ms, budget_ms,
                             });
                         }
                     }

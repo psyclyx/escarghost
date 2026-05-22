@@ -1,6 +1,7 @@
 const std = @import("std");
 const perf = @import("perf.zig");
 const render_env = @import("render/render_env.zig");
+const log = @import("log.zig");
 
 const wl = @cImport({
     @cInclude("wayland-client.h");
@@ -612,7 +613,7 @@ pub const Wayland = struct {
     fn xdgToplevelClose(data: ?*anyopaque, _: ?*wl.xdg_toplevel) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
         if (rendererLogEnabled()) {
-            std.debug.print("scrgo: received xdg_toplevel.close\n", .{});
+            log.info(.wayland, "xdg_toplevel.close received", .{});
         }
         self.closed = true;
     }
@@ -914,7 +915,7 @@ pub const Wayland = struct {
         last_frame_done_ns = now_ns;
         frame_done_count += 1;
         if (log_frame_events) {
-            std.debug.print("scrgo: wl frame_done #{} dt={d:.1}ms\n", .{ frame_done_count, dt_ms });
+            log.info(.wayland, "frame_done  seq={}  dt_ms={d:.1}", .{ frame_done_count, dt_ms });
         }
     }
 

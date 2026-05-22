@@ -18,6 +18,7 @@ const gpu_buffer = @import("gpu_buffer.zig");
 const terminal_mod = @import("../terminal.zig");
 const row_build = @import("row_build.zig");
 const perf = @import("../perf.zig");
+const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
@@ -46,11 +47,6 @@ fn rendererDebugOptions() render_env.RendererDebug {
 
 fn gpuDebugEnabled() bool {
     return rendererDebugOptions().renderers;
-}
-
-fn gpuDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
-    if (!gpuDebugEnabled()) return;
-    std.debug.print("scrgo[gpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
 pub const MaxBuffers = gpu_buffer.MaxBuffers;
@@ -155,9 +151,8 @@ const OffscreenEgl = struct {
     image_target_texture: ?*const fn (c.GLenum, c.GLeglImageOES) callconv(.c) void = null,
 
     pub fn init() !OffscreenEgl {
-        const timer = perf.Timer.now();
         var self: OffscreenEgl = .{};
-        gpuDebug(timer, "egl init start", .{});
+        if (gpuDebugEnabled()) log.info(.gpu, "egl init start", .{});
 
         _ = c.setenv("EGL_PLATFORM", "surfaceless", 0);
 
@@ -173,7 +168,7 @@ const OffscreenEgl = struct {
         var minor: c.EGLint = 0;
         if (c.eglInitialize(self.display, &major, &minor) == c.EGL_FALSE)
             return error.EglInitFailed;
-        gpuDebug(timer, "egl initialized {}.{}", .{ major, minor });
+        if (gpuDebugEnabled()) log.info(.gpu, "egl initialized  version={}.{}", .{ major, minor });
         _ = c.eglBindAPI(c.EGL_OPENGL_ES_API);
 
         const attrs = [_]c.EGLint{
@@ -205,13 +200,12 @@ const OffscreenEgl = struct {
 
         if (c.eglMakeCurrent(self.display, self.surface, self.surface, self.context) == c.EGL_FALSE)
             return error.EglMakeCurrentFailed;
-        gpuDebug(timer, "egl current", .{});
         if (gpuDebugEnabled()) {
             const vendor = c.glGetString(c.GL_VENDOR);
             const renderer = c.glGetString(c.GL_RENDERER);
             const gl_version = c.glGetString(c.GL_VERSION);
             const glsl_version = c.glGetString(c.GL_SHADING_LANGUAGE_VERSION);
-            std.debug.print("scrgo[gpu-renderer]: GL_VENDOR={s} GL_RENDERER={s} GL_VERSION={s} GLSL_VERSION={s}\n", .{
+            log.info(.gpu, "egl current  vendor={s}  renderer={s}  version={s}  glsl={s}", .{
                 if (vendor) |v| std.mem.sliceTo(v, 0) else "?",
                 if (renderer) |r| std.mem.sliceTo(r, 0) else "?",
                 if (gl_version) |v| std.mem.sliceTo(v, 0) else "?",
@@ -660,8 +654,7 @@ pub const GpuWorker = struct {
     // ── Worker thread ──
 
     fn workerMain(self: *GpuWorker) void {
-        const timer = perf.Timer.now();
-        gpuDebug(timer, "thread start", .{});
+        if (gpuDebugEnabled()) log.info(.gpu, "thread started", .{});
 
         const warn_slow_budget_ms = render_env.parseWarnSlowMs(
             if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
@@ -678,13 +671,13 @@ pub const GpuWorker = struct {
         var diag_frame_counter: u64 = 0;
 
         // Phase 1: EGL + snail.Renderer init (no deps needed)
-        var egl = OffscreenEgl.init() catch |err| {
-            gpuDebug(timer, "egl init failed: {}", .{err});
+        var egl = OffscreenEgl.init() catch |e| {
+            log.err(.gpu, "egl init failed  err={s}", .{@errorName(e)});
             writeResponse(self.response_fds[1], .{ .tag = .failed });
             return;
         };
         defer egl.deinit();
-        gpuDebug(timer, "offscreen egl ready", .{});
+        if (gpuDebugEnabled()) log.info(.gpu, "offscreen egl ready", .{});
 
         // Signal context ready — main can now send configure
         writeResponse(self.response_fds[1], .{ .tag = .context_ready });
@@ -735,17 +728,17 @@ pub const GpuWorker = struct {
                 .quit => return,
                 .configure => {
                     const reconfigure_timer = perf.Timer.now();
-                    gpuDebug(timer, "configure {}x{} font={d:.1}", .{ request.width, request.height, request.font_size });
+                    if (gpuDebugEnabled()) log.info(.gpu, "configure  width={}  height={}  font={d:.1}", .{ request.width, request.height, request.font_size });
 
                     const atlas_ref = self.atlas_ref orelse {
-                        gpuDebug(timer, "configure failed: no atlas_ref set", .{});
+                        log.err(.gpu, "configure failed  err=missing_atlas_ref", .{});
                         writeResponse(self.response_fds[1], .{ .tag = .failed });
                         continue;
                     };
 
                     // Allocate dmabufs
-                    const next_allocator = DmabufAllocator.init(&egl, request.width, request.height, MaxBuffers) catch |err| {
-                        gpuDebug(timer, "dmabuf alloc failed: {}", .{err});
+                    const next_allocator = DmabufAllocator.init(&egl, request.width, request.height, MaxBuffers) catch |e| {
+                        log.err(.gpu, "dmabuf alloc failed  err={s}", .{@errorName(e)});
                         writeResponse(self.response_fds[1], .{ .tag = .failed });
                         continue;
                     };
@@ -765,8 +758,8 @@ pub const GpuWorker = struct {
                             request.font_size,
                             request.cell_width,
                             request.cell_height,
-                        ) catch |err| {
-                            gpuDebug(timer, "renderer init failed: {}", .{err});
+                        ) catch |e| {
+                            log.err(.gpu, "renderer init failed  err={s}", .{@errorName(e)});
                             writeResponse(self.response_fds[1], .{ .tag = .failed });
                             continue;
                         };
@@ -801,10 +794,10 @@ pub const GpuWorker = struct {
                         const warm_t0 = perf.Timer.now();
                         c.glBindFramebuffer(c.GL_FRAMEBUFFER, active_allocator.targets[0].framebuffer);
                         c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
-                        renderer.?.warmPipeline() catch |err| {
-                            gpuDebug(timer, "pipeline warmup failed: {}", .{err});
+                        renderer.?.warmPipeline() catch |e| {
+                            log.warn(.gpu, "pipeline warmup failed  err={s}", .{@errorName(e)});
                         };
-                        gpuDebug(timer, "pipeline warmup in {d:.1}ms", .{warm_t0.elapsedMs()});
+                        if (gpuDebugEnabled()) log.info(.gpu, "pipeline warmup  elapsed_ms={d:.1}", .{warm_t0.elapsedMs()});
                     }
 
                     // Publish buffer descriptors for main thread
@@ -815,7 +808,7 @@ pub const GpuWorker = struct {
                         active_allocator.targets[i].export_fd = -1; // Transfer ownership to main
                     }
 
-                    gpuDebug(timer, "configure ready in {d:.1}ms", .{reconfigure_timer.elapsedMs()});
+                    if (gpuDebugEnabled()) log.info(.gpu, "configure ready  elapsed_ms={d:.1}", .{reconfigure_timer.elapsedMs()});
                     writeResponse(self.response_fds[1], .{ .tag = .ready });
                 },
                 .render => {
@@ -824,6 +817,7 @@ pub const GpuWorker = struct {
                     const r = &renderer.?;
                     if (request.buffer_index >= active_allocator.count) continue;
                     if (request.snapshot_slot >= SnapshotSlotCount) continue;
+                    log.setFrame(.gpu, request.serial);
 
                     // Iterate the render_state into the snapshot here on
                     // the worker thread. The main thread already ran
@@ -971,7 +965,7 @@ pub const GpuWorker = struct {
                     // how much the redraw + fence wait will cost.
                     last_full_frame_ns = monotonicNs() - draw_t0;
 
-                    gpuDebug(timer, "render complete buffer={} in {d:.1}ms", .{
+                    if (gpuDebugEnabled()) log.info(.gpu, "render complete  buffer={}  elapsed_ms={d:.1}", .{
                         request.buffer_index,
                         render_timer.elapsedMs(),
                     });
@@ -987,10 +981,9 @@ pub const GpuWorker = struct {
                     // memory growth without needing a slow-frame trigger.
                     diag_frame_counter += 1;
                     if (diag_frame_counter % 60 == 0) {
-                        const rss_kb = readRssKb();
-                        std.debug.print("scrgo[diag] frame={} rss_kb={}\n", .{
+                        log.info(.diag, "rss sample  frame={}  rss_kib={}", .{
                             diag_frame_counter,
-                            rss_kb,
+                            readRssKb(),
                         });
                     }
 
@@ -1009,7 +1002,7 @@ pub const GpuWorker = struct {
                             const row_count = row_build.phase_row_count - row_count_base;
                             const row_shape = row_build.phase_row_shape_ns - row_shape_base;
                             const row_finish = row_build.phase_row_finish_ns - row_finish_base;
-                            std.debug.print("scrgo: slow gpu frame {d:.1}ms (budget {}ms) — cells {d:.1} + draw {d:.1} (row {d:.1} [rebuild {d:.2} (shape {d:.2} finish {d:.2}) rows {}] pic {d:.1} upload {d:.1} dl {d:.1} gl {d:.1} fence {d:.1}) ms\n", .{
+                            log.warn(.gpu, "slow frame  elapsed_ms={d:.1}  budget_ms={}  cells_ms={d:.1}  draw_ms={d:.1}  row_ms={d:.1}  rebuild_ms={d:.2}  shape_ms={d:.2}  finish_ms={d:.2}  rows={}  pic_ms={d:.1}  upload_ms={d:.1}  drawlist_ms={d:.1}  gl_ms={d:.1}  fence_ms={d:.1}", .{
                                 @as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f,
                                 budget_ms,
                                 @as(f64, @floatFromInt(cells_elapsed_ns)) / ms_f,

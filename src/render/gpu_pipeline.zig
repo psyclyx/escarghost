@@ -8,6 +8,7 @@ const glyph_misses = @import("glyph_misses.zig");
 const row_build = @import("row_build.zig");
 const color = @import("color");
 const perf = @import("../perf.zig");
+const log = @import("../log.zig");
 const Rgb = color.Rgb;
 
 const gl = @cImport({
@@ -326,7 +327,7 @@ pub const GpuPipeline = struct {
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
 
         if (self.debug_log_atlas) {
-            std.debug.print("scrgo[gpu-renderer]: atlas snapshot {}\n", .{identity});
+            log.info(.gpu, "atlas snapshot  identity={}", .{identity});
         }
         return atlas;
     }
@@ -588,7 +589,7 @@ pub const GpuPipeline = struct {
         while (gl_err != gl.GL_NO_ERROR and error_count < 4) {
             error_count += 1;
             if (self.debug_log_frames) {
-                std.debug.print("scrgo[gpu-renderer]: GL error 0x{x} after drawPass (frame={})\n", .{ gl_err, phase_frame_count });
+                log.warn(.gpu, "GL error after drawPass  code=0x{x}  frame={}", .{ gl_err, phase_frame_count });
             }
             gl_err = gl.glGetError();
         }
@@ -606,21 +607,18 @@ pub const GpuPipeline = struct {
             for (sample_xs, 0..) |x, i| {
                 gl.glReadPixels(x, sample_y, 1, 1, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, &pixels[i]);
             }
-            std.debug.print(
-                "scrgo[gpu-renderer]: frame={} rects={} blobs={} glyphs={} (rows={}) px=[{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}]\n",
-                .{
-                    phase_frame_count,
-                    scene_shapes,
-                    scene_text_blobs,
-                    total_glyphs,
-                    built.rows.len,
-                    pixels[0][0], pixels[0][1], pixels[0][2],
-                    pixels[1][0], pixels[1][1], pixels[1][2],
-                    pixels[2][0], pixels[2][1], pixels[2][2],
-                    pixels[3][0], pixels[3][1], pixels[3][2],
-                    pixels[4][0], pixels[4][1], pixels[4][2],
-                },
-            );
+            log.info(.gpu, "scene  frame={}  rects={}  blobs={}  glyphs={}  rows={}  px=[{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}]", .{
+                phase_frame_count,
+                scene_shapes,
+                scene_text_blobs,
+                total_glyphs,
+                built.rows.len,
+                pixels[0][0], pixels[0][1], pixels[0][2],
+                pixels[1][0], pixels[1][1], pixels[1][2],
+                pixels[2][0], pixels[2][1], pixels[2][2],
+                pixels[3][0], pixels[3][1], pixels[3][2],
+                pixels[4][0], pixels[4][1], pixels[4][2],
+            });
         }
     }
 };

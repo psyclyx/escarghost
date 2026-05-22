@@ -4,6 +4,7 @@ const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const perf = @import("../perf.zig");
+const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
@@ -47,11 +48,6 @@ fn debugOptions() render_env.RendererDebug {
 fn atlasDebugEnabled() bool {
     const options = debugOptions();
     return options.atlas or options.renderers;
-}
-
-fn atlasDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
-    if (!atlasDebugEnabled()) return;
-    std.debug.print("scrgo[atlas-owner] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
 pub const ExtendOutcome = enum {
@@ -98,7 +94,6 @@ pub const AtlasWorker = struct {
 
     pub fn start(self: *AtlasWorker, ref: *atlas_ref_mod.AtlasRef) !void {
         if (self.active) return;
-        const timer = perf.Timer.now();
         self.* = .{
             .atlas_ref = ref,
             .prefetch_enabled = prefetchEnabled(),
@@ -121,12 +116,11 @@ pub const AtlasWorker = struct {
 
         self.active = true;
         self.thread = try std.Thread.spawn(.{}, AtlasWorker.workerMain, .{self});
-        atlasDebug(timer, "start", .{});
+        if (atlasDebugEnabled()) log.info(.atlas, "started", .{});
     }
 
     pub fn startWithBootstrap(self: *AtlasWorker, config: BootstrapConfig) !void {
         if (self.active) return;
-        const timer = perf.Timer.now();
         self.* = .{
             .bootstrap_config = config,
             .prefetch_enabled = prefetchEnabled(),
@@ -149,12 +143,11 @@ pub const AtlasWorker = struct {
 
         self.active = true;
         self.thread = try std.Thread.spawn(.{}, AtlasWorker.workerMain, .{self});
-        atlasDebug(timer, "start (bootstrap)", .{});
+        if (atlasDebugEnabled()) log.info(.atlas, "started  mode=bootstrap", .{});
     }
 
     pub fn stop(self: *AtlasWorker) void {
         if (!self.active) return;
-        const timer = perf.Timer.now();
         {
             _ = c.pthread_mutex_lock(&self.mutex);
             defer _ = c.pthread_mutex_unlock(&self.mutex);
@@ -173,18 +166,17 @@ pub const AtlasWorker = struct {
         self.request_pending = false;
         self.stop_requested = false;
         self.active = false;
-        atlasDebug(timer, "stop", .{});
+        if (atlasDebugEnabled()) log.info(.atlas, "stopped", .{});
     }
 
     pub fn requestMany(self: *AtlasWorker, misses: *const glyph_misses.Set) void {
         if (!self.active or !self.prefetch_enabled or misses.isEmpty()) return;
-        const timer = perf.Timer.now();
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
         self.pending.mergeFrom(misses);
         self.request_pending = !self.pending.isEmpty();
         _ = c.pthread_cond_signal(&self.cond);
-        atlasDebug(timer, "queue {} bytes", .{self.pending.len});
+        if (atlasDebugEnabled()) log.info(.atlas, "queue  bytes={}", .{self.pending.len});
     }
 
     /// Submit `misses` to the worker and block until the atlas
@@ -229,11 +221,11 @@ pub const AtlasWorker = struct {
         while (!(self.pending.isEmpty() and self.atlas_ref.loadGeneration() != baseline_gen)) {
             const rc = c.pthread_cond_timedwait(&self.completion_cond, &self.mutex, &ts);
             if (rc == c.ETIMEDOUT) {
-                atlasDebug(timer, "extendBefore timed out", .{});
+                if (atlasDebugEnabled()) log.info(.atlas, "extendBefore timed out  elapsed_ms={d:.2}", .{timer.elapsedMs()});
                 return .timed_out;
             }
         }
-        atlasDebug(timer, "extendBefore satisfied in {d:.2}ms", .{timer.elapsedMs()});
+        if (atlasDebugEnabled()) log.info(.atlas, "extendBefore satisfied  elapsed_ms={d:.2}", .{timer.elapsedMs()});
         return .extended;
     }
 
@@ -247,9 +239,7 @@ pub const AtlasWorker = struct {
     }
 
     fn workerMain(self: *AtlasWorker) void {
-        if (atlasDebugEnabled()) {
-            std.debug.print("scrgo[atlas-owner] thread running\n", .{});
-        }
+        if (atlasDebugEnabled()) log.info(.atlas, "thread running", .{});
 
         if (self.bootstrap_config) |config| {
             self.runBootstrap(config) catch |err| {
@@ -265,9 +255,7 @@ pub const AtlasWorker = struct {
         // left to do post-bootstrap; exit so we don't burn an OS thread
         // on a permanently parked cond_wait.
         if (!self.prefetch_enabled) {
-            if (atlasDebugEnabled()) {
-                std.debug.print("scrgo[atlas-owner] prefetch disabled; thread exiting\n", .{});
-            }
+            if (atlasDebugEnabled()) log.info(.atlas, "prefetch disabled, thread exiting", .{});
             return;
         }
 
@@ -298,8 +286,10 @@ pub const AtlasWorker = struct {
             // extend on the render thread doesn't race the publish.
             const result_err = self.atlas_ref.extend(current, pending_text);
             self.signalRoundComplete();
-            const result = result_err catch {
-                atlasDebug(timer, "extend failed for {} bytes", .{pending_text.len});
+            const result = result_err catch |e| {
+                log.err(.atlas, "extend failed  bytes={}  elapsed_ms={d:.2}  err={s}", .{
+                    pending_text.len, timer.elapsedMs(), @errorName(e),
+                });
                 writeResponse(self.response_fds[1], .{
                     .tag = .failed,
                     .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
@@ -310,7 +300,9 @@ pub const AtlasWorker = struct {
                 .extended => .updated,
                 .missing => .updated,
             };
-            atlasDebug(timer, "{s} for {} bytes", .{ @tagName(result), pending_text.len });
+            if (atlasDebugEnabled()) log.info(.atlas, "extend {s}  bytes={}  elapsed_ms={d:.2}", .{
+                @tagName(result), pending_text.len, timer.elapsedMs(),
+            });
             writeResponse(self.response_fds[1], .{
                 .tag = tag,
                 .requested_count = @intCast(@min(pending_text.len, std.math.maxInt(u8))),
@@ -339,7 +331,6 @@ pub const AtlasWorker = struct {
     }
 
     fn runBootstrap(self: *AtlasWorker, config: BootstrapConfig) !void {
-        const timer = perf.Timer.now();
         const alloc = config.allocator;
 
         // Phase 1: parse the font into a TextAtlas. No rasterization yet, but
@@ -358,7 +349,7 @@ pub const AtlasWorker = struct {
 
         self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
-        atlasDebug(timer, "font ready", .{});
+        if (atlasDebugEnabled()) log.info(.atlas, "font ready", .{});
 
         // Tell main it can compute cell metrics and fork the PTY now.
         // Glyph rasterization happens lazily via the atlas-thread miss

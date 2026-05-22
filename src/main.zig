@@ -9,12 +9,12 @@ const render_env = @import("render/render_env.zig");
 const atlas_worker = @import("render/atlas_worker.zig");
 const cpu_renderer_worker = @import("render/cpu_worker.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
-const perf = @import("perf.zig");
 const clipboard_mod = @import("clipboard.zig");
 const diagnostics = @import("diagnostics.zig");
 const app_state = @import("app_state.zig");
 const render_loop = @import("render_loop.zig");
 const input = @import("input.zig");
+const log = @import("log.zig");
 
 const c = @cImport({
     @cInclude("poll.h");
@@ -37,7 +37,7 @@ fn rendererDebugOptions() render_env.RendererDebug {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const startup_timer = perf.Timer.now();
+    log.init();
     var state: app_state.AppState = .{};
     state.diag.markStart();
     const allocator = std.heap.smp_allocator;
@@ -100,7 +100,7 @@ pub fn main(init: std.process.Init) !void {
     const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
     const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: debug flags startup={} renderers={} frames={} atlas={} pty={} reset_atlas={}\n", .{
+        log.info(.main, "debug flags  startup={}  renderers={}  frames={}  atlas={}  pty={}  reset_atlas={}", .{
             state.debug.renderer_debug.startup,
             state.debug.renderer_debug.renderers,
             state.debug.renderer_debug.frames,
@@ -108,12 +108,12 @@ pub fn main(init: std.process.Init) !void {
             state.debug.renderer_debug.pty,
             runtime_flags.reset_atlas_each_frame,
         });
-        std.debug.print("scrgo: requested renderer mode={s}\n", .{@tagName(requested_render_path)});
+        log.info(.main, "requested renderer  mode={s}", .{@tagName(requested_render_path)});
     }
 
     const gpu_allowed = requested_render_path != .cpu;
     if (state.debug.renderer_debug.startup and !gpu_allowed) {
-        std.debug.print("scrgo: gpu renderer disabled by SCRGO_RENDERER=cpu\n", .{});
+        log.info(.gpu, "disabled  reason=SCRGO_RENDERER=cpu", .{});
     }
 
     var gpu: gpu_worker.GpuWorker = .{};
@@ -128,21 +128,21 @@ pub fn main(init: std.process.Init) !void {
     // ~6 ms. The thread parks in cond_wait until start() assigns it work.
     var cpu: cpu_renderer_worker.Frontend = .{};
     defer cpu.stop();
-    cpu.spawnThread() catch |err| {
-        std.debug.print("scrgo: cpu renderer thread spawn failed: {}\n", .{err});
+    cpu.spawnThread() catch |e| {
+        log.err(.cpu, "thread spawn failed  err={s}", .{@errorName(e)});
     };
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: cpu renderer thread spawned ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        log.info(.cpu, "thread spawned", .{});
     }
 
     // Start GPU thread early — it begins EGL init immediately, no deps needed
     if (gpu_allowed) {
-        gpu.start() catch |err| {
-            std.debug.print("scrgo: gpu renderer thread start failed: {}\n", .{err});
+        gpu.start() catch |e| {
+            log.err(.gpu, "thread start failed  err={s}", .{@errorName(e)});
             state.render.gpu_restart.scheduleRetry();
         };
         if (state.debug.renderer_debug.startup) {
-            std.debug.print("scrgo: gpu renderer thread started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            log.info(.gpu, "thread started", .{});
         }
     }
 
@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
         state.diag.recordCommit('b');
         if (state.debug.renderer_debug.startup) {
-            std.debug.print("scrgo: 1px bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            log.info(.frame, "bg committed  path=solid", .{});
         }
     } else if (wl.shm) |shm| {
         var bg_frame = cpu_pipeline.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
@@ -173,14 +173,14 @@ pub fn main(init: std.process.Init) !void {
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
             state.diag.recordCommit('b');
             if (state.debug.renderer_debug.startup) {
-                std.debug.print("scrgo: SHM bg ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                log.info(.frame, "bg committed  path=shm", .{});
             }
             frame.destroy();
         }
     }
 
     if (requested_render_path == .gpu and wl.linux_dmabuf == null) {
-        std.debug.print("scrgo: GPU renderer requested but linux-dmabuf is unavailable; falling back to CPU\n", .{});
+        log.warn(.gpu, "linux-dmabuf unavailable, falling back to cpu", .{});
     }
 
     // ── Phase 2: wait for font (overlapped with Wayland init) ──
@@ -193,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
     const atlas_ref_ptr = atlas_thread.atlas_ref;
     state.refs.atlas_ref = atlas_ref_ptr;
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: font ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        log.info(.atlas, "font ready", .{});
     }
 
     var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
@@ -215,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
     defer pty.close();
 
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: PTY forked, {}x{} ({d:.1}ms)\n", .{ grid.cols, grid.rows, startup_timer.elapsedMs() });
+        log.info(.pty, "forked  cols={}  rows={}", .{ grid.cols, grid.rows });
     }
 
     var term: terminal_mod.Terminal = undefined;
@@ -229,27 +229,27 @@ pub fn main(init: std.process.Init) !void {
         return error.BootstrapFailed;
     }
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: atlas ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        log.info(.atlas, "ready", .{});
     }
 
     if (wl.shm) |shm| {
-        cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |err| {
-            std.debug.print("scrgo: cpu renderer start failed: {}\n", .{err});
+        cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |e| {
+            log.err(.cpu, "start failed  err={s}", .{@errorName(e)});
         };
     }
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: cpu started ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        log.info(.cpu, "started", .{});
     }
 
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
-        gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |err| {
-            std.debug.print("scrgo: gpu renderer initial configure failed: {}\n", .{err});
+        gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |e| {
+            log.err(.gpu, "initial configure failed  err={s}", .{@errorName(e)});
             gpu.stop();
             state.render.gpu_restart.scheduleRetry();
         };
         if (state.debug.renderer_debug.startup) {
-            std.debug.print("scrgo: gpu renderer configured ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+            log.info(.gpu, "configured", .{});
         }
     } else if (gpu.active) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
@@ -311,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
     const drain_timeout_ns: u64 = 250 * std.time.ns_per_ms;
 
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: main loop entry ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        log.info(.main, "loop entry", .{});
     }
 
     main_loop: while (!wl.closed) {
@@ -331,7 +331,7 @@ pub fn main(init: std.process.Init) !void {
             draining = true;
             drain_deadline_ns = monotonicNowNs() + drain_timeout_ns;
             if (state.debug.renderer_debug.startup) {
-                std.debug.print("scrgo: child exited, draining final frame ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                log.info(.main, "child exited, draining final frame", .{});
             }
         }
 
@@ -345,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
             if (painted and renderers_idle) break;
             if (monotonicNowNs() >= drain_deadline_ns) {
                 if (state.debug.renderer_debug.startup) {
-                    std.debug.print("scrgo: drain timed out ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                    log.warn(.main, "drain timed out", .{});
                 }
                 break;
             }
@@ -353,20 +353,20 @@ pub fn main(init: std.process.Init) !void {
 
         if (!gpu.active and state.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and state.render.gpu_restart.due()) {
             gpu.start() catch |err| {
-                std.debug.print("scrgo: gpu renderer restart failed: {}\n", .{err});
+                log.err(.gpu, "restart failed: {}", .{err});
                 state.render.gpu_restart.scheduleRetry();
                 continue;
             };
             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
             if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                std.debug.print("scrgo: restarting gpu renderer ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                log.info(.gpu, "restarting", .{});
             }
             state.render.gpu_restart.deadline_ns = null;
         }
 
         while (!wl.prepareRead()) {
             wl.dispatchPending() catch {
-                std.debug.print("scrgo: wayland dispatchPending failed before poll, exiting\n", .{});
+                log.err(.wayland, "dispatchPending failed before poll, exiting", .{});
                 break :main_loop;
             };
         }
@@ -375,7 +375,7 @@ pub fn main(init: std.process.Init) !void {
             state.render.gpu_reconfigure_requested = false;
             if (gpu.active and gpu.context_ready) {
                 gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |err| {
-                    std.debug.print("scrgo: gpu renderer reconfigure failed: {}\n", .{err});
+                    log.err(.gpu, "reconfigure failed: {}", .{err});
                     render_loop.noteGpuUnavailable(&state);
                     continue;
                 };
@@ -414,21 +414,21 @@ pub fn main(init: std.process.Init) !void {
         }
         if (poll_rc < 0) {
             wl.cancelRead();
-            std.debug.print("scrgo: poll failed, exiting\n", .{});
+            log.err(.main, "poll failed, exiting", .{});
             break;
         }
 
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.readEvents() catch {
                 wl.cancelRead();
-                std.debug.print("scrgo: wayland readEvents failed, exiting\n", .{});
+                log.err(.wayland, "readEvents failed, exiting", .{});
                 break;
             };
         } else {
             wl.cancelRead();
         }
         wl.dispatchPending() catch {
-            std.debug.print("scrgo: wayland dispatchPending failed, exiting\n", .{});
+            log.err(.wayland, "dispatchPending failed, exiting", .{});
             break :main_loop;
         };
 
@@ -438,28 +438,28 @@ pub fn main(init: std.process.Init) !void {
                 switch (resp.tag) {
                     .context_ready => {
                         if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                            std.debug.print("scrgo: gpu renderer context ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                            log.info(.gpu, "context ready", .{});
                         }
                         if (gpu.atlas_ref == null) {
                             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
                         }
-                        gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |err| {
-                            std.debug.print("scrgo: gpu renderer configure after context_ready failed: {}\n", .{err});
+                        gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |e| {
+                            log.err(.gpu, "configure after context_ready failed  err={s}", .{@errorName(e)});
                             render_loop.noteGpuUnavailable(&state);
                             continue;
                         };
                     },
                     .ready => {
                         if (wl.linux_dmabuf) |linux_dmabuf| {
-                            gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |err| {
-                                std.debug.print("scrgo: GPU dmabuf import failed: {}\n", .{err});
+                            gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |e| {
+                                log.err(.gpu, "dmabuf import failed  err={s}", .{@errorName(e)});
                                 render_loop.noteGpuUnavailable(&state);
                                 continue;
                             };
                             state.render.gpu_snapshot_dirty = true;
                             state.render.gpu_restart.clear();
                             if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                                std.debug.print("scrgo: gpu renderer ready ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                                log.info(.gpu, "ready", .{});
                             }
                         } else {
                             render_loop.noteGpuUnavailable(&state);
@@ -470,11 +470,9 @@ pub fn main(init: std.process.Init) !void {
                             // Target switched away from gpu; drop this frame.
                             state.diag.recordCommit('d');
                         } else {
+                            log.setFrame(.frame, resp.serial);
                             if (state.debug.renderer_debug.renderers) {
-                                std.debug.print("scrgo: gpu renderer frame ready buffer={} ({d:.1}ms)\n", .{
-                                    resp.buffer_index,
-                                    startup_timer.elapsedMs(),
-                                });
+                                log.info(.gpu, "frame ready  buffer={}", .{resp.buffer_index});
                             }
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
                                 // Commit immediately. If the compositor
@@ -490,13 +488,13 @@ pub fn main(init: std.process.Init) !void {
                                 if (!wl.frame_pending) wl.requestFrame();
                                 if (state.render.active_render_path != .gpu) {
                                     if (state.debug.renderer_debug.frames) {
-                                        std.debug.print("scrgo: switching render path cpu->gpu\n", .{});
+                                        log.info(.frame, "path switch  from=cpu  to=gpu", .{});
                                     }
                                     state.render.active_render_path = .gpu;
                                 }
                                 if (!gpu.first_frame_presented) {
                                     if (state.debug.renderer_debug.frames or state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                                        std.debug.print("scrgo: first gpu renderer paint ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+                                        log.info(.gpu, "first paint", .{});
                                     }
                                     gpu.first_frame_presented = true;
                                 }
@@ -518,7 +516,7 @@ pub fn main(init: std.process.Init) !void {
                         state.render.gpu_snapshot_dirty = true;
                     },
                     .failed => {
-                        std.debug.print("scrgo: gpu renderer failed\n", .{});
+                        log.err(.gpu, "render failed", .{});
                         render_loop.noteGpuUnavailable(&state);
                     },
                 }
@@ -540,24 +538,21 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommit('c');
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
+                            log.setFrame(.frame, resp.serial);
                             if (state.debug.renderer_debug.frames) {
-                                std.debug.print("scrgo: cpu renderer frame committed buffer={} ({d:.1}ms)\n", .{
-                                    resp.buffer_index,
-                                    state.diag.elapsedMs(),
-                                });
+                                log.info(.cpu, "frame committed  buffer={}", .{resp.buffer_index});
                             }
                             render_loop.markFirstContentPaint(&state);
                         } else if (state.debug.renderer_debug.frames) {
                             const reason: []const u8 = if (!buffer_ok)
-                                "bad buffer index"
+                                "bad_buffer_index"
                             else if (!path_ok)
-                                "active path is gpu"
+                                "active_path_is_gpu"
                             else
-                                "size mismatch";
-                            std.debug.print("scrgo: cpu renderer frame dropped buffer={} ({s}) ({d:.1}ms)\n", .{
+                                "size_mismatch";
+                            log.warn(.cpu, "frame dropped  buffer={}  reason={s}", .{
                                 resp.buffer_index,
                                 reason,
-                                state.diag.elapsedMs(),
                             });
                         }
                         // Only clear dirty if no new PTY data arrived
@@ -579,7 +574,7 @@ pub fn main(init: std.process.Init) !void {
                 switch (resp.tag) {
                     .updated => {
                         if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.atlas) {
-                            std.debug.print("scrgo: atlas owner applied {} codepoints pages+={}\n", .{
+                            log.info(.atlas, "applied  codepoints={}  added_pages={}", .{
                                 resp.requested_count,
                                 resp.added_pages,
                             });
@@ -587,7 +582,7 @@ pub fn main(init: std.process.Init) !void {
                         render_loop.markRenderDirty(&state);
                     },
                     .failed => {
-                        std.debug.print("scrgo: atlas owner update failed for {} codepoints\n", .{resp.requested_count});
+                        log.err(.atlas, "update failed  codepoints={}", .{resp.requested_count});
                     },
                     .font_ready, .bootstrap_ready => {},
                 }
@@ -613,11 +608,11 @@ pub fn main(init: std.process.Init) !void {
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
             while (true) {
                 const read_t0 = if (state.debug.renderer_debug.commits) monotonicNowNs() else 0;
-                const n = pty.read(&pty_buf) catch |err| switch (err) {
+                const n = pty.read(&pty_buf) catch |e| switch (e) {
                     error.WouldBlock => break,
                     else => {
                         if (state.debug.renderer_debug.startup or state.debug.renderer_debug.pty) {
-                            std.debug.print("scrgo: PTY read failed: {}, exiting\n", .{err});
+                            log.err(.pty, "read failed, exiting  err={s}", .{@errorName(e)});
                         }
                         child_exited = true;
                         break;
@@ -625,13 +620,13 @@ pub fn main(init: std.process.Init) !void {
                 };
                 if (n == 0) {
                     if (state.debug.renderer_debug.startup or state.debug.renderer_debug.pty) {
-                        std.debug.print("scrgo: PTY EOF/EIO, exiting\n", .{});
+                        log.info(.pty, "eof, exiting", .{});
                     }
                     child_exited = true;
                     break;
                 }
                 if (state.debug.renderer_debug.pty) {
-                    std.debug.print("scrgo: PTY read {} bytes ({d:.1}ms)\n", .{ n, state.diag.elapsedMs() });
+                    log.info(.pty, "read  bytes={}", .{n});
                 }
                 if (state.debug.renderer_debug.commits) {
                     state.diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
@@ -655,7 +650,7 @@ pub fn main(init: std.process.Init) !void {
         if (!child_exited) {
             if (pty.checkChild()) |status| {
                 if (state.debug.renderer_debug.startup or state.debug.renderer_debug.pty) {
-                    std.debug.print("scrgo: PTY child exited status={}, exiting\n", .{status});
+                    log.info(.pty, "child exited, exiting  status={}", .{status});
                 }
                 child_exited = true;
                 if (state.debug.renderer_debug.commits and state.diag.t_child_exited_ns == 0) {
@@ -674,7 +669,7 @@ pub fn main(init: std.process.Init) !void {
         state.diag.t_main_loop_exit_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
     }
     if (state.debug.renderer_debug.startup) {
-        std.debug.print("scrgo: main loop exit ({d:.1}ms)\n", .{startup_timer.elapsedMs()});
+        log.info(.main, "loop exit", .{});
     }
     state.diag.dumpExitReport(.{
         .wl_closed = wl.closed,

@@ -3,6 +3,7 @@ const app_state = @import("app_state.zig");
 const diagnostics = @import("diagnostics.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
+const log = @import("log.zig");
 
 const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 
@@ -105,7 +106,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
         if (s.debug.warn_slow_budget_ms) |budget_ms| {
             const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
             if (starvation_ns > budget_ns) {
-                std.debug.print("scrgo: buffer starvation {d:.1}ms (budget {}ms) — compositor hadn't released a dmabuf\n", .{
+                log.warn(.frame, "buffer starvation  elapsed_ms={d:.1}  budget_ms={}  reason=compositor_holding_dmabuf", .{
                     @as(f64, @floatFromInt(starvation_ns)) / @as(f64, std.time.ns_per_ms),
                     budget_ms,
                 });
@@ -113,8 +114,9 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
         }
         s.render.buffer_starvation_start_ns = 0;
     }
+    log.setFrame(.frame, s.render.render_serial);
     if (s.debug.renderer_debug.renderers) {
-        std.debug.print("scrgo: queued gpu renderer frame serial={}\n", .{s.render.render_serial});
+        log.info(.frame, "queued gpu frame", .{});
     }
     s.render.gpu_snapshot_dirty = false;
 }
@@ -149,8 +151,9 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             else => return,
         };
         s.render.needs_redraw = false;
+        log.setFrame(.frame, s.render.render_serial);
         if (s.debug.renderer_debug.frames) {
-            std.debug.print("scrgo: queue cpu renderer frame {}x{} ({d:.1}ms)\n", .{ wl.width, wl.height, s.diag.elapsedMs() });
+            log.info(.frame, "queued cpu frame  width={}  height={}", .{ wl.width, wl.height });
         }
         return;
     }
@@ -160,7 +163,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
 pub fn noteGpuUnavailable(s: *app_state.AppState) void {
     s.refs.gpu.stop();
     if (s.debug.renderer_debug.renderers) {
-        std.debug.print("scrgo: gpu renderer unavailable, switching to cpu renderer and scheduling restart\n", .{});
+        log.warn(.gpu, "unavailable, switching to cpu and scheduling restart", .{});
     }
     if (s.render.active_render_path == .gpu) {
         s.render.active_render_path = .cpu;

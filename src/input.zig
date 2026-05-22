@@ -7,6 +7,7 @@ const clipboard_mod = @import("clipboard.zig");
 const wayland_mod = @import("wayland.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
+const log = @import("log.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -467,10 +468,10 @@ fn expandWordLive(cell: selection_mod.Cell, cols: u16, row_cp_buf: *[render_snap
 fn debugKillActiveRenderer() void {
     if (state.render.active_render_path == .gpu and state.refs.gpu.active) {
         render_loop.noteGpuUnavailable(state);
-        std.debug.print("scrgo: debug: killed gpu renderer\n", .{});
+        log.info(.input, "debug killed  target=gpu", .{});
     } else if (state.refs.cpu.active) {
         state.refs.cpu.stop();
-        std.debug.print("scrgo: debug: killed cpu renderer\n", .{});
+        log.info(.input, "debug killed  target=cpu", .{});
     }
 }
 
@@ -479,11 +480,11 @@ fn debugSwapRenderer() void {
         state.render.target_render_path = .cpu;
         state.render.active_render_path = .cpu;
         state.render.needs_redraw = true;
-        std.debug.print("scrgo: debug: target renderer -> cpu\n", .{});
+        log.info(.input, "debug target  renderer=cpu", .{});
     } else {
         state.render.target_render_path = .gpu;
         state.render.gpu_snapshot_dirty = true;
-        std.debug.print("scrgo: debug: target renderer -> gpu\n", .{});
+        log.info(.input, "debug target  renderer=gpu", .{});
     }
 }
 
@@ -493,7 +494,7 @@ fn debugClearAtlas() void {
     // change by allocating a fresh TextAtlas init from scratch using the
     // current atlas's font config bytes.
     render_loop.markRenderDirty(state);
-    std.debug.print("scrgo: debug: atlas clear (no-op in 0.4.x)\n", .{});
+    log.info(.input, "debug atlas clear  status=noop", .{});
 }
 
 fn keysymToGhosttyKey(keysym: u32) c_uint {
