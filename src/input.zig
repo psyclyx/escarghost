@@ -38,6 +38,20 @@ const BTN_MIDDLE: u32 = 0x112;
 /// Hover detection: pointer is within this many pixels of the right edge.
 const SCROLLBAR_HOVER_WIDTH: f64 = 16.0;
 
+/// Velocity smoothing across motion samples. 0 = no smoothing
+/// (each sample replaces the velocity), 1 = no update.
+const TOUCH_VELOCITY_EWMA: f64 = 0.65;
+/// A motion gap longer than this kills the velocity sample —
+/// otherwise a finger that stalled before release would still flick.
+const TOUCH_VELOCITY_STALL_MS: i64 = 80;
+/// Friction applied to the fling integrator each second (lines/s²).
+const TOUCH_FLING_DECEL: f64 = 14.0;
+/// Stop the fling once |velocity| drops below this many lines/sec.
+const TOUCH_FLING_MIN_LPS: f64 = 1.5;
+/// Cap on initial fling speed so a fast flick doesn't catapult
+/// past the scrollback.
+const TOUCH_FLING_MAX_LPS: f64 = 80.0;
+
 pub fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
@@ -220,6 +234,228 @@ pub fn onMouse(ev: wayland_mod.MouseEvent) void {
             }
         },
     }
+}
+
+pub fn onTouch(ev: wayland_mod.TouchEvent) void {
+    var ts = &state.input.touch;
+    const now = nowMs();
+    switch (ev.kind) {
+        .down => {
+            // Only track the first finger; secondary touches are
+            // ignored until the active one lifts. A new touch always
+            // kills any in-progress fling — direct manipulation wins.
+            cancelFling();
+            if (ts.active_id != null) return;
+            ts.active_id = ev.id;
+            ts.down_x = ev.x;
+            ts.down_y = ev.y;
+            ts.down_ms = now;
+            ts.last_x = ev.x;
+            ts.last_y = ev.y;
+            ts.last_motion_ms = now;
+            ts.mode = .undecided;
+            ts.scroll_residual_lines = 0;
+            ts.velocity_y_px_per_ms = 0;
+            // A tap reveals the scrollbar (it'll fade on the regular
+            // timer) so the user knows where in scrollback they are.
+            render_loop.bumpScrollbarVisibility(state);
+            render_loop.markRenderDirty(state);
+        },
+        .motion => {
+            const active = ts.active_id orelse return;
+            if (ev.id != active) return;
+            const dy = ev.y - ts.last_y;
+            const dt_ms_raw = now - ts.last_motion_ms;
+            const dt_ms: f64 = if (dt_ms_raw > 0) @floatFromInt(dt_ms_raw) else 1.0;
+
+            if (ts.mode == .undecided) {
+                const ddx = ev.x - ts.down_x;
+                const ddy = ev.y - ts.down_y;
+                const drift_sq = ddx * ddx + ddy * ddy;
+                const limit = @as(f64, state.input.touch_cfg.drift_px);
+                if (drift_sq > limit * limit) {
+                    ts.mode = .scroll;
+                } else if (now - ts.down_ms >= @as(i64, @intCast(state.input.touch_cfg.long_press_ms))) {
+                    promoteToSelect();
+                }
+            }
+
+            switch (ts.mode) {
+                .undecided => {},
+                .scroll => {
+                    // Natural-scroll convention: finger moves down →
+                    // viewport scrolls toward older lines (negative).
+                    if (state.metrics.cell_height > 0) {
+                        ts.scroll_residual_lines += -dy / state.metrics.cell_height;
+                        const whole = @trunc(ts.scroll_residual_lines);
+                        if (whole != 0) {
+                            const lines: isize = @intFromFloat(whole);
+                            state.refs.term.scrollViewport(lines);
+                            ts.scroll_residual_lines -= whole;
+                            render_loop.bumpScrollbarVisibility(state);
+                            render_loop.markRenderDirty(state);
+                        }
+                    }
+                    // EWMA velocity in px/ms (signed: finger-down +y).
+                    const sample = dy / dt_ms;
+                    if (dt_ms_raw > TOUCH_VELOCITY_STALL_MS) {
+                        ts.velocity_y_px_per_ms = sample;
+                    } else {
+                        ts.velocity_y_px_per_ms = TOUCH_VELOCITY_EWMA * ts.velocity_y_px_per_ms + (1.0 - TOUCH_VELOCITY_EWMA) * sample;
+                    }
+                },
+                .select => {
+                    const cell = pixelToCell(ev.x, ev.y) orelse return;
+                    state.input.selection.updateDrag(cell);
+                    render_loop.markRenderDirty(state);
+                },
+            }
+
+            ts.last_x = ev.x;
+            ts.last_y = ev.y;
+            ts.last_motion_ms = now;
+        },
+        .up => {
+            const active = ts.active_id orelse return;
+            if (ev.id != active) return;
+            switch (ts.mode) {
+                .select => {
+                    const had_selection = state.input.selection.range != null;
+                    state.input.selection.endDrag();
+                    if (had_selection and state.input.selection.range != null) {
+                        copyToPrimary();
+                    }
+                    render_loop.markRenderDirty(state);
+                },
+                .scroll => {
+                    if (state.input.touch_cfg.momentum) startFling();
+                },
+                .undecided => {
+                    // Quick tap — nothing to do.
+                },
+            }
+            ts.active_id = null;
+            ts.mode = .undecided;
+        },
+        .cancel => {
+            cancelTouch();
+        },
+    }
+}
+
+fn cancelTouch() void {
+    var ts = &state.input.touch;
+    if (ts.mode == .select) {
+        // Don't commit a partial selection from a compositor-cancelled
+        // touch; clear the in-progress range.
+        state.input.selection.clear();
+        render_loop.markRenderDirty(state);
+    }
+    ts.active_id = null;
+    ts.mode = .undecided;
+    cancelFling();
+}
+
+fn cancelFling() void {
+    var ts = &state.input.touch;
+    ts.fling_lines_per_s = 0;
+    ts.fling_residual_lines = 0;
+    ts.fling_last_tick_ns = 0;
+}
+
+fn promoteToSelect() void {
+    var ts = &state.input.touch;
+    const cell = pixelToCell(ts.last_x, ts.last_y) orelse return;
+    state.input.selection.beginPrimary(cell, false, nowMs());
+    ts.mode = .select;
+    render_loop.markRenderDirty(state);
+}
+
+fn startFling() void {
+    var ts = &state.input.touch;
+    // A stalled finger at release has near-zero velocity already, but
+    // also kill it explicitly if the last motion is too stale.
+    if (nowMs() - ts.last_motion_ms > TOUCH_VELOCITY_STALL_MS) return;
+    if (state.metrics.cell_height <= 0) return;
+    // px/ms → px/s → lines/s; flip sign for natural-scroll.
+    var lps = -ts.velocity_y_px_per_ms * 1000.0 / state.metrics.cell_height;
+    if (lps > TOUCH_FLING_MAX_LPS) lps = TOUCH_FLING_MAX_LPS;
+    if (lps < -TOUCH_FLING_MAX_LPS) lps = -TOUCH_FLING_MAX_LPS;
+    if (@abs(lps) < TOUCH_FLING_MIN_LPS) return;
+    ts.fling_lines_per_s = lps;
+    ts.fling_residual_lines = 0;
+    ts.fling_last_tick_ns = 0;
+    render_loop.bumpScrollbarVisibility(state);
+    render_loop.markRenderDirty(state);
+}
+
+/// Called once per main-loop iteration. Promotes an undecided touch
+/// to select-mode once the long-press threshold has passed (even
+/// without a fresh motion event, so a perfectly still finger still
+/// triggers selection on simulated mouse input).
+pub fn tickTouch() void {
+    const ts = &state.input.touch;
+    if (ts.active_id == null) return;
+    if (ts.mode != .undecided) return;
+    if (nowMs() - ts.down_ms >= @as(i64, @intCast(state.input.touch_cfg.long_press_ms))) {
+        promoteToSelect();
+    }
+}
+
+/// Called once per main-loop iteration. Advances the fling
+/// integrator and forwards whole-line steps to the terminal; the
+/// fractional residual carries over so smooth motion survives
+/// frame-rate jitter. Marks the frame dirty as long as the fling is
+/// alive so the loop keeps presenting.
+pub fn tickFling() void {
+    var ts = &state.input.touch;
+    if (ts.fling_lines_per_s == 0) return;
+    const now_ns = diagnostics.monotonicNowNs();
+    if (ts.fling_last_tick_ns == 0) {
+        ts.fling_last_tick_ns = now_ns;
+        return;
+    }
+    const dt_s = @as(f64, @floatFromInt(now_ns - ts.fling_last_tick_ns)) / @as(f64, std.time.ns_per_s);
+    ts.fling_last_tick_ns = now_ns;
+
+    const sign: f64 = if (ts.fling_lines_per_s > 0) 1.0 else -1.0;
+    const speed = @abs(ts.fling_lines_per_s) - TOUCH_FLING_DECEL * dt_s;
+    if (speed < TOUCH_FLING_MIN_LPS) {
+        cancelFling();
+        return;
+    }
+    ts.fling_lines_per_s = sign * speed;
+
+    ts.fling_residual_lines += ts.fling_lines_per_s * dt_s;
+    const whole = @trunc(ts.fling_residual_lines);
+    if (whole != 0) {
+        const lines: isize = @intFromFloat(whole);
+        state.refs.term.scrollViewport(lines);
+        ts.fling_residual_lines -= whole;
+        render_loop.bumpScrollbarVisibility(state);
+    }
+    render_loop.markRenderDirty(state);
+}
+
+/// Poll-timeout hook: returns ms until the next gesture-driven
+/// wakeup, or null when neither the long-press timer nor a fling
+/// needs the loop to spin.
+pub fn touchTimeoutMs() ?c_int {
+    const ts = &state.input.touch;
+    var soonest: ?c_int = null;
+    if (ts.active_id != null and ts.mode == .undecided) {
+        const elapsed = nowMs() - ts.down_ms;
+        const remaining = @as(i64, @intCast(state.input.touch_cfg.long_press_ms)) - elapsed;
+        const ms: c_int = if (remaining <= 0) 0 else @intCast(@min(remaining, @as(i64, std.math.maxInt(c_int))));
+        soonest = ms;
+    }
+    if (ts.fling_lines_per_s != 0) {
+        // Vsync-pace the fling integrator: 16ms is the worst case
+        // for a 60Hz frame loop, but a frame_done arrival will wake
+        // us earlier.
+        soonest = if (soonest) |s| @min(s, @as(c_int, 16)) else 16;
+    }
+    return soonest;
 }
 
 pub fn onResize(w: u32, h: u32) void {

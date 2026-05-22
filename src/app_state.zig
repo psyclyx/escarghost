@@ -130,6 +130,53 @@ pub const InputState = struct {
     /// Tracks whether the previous render observed a visible scrollbar.
     /// Lets the hide-timeout know whether it still needs to redirty.
     scrollbar_was_visible: bool = false,
+    touch: TouchState = .{},
+    touch_cfg: TouchConfig = .{},
+};
+
+/// Tunables for the touch gesture handler. Copied from `config.zig`
+/// at startup so the gesture code can read them without reaching
+/// back through Refs.
+pub const TouchConfig = struct {
+    momentum: bool = true,
+    long_press_ms: u32 = 400,
+    drift_px: f32 = 8.0,
+};
+
+/// Touch gesture state. A single finger is tracked at a time —
+/// secondary touches that land while `active_id` is set are dropped.
+/// Gesture resolution is one of:
+///   undecided → starting state; promotes to .scroll on first motion
+///               past `drift_px` or to .select once long-press elapses
+///   scroll    → finger Δy translates into viewport scrolling; at
+///               touch-up, captured velocity feeds the fling integrator
+///   select    → drag extends the active selection range
+pub const TouchState = struct {
+    /// Compositor slot id of the active finger, or null when idle.
+    /// Sim mode always uses id 0.
+    active_id: ?i32 = null,
+    down_x: f64 = 0,
+    down_y: f64 = 0,
+    /// Monotonic ms (our clock) at touch-down. Drives long-press timing.
+    down_ms: i64 = 0,
+    last_x: f64 = 0,
+    last_y: f64 = 0,
+    last_motion_ms: i64 = 0,
+    mode: enum { undecided, scroll, select } = .undecided,
+    /// Sub-line scroll accumulator during a .scroll-mode drag.
+    /// Whole-line steps get forwarded to the terminal; the remainder
+    /// is kept so a slow drag still produces smooth motion.
+    scroll_residual_lines: f64 = 0,
+    /// EWMA-smoothed Y velocity (px/ms, signed). Captured at touch-up
+    /// to seed the fling integrator.
+    velocity_y_px_per_ms: f64 = 0,
+    /// Active fling integrator (0 means no fling running). Sign
+    /// matches scrollViewport's: positive = scroll toward newest.
+    fling_lines_per_s: f64 = 0,
+    fling_residual_lines: f64 = 0,
+    /// Monotonic-ns timestamp of the last fling tick; 0 = freshly
+    /// armed, advance from this iteration's clock without integrating.
+    fling_last_tick_ns: u64 = 0,
 };
 
 /// Drain-phase tracking. After the PTY child exits we keep looping

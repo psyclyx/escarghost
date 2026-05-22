@@ -64,6 +64,21 @@ pub const MouseEvent = struct {
     mods: Mods = .{},
 };
 
+/// One slot from wl_touch. Coordinates are surface-local pixels
+/// (already converted from Wayland's 24.8 fixed-point form). `id` is
+/// the compositor's slot identifier — a single finger keeps the same
+/// id between down/motion/up. `time_ms` is the low 32 bits of the
+/// compositor's monotonic millisecond clock; comparisons must be
+/// modulo-wrapped, but for gesture timing on the order of seconds we
+/// can read it as a plain u32.
+pub const TouchEvent = struct {
+    kind: enum { down, up, motion, cancel },
+    id: i32 = 0,
+    x: f64 = 0,
+    y: f64 = 0,
+    time_ms: u32 = 0,
+};
+
 pub const Wayland = struct {
     display: *wl.wl_display,
     registry: *wl.wl_registry,
@@ -72,6 +87,7 @@ pub const Wayland = struct {
     seat: ?*wl.wl_seat = null,
     keyboard: ?*wl.wl_keyboard = null,
     pointer: ?*wl.wl_pointer = null,
+    touch: ?*wl.wl_touch = null,
     decoration_manager: ?*wl.zxdg_decoration_manager_v1 = null,
     viewporter: ?*wl.wp_viewporter = null,
     single_pixel_buffer_manager: ?*wl.wp_single_pixel_buffer_manager_v1 = null,
@@ -134,9 +150,20 @@ pub const Wayland = struct {
     pointer_y: f64 = 0,
     pointer_in_surface: bool = false,
 
+    /// When true (SCRGO_TOUCH_SIMULATE=1), BTN_LEFT press/motion/release
+    /// route to `on_touch` instead of `on_mouse`. Wheel scrolls and
+    /// other buttons keep the normal mouse path so dev sessions can
+    /// still middle-click-paste and wheel-scroll.
+    touch_simulate: bool = false,
+    /// Set between BTN_LEFT press and release while simulating, so
+    /// pointer motion only emits synthetic touch motion events when a
+    /// "finger" is actually down.
+    pointer_simulating_down: bool = false,
+
     // Callbacks
     on_key: ?*const fn (KeyEvent) void = null,
     on_mouse: ?*const fn (MouseEvent) void = null,
+    on_touch: ?*const fn (TouchEvent) void = null,
     on_resize: ?*const fn (u32, u32) void = null,
     on_focus: ?*const fn (bool) void = null,
 
@@ -147,6 +174,7 @@ pub const Wayland = struct {
         self.seat = null;
         self.keyboard = null;
         self.pointer = null;
+        self.touch = null;
         self.decoration_manager = null;
         self.viewporter = null;
         self.single_pixel_buffer_manager = null;
@@ -192,8 +220,11 @@ pub const Wayland = struct {
         self.repeat_deadline_ns = 0;
         self.on_key = null;
         self.on_mouse = null;
+        self.on_touch = null;
         self.on_resize = null;
         self.on_focus = null;
+        self.touch_simulate = false;
+        self.pointer_simulating_down = false;
         self.width = width;
         self.height = height;
 
@@ -342,6 +373,7 @@ pub const Wayland = struct {
         if (self.primary_selection_manager) |mgr| wl.zwp_primary_selection_device_manager_v1_destroy(mgr);
         if (self.data_device) |d| wl.wl_data_device_destroy(d);
         if (self.data_device_manager) |mgr| wl.wl_data_device_manager_destroy(mgr);
+        if (self.touch) |t| wl.wl_touch_destroy(t);
         if (self.pointer) |p| wl.wl_pointer_destroy(p);
         if (self.keyboard) |k| wl.wl_keyboard_destroy(k);
 
@@ -644,6 +676,12 @@ pub const Wayland = struct {
                 }
             }
         }
+        if (caps & wl.WL_SEAT_CAPABILITY_TOUCH != 0 and self.touch == null) {
+            self.touch = wl.wl_seat_get_touch(seat);
+            if (self.touch) |t| {
+                _ = wl.wl_touch_add_listener(t, &touch_listener, @ptrCast(self));
+            }
+        }
     }
 
     fn seatName(_: ?*anyopaque, _: ?*wl.wl_seat, _: [*c]const u8) callconv(.c) void {}
@@ -807,6 +845,17 @@ pub const Wayland = struct {
         .axis_relative_direction = pointerAxisRelativeDirection,
     };
 
+    /// Compositor-style timestamp in milliseconds. wl_touch.time is the
+    /// low 32 bits of the compositor's monotonic ms clock; we don't
+    /// need to match that exactly when synthesizing touch from the
+    /// pointer path, only to be monotonic and ms-resolution.
+    fn touchTimeMs() u32 {
+        var ts: time_c.struct_timespec = undefined;
+        if (time_c.clock_gettime(time_c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+        const total_ms: u64 = @as(u64, @intCast(ts.tv_sec)) * 1000 + @as(u64, @intCast(ts.tv_nsec)) / 1_000_000;
+        return @truncate(total_ms);
+    }
+
     fn pointerEnter(data: ?*anyopaque, _: ?*wl.wl_pointer, serial: u32, _: ?*wl.wl_surface, sx: i32, sy: i32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.last_input_serial = serial;
@@ -819,6 +868,7 @@ pub const Wayland = struct {
         if (self.cursor_shape_device) |device| {
             wl.wp_cursor_shape_device_v1_set_shape(device, serial, wl.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
         }
+        if (self.touch_simulate) return;
         if (self.on_mouse) |cb| cb(.{
             .kind = .enter,
             .x = self.pointer_x,
@@ -830,6 +880,13 @@ pub const Wayland = struct {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.last_input_serial = serial;
         self.pointer_in_surface = false;
+        if (self.touch_simulate) {
+            if (self.pointer_simulating_down) {
+                self.pointer_simulating_down = false;
+                if (self.on_touch) |cb| cb(.{ .kind = .cancel });
+            }
+            return;
+        }
         if (self.on_mouse) |cb| cb(.{
             .kind = .leave,
             .x = self.pointer_x,
@@ -842,6 +899,18 @@ pub const Wayland = struct {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.pointer_x = @as(f64, @floatFromInt(sx)) / 256.0;
         self.pointer_y = @as(f64, @floatFromInt(sy)) / 256.0;
+        if (self.touch_simulate) {
+            if (self.pointer_simulating_down) {
+                if (self.on_touch) |cb| cb(.{
+                    .kind = .motion,
+                    .id = 0,
+                    .x = self.pointer_x,
+                    .y = self.pointer_y,
+                    .time_ms = touchTimeMs(),
+                });
+            }
+            return;
+        }
         if (self.on_mouse) |cb| cb(.{
             .kind = .motion,
             .x = self.pointer_x,
@@ -853,6 +922,31 @@ pub const Wayland = struct {
     fn pointerButton(data: ?*anyopaque, _: ?*wl.wl_pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.last_input_serial = serial;
+        // BTN_LEFT in sim mode drives a synthetic touch slot; other
+        // buttons fall through to the mouse path so middle-click paste
+        // still works during dev.
+        const BTN_LEFT: u32 = 0x110;
+        if (self.touch_simulate and button == BTN_LEFT) {
+            const pressed = state == wl.WL_POINTER_BUTTON_STATE_PRESSED;
+            if (pressed and !self.pointer_simulating_down) {
+                self.pointer_simulating_down = true;
+                if (self.on_touch) |cb| cb(.{
+                    .kind = .down,
+                    .id = 0,
+                    .x = self.pointer_x,
+                    .y = self.pointer_y,
+                    .time_ms = touchTimeMs(),
+                });
+            } else if (!pressed and self.pointer_simulating_down) {
+                self.pointer_simulating_down = false;
+                if (self.on_touch) |cb| cb(.{
+                    .kind = .up,
+                    .id = 0,
+                    .time_ms = touchTimeMs(),
+                });
+            }
+            return;
+        }
         if (self.on_mouse) |cb| cb(.{
             .kind = if (state == wl.WL_POINTER_BUTTON_STATE_PRESSED) .button_press else .button_release,
             .button = button,
@@ -881,6 +975,49 @@ pub const Wayland = struct {
     fn pointerAxisDiscrete(_: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, _: i32) callconv(.c) void {}
     fn pointerAxisValue120(_: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, _: i32) callconv(.c) void {}
     fn pointerAxisRelativeDirection(_: ?*anyopaque, _: ?*wl.wl_pointer, _: u32, _: u32) callconv(.c) void {}
+
+    // ── wl_touch ──
+
+    const touch_listener = wl.wl_touch_listener{
+        .down = touchDown,
+        .up = touchUp,
+        .motion = touchMotion,
+        .frame = touchFrame,
+        .cancel = touchCancel,
+        .shape = touchShape,
+        .orientation = touchOrientation,
+    };
+
+    fn touchDown(data: ?*anyopaque, _: ?*wl.wl_touch, serial: u32, time: u32, _: ?*wl.wl_surface, id: i32, sx: i32, sy: i32) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        self.last_input_serial = serial;
+        const x = @as(f64, @floatFromInt(sx)) / 256.0;
+        const y = @as(f64, @floatFromInt(sy)) / 256.0;
+        if (self.on_touch) |cb| cb(.{ .kind = .down, .id = id, .x = x, .y = y, .time_ms = time });
+    }
+
+    fn touchUp(data: ?*anyopaque, _: ?*wl.wl_touch, serial: u32, time: u32, id: i32) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        self.last_input_serial = serial;
+        if (self.on_touch) |cb| cb(.{ .kind = .up, .id = id, .time_ms = time });
+    }
+
+    fn touchMotion(data: ?*anyopaque, _: ?*wl.wl_touch, time: u32, id: i32, sx: i32, sy: i32) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        const x = @as(f64, @floatFromInt(sx)) / 256.0;
+        const y = @as(f64, @floatFromInt(sy)) / 256.0;
+        if (self.on_touch) |cb| cb(.{ .kind = .motion, .id = id, .x = x, .y = y, .time_ms = time });
+    }
+
+    fn touchFrame(_: ?*anyopaque, _: ?*wl.wl_touch) callconv(.c) void {}
+
+    fn touchCancel(data: ?*anyopaque, _: ?*wl.wl_touch) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        if (self.on_touch) |cb| cb(.{ .kind = .cancel });
+    }
+
+    fn touchShape(_: ?*anyopaque, _: ?*wl.wl_touch, _: i32, _: i32, _: i32) callconv(.c) void {}
+    fn touchOrientation(_: ?*anyopaque, _: ?*wl.wl_touch, _: i32, _: i32) callconv(.c) void {}
 
     // ── Frame callback ──
 

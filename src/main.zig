@@ -30,6 +30,23 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(ptr, 0);
 }
 
+/// Liberal truthy parse for boolean-shaped env vars. Empty/absent
+/// reads as false; "0"/"false"/"no"/"off" (any case) read as false;
+/// anything else reads as true.
+fn parseBool(v: ?[]const u8) bool {
+    const s = v orelse return false;
+    if (s.len == 0) return false;
+    var buf: [16]u8 = undefined;
+    if (s.len > buf.len) return true;
+    for (s, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    const lower = buf[0..s.len];
+    if (std.mem.eql(u8, lower, "0")) return false;
+    if (std.mem.eql(u8, lower, "false")) return false;
+    if (std.mem.eql(u8, lower, "no")) return false;
+    if (std.mem.eql(u8, lower, "off")) return false;
+    return true;
+}
+
 const monotonicNowNs = diagnostics.monotonicNowNs;
 
 pub fn main(init: std.process.Init) !void {
@@ -285,6 +302,12 @@ pub fn main(init: std.process.Init) !void {
     state.refs.clipboard = &clipboard;
     state.metrics.scroll_lines = cfg.scroll_lines;
     state.metrics.base_font_size = cfg.font_size;
+    state.input.touch_cfg = .{
+        .momentum = cfg.touch_momentum,
+        .long_press_ms = cfg.touch_long_press_ms,
+        .drift_px = cfg.touch_drift_px,
+    };
+    wl.touch_simulate = parseBool(getenv("SCRGO_TOUCH_SIMULATE"));
     state.render.needs_redraw = false;
     state.render.gpu_snapshot_dirty = false;
     state.render.gpu_reconfigure_requested = false;
@@ -302,6 +325,7 @@ pub fn main(init: std.process.Init) !void {
     input.bind(&state);
     wl.on_key = input.onKey;
     wl.on_mouse = input.onMouse;
+    wl.on_touch = input.onTouch;
     wl.on_resize = input.onResize;
     wl.on_focus = input.onFocus;
 
@@ -385,6 +409,8 @@ pub fn main(init: std.process.Init) !void {
 
         render_loop.maybeScheduleScrollbarHide(&state);
         render_loop.tickBell(&state);
+        input.tickTouch();
+        input.tickFling();
         render_loop.maybeQueueGpuFrame(&state);
         render_loop.renderActivePath(&state);
         wl.flush();
@@ -397,9 +423,16 @@ pub fn main(init: std.process.Init) !void {
             null;
         const scroll_timeout = render_loop.scrollbarTimeoutMs(&state);
         const bell_timeout = bell.visualTimeoutMs();
+        const touch_timeout = input.touchTimeoutMs();
         const poll_timeout = render_loop.combineTimeout(
-            render_loop.combineTimeout(render_loop.combineTimeout(repeat_timeout, restart_timeout), scroll_timeout),
-            bell_timeout,
+            render_loop.combineTimeout(
+                render_loop.combineTimeout(
+                    render_loop.combineTimeout(repeat_timeout, restart_timeout),
+                    scroll_timeout,
+                ),
+                bell_timeout,
+            ),
+            touch_timeout,
         );
 
         var pollfds = [_]c.struct_pollfd{

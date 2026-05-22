@@ -55,6 +55,19 @@ pub const Config = struct {
     // Scroll
     scroll_lines: u32 = 3, // lines per scroll event
 
+    // Touch input
+    /// Add a kinetic-scroll fling on touch-up (or on simulated-mouse
+    /// release). When false, scrolling stops the moment the finger
+    /// lifts.
+    touch_momentum: bool = true,
+    /// Milliseconds a finger must rest in place before a touch
+    /// becomes a selection drag rather than a scroll drag.
+    touch_long_press_ms: u32 = 400,
+    /// Maximum drift in pixels during the long-press window. Past
+    /// this the gesture commits to scroll, even if the timer would
+    /// have promoted it to select.
+    touch_drift_px: f32 = 8.0,
+
     // Bell behavior. mode=visual matches what users get without
     // touching config.
     bell: bell_mod.Config = .{},
@@ -331,6 +344,23 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
                 if (vv == .integer and vv.integer >= 0) cfg.bell.audible_debounce_ms = @intCast(vv.integer);
             }
         }
+    }
+
+    if (obj.get("touch_momentum")) |v| {
+        if (v == .bool) cfg.touch_momentum = v.bool;
+    }
+
+    if (obj.get("touch_long_press_ms")) |v| {
+        if (v == .integer and v.integer >= 0) cfg.touch_long_press_ms = @intCast(v.integer);
+    }
+
+    if (obj.get("touch_drift_px")) |v| {
+        const px: ?f32 = switch (v) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => null,
+        };
+        if (px) |p| cfg.touch_drift_px = p;
     }
 
     if (obj.get("gpu_restart_initial_delay_ms")) |v| {
