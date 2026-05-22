@@ -384,9 +384,9 @@ const DmabufAllocator = struct {
     }
 };
 
-// ── Frontend (main thread side) ──
+// ── GpuWorker (main thread side) ──
 
-pub const Frontend = struct {
+pub const GpuWorker = struct {
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
     /// eventfd the worker blocks on instead of `pthread_cond_wait`.
@@ -416,7 +416,7 @@ pub const Frontend = struct {
     buffer_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
     buffer_count: u8 = 0,
 
-    // Frontend-side state
+    // GpuWorker-side state
     buffers: [MaxBuffers]shared_dmabuf.FrontendBuffer = undefined,
     frontend_buffer_count: usize = 0,
 
@@ -426,20 +426,20 @@ pub const Frontend = struct {
     render_in_flight: bool = false,
     first_frame_presented: bool = false,
 
-    pub fn responseFd(self: *const Frontend) c_int {
+    pub fn responseFd(self: *const GpuWorker) c_int {
         return self.response_fds[0];
     }
 
     /// Wake the worker. eventfd accumulates writes into a counter and
     /// the worker's blocking read drains it; we never miss a signal
     /// even if we write twice between worker iterations.
-    fn signalWorker(self: *Frontend) void {
+    fn signalWorker(self: *GpuWorker) void {
         var v: u64 = 1;
         _ = c.write(self.request_event_fd, &v, @sizeOf(u64));
     }
 
     /// Start the GPU renderer thread. It immediately begins EGL init (no deps).
-    pub fn start(self: *Frontend) !void {
+    pub fn start(self: *GpuWorker) !void {
         if (self.active) return;
         self.* = .{};
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
@@ -461,13 +461,13 @@ pub const Frontend = struct {
         }
 
         self.active = true;
-        self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
+        self.thread = try std.Thread.spawn(.{}, GpuWorker.workerMain, .{self});
     }
 
     /// Provide the atlas ref after it is initialized.
     /// Must be called before requestConfigure.
     pub fn setSharedState(
-        self: *Frontend,
+        self: *GpuWorker,
         atlas_ref: *atlas_ref_mod.AtlasRef,
         atlas_thread: *atlas_owner.Frontend,
     ) void {
@@ -475,7 +475,7 @@ pub const Frontend = struct {
         self.atlas_thread = atlas_thread;
     }
 
-    pub fn requestConfigure(self: *Frontend, w: u32, h: u32, font_size: f32, cell_width: f32, cell_height: f32) !void {
+    pub fn requestConfigure(self: *GpuWorker, w: u32, h: u32, font_size: f32, cell_width: f32, cell_height: f32) !void {
         if (!self.active or !self.context_ready) return error.NotReady;
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
@@ -501,14 +501,14 @@ pub const Frontend = struct {
         self.signalWorker();
     }
 
-    pub fn freeBufferIndex(self: *Frontend) ?u8 {
+    pub fn freeBufferIndex(self: *GpuWorker) ?u8 {
         for (0..self.frontend_buffer_count) |i| {
             if (self.buffers[i].released) return @intCast(i);
         }
         return null;
     }
 
-    fn freeSnapshotSlot(self: *Frontend) ?u8 {
+    fn freeSnapshotSlot(self: *GpuWorker) ?u8 {
         for (0..SnapshotSlotCount) |i| {
             if (!self.snapshot_busy[i]) return @intCast(i);
         }
@@ -516,7 +516,7 @@ pub const Frontend = struct {
     }
 
     pub fn queueRender(
-        self: *Frontend,
+        self: *GpuWorker,
         term: *terminal_mod.Terminal,
         serial: u32,
         selection: ?@import("selection.zig").Snapshot,
@@ -556,7 +556,7 @@ pub const Frontend = struct {
         self.signalWorker();
     }
 
-    pub fn readResponse(self: *Frontend) !?Response {
+    pub fn readResponse(self: *GpuWorker) !?Response {
         var response: Response = undefined;
         const rc = c.read(self.response_fds[0], &response, @sizeOf(Response));
         if (rc == 0) return null;
@@ -588,7 +588,7 @@ pub const Frontend = struct {
     }
 
     /// Import dmabuf fds as wayland buffers. Call after receiving "ready" response.
-    pub fn installBuffers(self: *Frontend, dmabuf_opaque: *anyopaque) !void {
+    pub fn installBuffers(self: *GpuWorker, dmabuf_opaque: *anyopaque) !void {
         self.destroyFrontendBuffers();
         const count = @min(@as(usize, self.buffer_count), MaxBuffers);
         for (0..count) |i| {
@@ -603,12 +603,12 @@ pub const Frontend = struct {
         }
     }
 
-    fn destroyFrontendBuffers(self: *Frontend) void {
+    fn destroyFrontendBuffers(self: *GpuWorker) void {
         for (self.buffers[0..self.frontend_buffer_count]) |*buffer| buffer.destroy();
         self.frontend_buffer_count = 0;
     }
 
-    pub fn stop(self: *Frontend) void {
+    pub fn stop(self: *GpuWorker) void {
         if (!self.active) return;
         var was_ready: bool = undefined;
         {
@@ -659,7 +659,7 @@ pub const Frontend = struct {
 
     // ── Worker thread ──
 
-    fn workerMain(self: *Frontend) void {
+    fn workerMain(self: *GpuWorker) void {
         const timer = perf.Timer.now();
         gpuDebug(timer, "thread start", .{});
 

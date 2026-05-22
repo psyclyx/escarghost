@@ -3,7 +3,7 @@ const render_env = @import("render_env.zig");
 const wayland_mod = @import("wayland.zig");
 const gpu_pipeline = @import("gpu_pipeline.zig");
 const shm_render = @import("shm_render.zig");
-const gpu_renderer = @import("gpu_renderer.zig");
+const gpu_worker = @import("gpu_worker.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -247,20 +247,20 @@ pub const Diagnostics = struct {
                     self.phase_poll_calls,
                     @as(f64, @floatFromInt(self.phase_pty_read_ns)) / ms_f,
                     @as(f64, @floatFromInt(self.phase_feed_data_ns)) / ms_f,
-                    @as(f64, @floatFromInt(gpu_renderer.snapshotPhaseAccumNs)) / ms_f,
-                    @as(f64, @floatFromInt(gpu_renderer.captureCellsAccumNs)) / ms_f,
+                    @as(f64, @floatFromInt(gpu_worker.snapshotPhaseAccumNs)) / ms_f,
+                    @as(f64, @floatFromInt(gpu_worker.captureCellsAccumNs)) / ms_f,
                     self.phase_bytes_read,
                     self.phase_feed_calls,
-                    gpu_renderer.snapshotPhaseCount,
+                    gpu_worker.snapshotPhaseCount,
                 },
             );
             std.debug.print(
                 "scrgo: gpu sched  worker_wait={d:.1}ms({})  buf_starvation={d:.1}ms({})\n",
                 .{
-                    @as(f64, @floatFromInt(gpu_renderer.workerWaitAccumNs)) / ms_f,
-                    gpu_renderer.workerWaitCount,
-                    @as(f64, @floatFromInt(gpu_renderer.bufferStarvationAccumNs)) / ms_f,
-                    gpu_renderer.bufferStarvationCount,
+                    @as(f64, @floatFromInt(gpu_worker.workerWaitAccumNs)) / ms_f,
+                    gpu_worker.workerWaitCount,
+                    @as(f64, @floatFromInt(gpu_worker.bufferStarvationAccumNs)) / ms_f,
+                    gpu_worker.bufferStarvationCount,
                 },
             );
             std.debug.print(

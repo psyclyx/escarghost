@@ -7,7 +7,7 @@ const wayland_mod = @import("wayland.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const cpu_worker = @import("cpu_worker.zig");
-const gpu_renderer = @import("gpu_renderer.zig");
+const gpu_worker = @import("gpu_worker.zig");
 const render_env = @import("render_env.zig");
 const diagnostics = @import("diagnostics.zig");
 
@@ -89,7 +89,7 @@ pub const Refs = struct {
     wayland: *wayland_mod.Wayland = undefined,
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     clipboard: ?*clipboard_mod.Manager = null,
-    gpu: *gpu_renderer.Frontend = undefined,
+    gpu: *gpu_worker.GpuWorker = undefined,
     cpu: *cpu_worker.Frontend = undefined,
     atlas_thread: *atlas_owner.Frontend = undefined,
 };

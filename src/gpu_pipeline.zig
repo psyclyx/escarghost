@@ -166,7 +166,7 @@ pub const GpuPipeline = struct {
         return self.atlas_lease.get();
     }
 
-    /// No-op kept for API stability with the gpu_renderer worker. We
+    /// No-op kept for API stability with the gpu_worker worker. We
     /// don't keep per-dmabuf paint state anymore — every frame paints
     /// itself fully into whichever dmabuf the caller bound.
     pub fn setActiveTarget(self: *GpuPipeline, idx: u8) void {
@@ -416,7 +416,7 @@ pub const GpuPipeline = struct {
         phase_row_build_ns += row_build_t0.elapsedNs();
 
         // Misses on the freshly-shaped blob are reported via `misses`
-        // upward. The GPU worker (gpu_renderer.zig) hands them to the
+        // upward. The GPU worker (gpu_worker.zig) hands them to the
         // async atlas thread (`atlas_thread.requestMany`) so the next
         // frame's atlas snapshot will include them. We deliberately do
         // NOT extend the atlas synchronously and re-shape this frame:

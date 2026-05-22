@@ -2,7 +2,7 @@ const std = @import("std");
 const app_state = @import("app_state.zig");
 const diagnostics = @import("diagnostics.zig");
 const render_snapshot = @import("render_snapshot.zig");
-const gpu_renderer = @import("gpu_renderer.zig");
+const gpu_worker = @import("gpu_worker.zig");
 
 const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 
@@ -99,8 +99,8 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     if (s.render.buffer_starvation_start_ns != 0) {
         const starvation_ns = diagnostics.monotonicNowNs() - s.render.buffer_starvation_start_ns;
         if (s.debug.renderer_debug.commits) {
-            gpu_renderer.bufferStarvationAccumNs += starvation_ns;
-            gpu_renderer.bufferStarvationCount += 1;
+            gpu_worker.bufferStarvationAccumNs += starvation_ns;
+            gpu_worker.bufferStarvationCount += 1;
         }
         if (s.debug.warn_slow_budget_ms) |budget_ms| {
             const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;

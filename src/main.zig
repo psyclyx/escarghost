@@ -8,7 +8,7 @@ const shm_render = @import("shm_render.zig");
 const render_env = @import("render_env.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
-const gpu_renderer = @import("gpu_renderer.zig");
+const gpu_worker = @import("gpu_worker.zig");
 const perf = @import("perf.zig");
 const clipboard_mod = @import("clipboard.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("scrgo: gpu renderer disabled by SCRGO_RENDERER=cpu\n", .{});
     }
 
-    var gpu: gpu_renderer.Frontend = .{};
+    var gpu: gpu_worker.GpuWorker = .{};
     state.render.gpu_restart = app_state.GpuRestartBackoff.init(
         cfg.gpu_restart_initial_delay_ms,
         cfg.gpu_restart_max_delay_ms,
