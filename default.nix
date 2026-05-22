@@ -1,9 +1,9 @@
 let
   sources = import ./npins;
   flake-compat = import sources.flake-compat;
-  zig-flake = (flake-compat { src = sources.zig-overlay; }).defaultNix;
+  zig-flake = (flake-compat {src = sources.zig-overlay;}).defaultNix;
   pkgs = import sources.nixpkgs-unstable {
-    overlays = [ zig-flake.overlays.default ];
+    overlays = [zig-flake.overlays.default];
   };
 
   ghostty-src = sources.ghostty;
@@ -32,6 +32,7 @@ let
     inherit scrgo scrgo-integration-test;
   };
 in
-scrgo // {
-  inherit scrgo-bench-suite scrgo-integration-test bench integration-test;
-}
+  scrgo
+  // {
+    inherit scrgo-bench-suite scrgo-integration-test bench integration-test;
+  }
