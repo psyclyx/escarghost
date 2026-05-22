@@ -39,14 +39,10 @@ const c = @cImport({
     @cInclude("GLES2/gl2ext.h");
 });
 
-fn rendererDebugOptions() render_env.RendererDebug {
-    if (c.getenv("SCRGO_LOG")) |value|
-        return render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
-    return .{};
-}
-
-fn gpuDebugEnabled() bool {
-    return rendererDebugOptions().renderers;
+fn parseTraceFromEnv() bool {
+    if (c.getenv("SCRGO_TRACE")) |value|
+        return render_env.parseTraceCommits(std.mem.sliceTo(value, 0));
+    return false;
 }
 
 pub const MaxBuffers = gpu_buffer.MaxBuffers;
@@ -152,7 +148,7 @@ const OffscreenEgl = struct {
 
     pub fn init() !OffscreenEgl {
         var self: OffscreenEgl = .{};
-        if (gpuDebugEnabled()) log.info(.gpu, "egl init start", .{});
+        log.info(.gpu, "egl init start", .{});
 
         _ = c.setenv("EGL_PLATFORM", "surfaceless", 0);
 
@@ -168,7 +164,9 @@ const OffscreenEgl = struct {
         var minor: c.EGLint = 0;
         if (c.eglInitialize(self.display, &major, &minor) == c.EGL_FALSE)
             return error.EglInitFailed;
-        if (gpuDebugEnabled()) log.info(.gpu, "egl initialized  version={}.{}", .{ major, minor });
+        log.info(.gpu, "egl initialized", .{
+            .version = log.fmt("{}.{}", .{ major, minor }),
+        });
         _ = c.eglBindAPI(c.EGL_OPENGL_ES_API);
 
         const attrs = [_]c.EGLint{
@@ -200,16 +198,16 @@ const OffscreenEgl = struct {
 
         if (c.eglMakeCurrent(self.display, self.surface, self.surface, self.context) == c.EGL_FALSE)
             return error.EglMakeCurrentFailed;
-        if (gpuDebugEnabled()) {
+        if (log.isScopeEnabled(.gpu)) {
             const vendor = c.glGetString(c.GL_VENDOR);
             const renderer = c.glGetString(c.GL_RENDERER);
             const gl_version = c.glGetString(c.GL_VERSION);
             const glsl_version = c.glGetString(c.GL_SHADING_LANGUAGE_VERSION);
-            log.info(.gpu, "egl current  vendor={s}  renderer={s}  version={s}  glsl={s}", .{
-                if (vendor) |v| std.mem.sliceTo(v, 0) else "?",
-                if (renderer) |r| std.mem.sliceTo(r, 0) else "?",
-                if (gl_version) |v| std.mem.sliceTo(v, 0) else "?",
-                if (glsl_version) |v| std.mem.sliceTo(v, 0) else "?",
+            log.info(.gpu, "egl current", .{
+                .vendor = if (vendor) |v| std.mem.sliceTo(v, 0) else "?",
+                .renderer = if (renderer) |r| std.mem.sliceTo(r, 0) else "?",
+                .version = if (gl_version) |v| std.mem.sliceTo(v, 0) else "?",
+                .glsl = if (glsl_version) |v| std.mem.sliceTo(v, 0) else "?",
             });
         }
 
@@ -654,7 +652,7 @@ pub const GpuWorker = struct {
     // ── Worker thread ──
 
     fn workerMain(self: *GpuWorker) void {
-        if (gpuDebugEnabled()) log.info(.gpu, "thread started", .{});
+        log.info(.gpu, "thread started", .{});
 
         const warn_slow_budget_ms = render_env.parseWarnSlowMs(
             if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
@@ -672,12 +670,12 @@ pub const GpuWorker = struct {
 
         // Phase 1: EGL + snail.Renderer init (no deps needed)
         var egl = OffscreenEgl.init() catch |e| {
-            log.err(.gpu, "egl init failed  err={s}", .{@errorName(e)});
+            log.err(.gpu, "egl init failed", .{ .err = e });
             writeResponse(self.response_fds[1], .{ .tag = .failed });
             return;
         };
         defer egl.deinit();
-        if (gpuDebugEnabled()) log.info(.gpu, "offscreen egl ready", .{});
+        log.info(.gpu, "offscreen egl ready", .{});
 
         // Signal context ready — main can now send configure
         writeResponse(self.response_fds[1], .{ .tag = .context_ready });
@@ -728,17 +726,21 @@ pub const GpuWorker = struct {
                 .quit => return,
                 .configure => {
                     const reconfigure_timer = perf.Timer.now();
-                    if (gpuDebugEnabled()) log.info(.gpu, "configure  width={}  height={}  font={d:.1}", .{ request.width, request.height, request.font_size });
+                    log.info(.gpu, "configure", .{
+                        .width = request.width,
+                        .height = request.height,
+                        .font = log.fmt("{d:.1}", .{request.font_size}),
+                    });
 
                     const atlas_ref = self.atlas_ref orelse {
-                        log.err(.gpu, "configure failed  err=missing_atlas_ref", .{});
+                        log.err(.gpu, "configure failed", .{ .reason = "missing_atlas_ref" });
                         writeResponse(self.response_fds[1], .{ .tag = .failed });
                         continue;
                     };
 
                     // Allocate dmabufs
                     const next_allocator = DmabufAllocator.init(&egl, request.width, request.height, MaxBuffers) catch |e| {
-                        log.err(.gpu, "dmabuf alloc failed  err={s}", .{@errorName(e)});
+                        log.err(.gpu, "dmabuf alloc failed", .{ .err = e });
                         writeResponse(self.response_fds[1], .{ .tag = .failed });
                         continue;
                     };
@@ -759,12 +761,11 @@ pub const GpuWorker = struct {
                             request.cell_width,
                             request.cell_height,
                         ) catch |e| {
-                            log.err(.gpu, "renderer init failed  err={s}", .{@errorName(e)});
+                            log.err(.gpu, "renderer init failed", .{ .err = e });
                             writeResponse(self.response_fds[1], .{ .tag = .failed });
                             continue;
                         };
-                        const debug_opts = rendererDebugOptions();
-                        renderer.?.setDebugLogs(debug_opts);
+                        renderer.?.setTraceFrames(parseTraceFromEnv());
                         const runtime_flags = render_env.parseRuntimeFlags(
                             if (c.getenv("SCRGO_FLAGS")) |value| std.mem.sliceTo(value, 0) else null,
                         );
@@ -795,9 +796,11 @@ pub const GpuWorker = struct {
                         c.glBindFramebuffer(c.GL_FRAMEBUFFER, active_allocator.targets[0].framebuffer);
                         c.glViewport(0, 0, @intCast(current_width), @intCast(current_height));
                         renderer.?.warmPipeline() catch |e| {
-                            log.warn(.gpu, "pipeline warmup failed  err={s}", .{@errorName(e)});
+                            log.warn(.gpu, "pipeline warmup failed", .{ .err = e });
                         };
-                        if (gpuDebugEnabled()) log.info(.gpu, "pipeline warmup  elapsed_ms={d:.1}", .{warm_t0.elapsedMs()});
+                        log.info(.gpu, "pipeline warmup", .{
+                            .elapsed_ms = log.fmt("{d:.1}", .{warm_t0.elapsedMs()}),
+                        });
                     }
 
                     // Publish buffer descriptors for main thread
@@ -808,7 +811,9 @@ pub const GpuWorker = struct {
                         active_allocator.targets[i].export_fd = -1; // Transfer ownership to main
                     }
 
-                    if (gpuDebugEnabled()) log.info(.gpu, "configure ready  elapsed_ms={d:.1}", .{reconfigure_timer.elapsedMs()});
+                    log.info(.gpu, "configure ready", .{
+                        .elapsed_ms = log.fmt("{d:.1}", .{reconfigure_timer.elapsedMs()}),
+                    });
                     writeResponse(self.response_fds[1], .{ .tag = .ready });
                 },
                 .render => {
@@ -965,9 +970,9 @@ pub const GpuWorker = struct {
                     // how much the redraw + fence wait will cost.
                     last_full_frame_ns = monotonicNs() - draw_t0;
 
-                    if (gpuDebugEnabled()) log.info(.gpu, "render complete  buffer={}  elapsed_ms={d:.1}", .{
-                        request.buffer_index,
-                        render_timer.elapsedMs(),
+                    log.info(.gpu, "render complete", .{
+                        .buffer = request.buffer_index,
+                        .elapsed_ms = log.fmt("{d:.1}", .{render_timer.elapsedMs()}),
                     });
                     writeResponse(self.response_fds[1], .{
                         .tag = .frame,
@@ -981,9 +986,9 @@ pub const GpuWorker = struct {
                     // memory growth without needing a slow-frame trigger.
                     diag_frame_counter += 1;
                     if (diag_frame_counter % 60 == 0) {
-                        log.info(.diag, "rss sample  frame={}  rss_kib={}", .{
-                            diag_frame_counter,
-                            readRssKb(),
+                        log.info(.diag, "rss sample", .{
+                            .frame = diag_frame_counter,
+                            .rss_kib = readRssKb(),
                         });
                     }
 
@@ -1002,21 +1007,21 @@ pub const GpuWorker = struct {
                             const row_count = row_build.phase_row_count - row_count_base;
                             const row_shape = row_build.phase_row_shape_ns - row_shape_base;
                             const row_finish = row_build.phase_row_finish_ns - row_finish_base;
-                            log.warn(.gpu, "slow frame  elapsed_ms={d:.1}  budget_ms={}  cells_ms={d:.1}  draw_ms={d:.1}  row_ms={d:.1}  rebuild_ms={d:.2}  shape_ms={d:.2}  finish_ms={d:.2}  rows={}  pic_ms={d:.1}  upload_ms={d:.1}  drawlist_ms={d:.1}  gl_ms={d:.1}  fence_ms={d:.1}", .{
-                                @as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f,
-                                budget_ms,
-                                @as(f64, @floatFromInt(cells_elapsed_ns)) / ms_f,
-                                @as(f64, @floatFromInt(draw_elapsed_ns)) / ms_f,
-                                @as(f64, @floatFromInt(phase_row)) / ms_f,
-                                @as(f64, @floatFromInt(row_rebuild)) / ms_f,
-                                @as(f64, @floatFromInt(row_shape)) / ms_f,
-                                @as(f64, @floatFromInt(row_finish)) / ms_f,
-                                row_count,
-                                @as(f64, @floatFromInt(phase_pic)) / ms_f,
-                                @as(f64, @floatFromInt(phase_upload)) / ms_f,
-                                @as(f64, @floatFromInt(phase_drawlist)) / ms_f,
-                                @as(f64, @floatFromInt(phase_draw)) / ms_f,
-                                @as(f64, @floatFromInt(gpu_wait_elapsed_ns)) / ms_f,
+                            log.warn(.gpu, "slow frame", .{
+                                .elapsed_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f}),
+                                .budget_ms = budget_ms,
+                                .cells_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cells_elapsed_ns)) / ms_f}),
+                                .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(draw_elapsed_ns)) / ms_f}),
+                                .row_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_row)) / ms_f}),
+                                .rebuild_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_rebuild)) / ms_f}),
+                                .shape_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_shape)) / ms_f}),
+                                .finish_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_finish)) / ms_f}),
+                                .rows = row_count,
+                                .pic_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_pic)) / ms_f}),
+                                .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_upload)) / ms_f}),
+                                .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_drawlist)) / ms_f}),
+                                .gl_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_draw)) / ms_f}),
+                                .fence_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_wait_elapsed_ns)) / ms_f}),
                             });
                         }
                     }

@@ -79,8 +79,12 @@ pub const FrameStats = struct {
 
     pub fn dump(self: *const FrameStats, label: []const u8) void {
         if (self.count == 0) return;
-        log.info(.diag, "{s} stats  avg_us={d:.1}  max_us={d:.1}  p99_us={d:.1}  frames={}", .{
-            label, self.avgUs(), self.maxUs(), self.p99Us(), self.total_frames,
+        log.info(.diag, "stats", .{
+            .label = label,
+            .avg_us = log.fmt("{d:.1}", .{self.avgUs()}),
+            .max_us = log.fmt("{d:.1}", .{self.maxUs()}),
+            .p99_us = log.fmt("{d:.1}", .{self.p99Us()}),
+            .frames = self.total_frames,
         });
     }
 };

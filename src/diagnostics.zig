@@ -1,5 +1,4 @@
 const std = @import("std");
-const render_env = @import("render/render_env.zig");
 const wayland_mod = @import("wayland.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const cpu_pipeline = @import("render/cpu_pipeline.zig");
@@ -97,7 +96,11 @@ pub const ExitContext = struct {
 };
 
 pub const Diagnostics = struct {
-    debug: render_env.RendererDebug = .{},
+    /// Opt-in commit/phase tracing. Gates the per-commit trace buffer,
+    /// phase counters, mem-poll thread, and the exit-time summary. Set
+    /// via `SCRGO_TRACE=commits`. Independent from `SCRGO_LOG` (which
+    /// controls scope-based log filtering in log.zig).
+    trace_commits: bool = false,
 
     // Commit trace
     commit_trace: [4096]CommitTrace = undefined,
@@ -147,7 +150,7 @@ pub const Diagnostics = struct {
     }
 
     pub fn recordCommit(self: *Diagnostics, path_tag: u8) void {
-        if (!self.debug.commits) return;
+        if (!self.trace_commits) return;
         if (self.commit_trace_len >= self.commit_trace.len) return;
         const dt: f32 = @floatFromInt(monotonicNowNs() - self.commit_trace_start_ns);
         self.commit_trace[self.commit_trace_len] = .{
@@ -164,7 +167,7 @@ pub const Diagnostics = struct {
         latest_serial: u32,
         dirty: bool,
     ) void {
-        if (!self.debug.frames) return;
+        if (!self.trace_commits) return;
         const stale = committed_serial != latest_serial;
         if (stale) self.total_stale_commits += 1;
         self.last_commit_serial = committed_serial;
@@ -177,22 +180,22 @@ pub const Diagnostics = struct {
         };
         log.setFrame(.frame, latest_serial);
         if (stale) {
-            log.warn(scope, "commit stale  committed={}  latest={}  gap={}  dirty={}", .{
-                committed_serial,
-                latest_serial,
-                latest_serial - committed_serial,
-                dirty,
+            log.warn(scope, "commit stale", .{
+                .committed = committed_serial,
+                .latest = latest_serial,
+                .gap = latest_serial - committed_serial,
+                .dirty = dirty,
             });
         } else {
-            log.info(scope, "commit caught-up  committed={}  latest={}", .{
-                committed_serial,
-                latest_serial,
+            log.info(scope, "commit caught-up", .{
+                .committed = committed_serial,
+                .latest = latest_serial,
             });
         }
     }
 
     pub fn startMemPollThread(self: *Diagnostics) ?std.Thread {
-        if (!self.debug.commits) return null;
+        if (!self.trace_commits) return null;
         return std.Thread.spawn(.{}, memPollLoop, .{self}) catch null;
     }
 
@@ -207,116 +210,118 @@ pub const Diagnostics = struct {
         // Stale-last-frame diagnostic. If the final committed frame's
         // serial is behind the latest dirty-serial, the user's last
         // visible frame doesn't reflect the last PTY data we received.
-        if (self.debug.frames and self.last_commit_serial != 0) {
-            const verdict: []const u8 = if (self.last_commit_serial == ctx.render_serial and !ctx.pipeline_dirty)
-                "caught-up"
+        if (self.trace_commits and self.last_commit_serial != 0) {
+            const Verdict = enum { caught_up, stale };
+            const verdict: Verdict = if (self.last_commit_serial == ctx.render_serial and !ctx.pipeline_dirty)
+                .caught_up
             else
-                "stale";
-            log.info(.diag, "final commit  committed={}  latest={}  dirty={}  verdict={s}  stale_commits={}  throttle_skips={}", .{
-                self.last_commit_serial,
-                ctx.render_serial,
-                ctx.pipeline_dirty,
-                verdict,
-                self.total_stale_commits,
-                self.total_throttled_skips,
+                .stale;
+            log.info(.diag, "final commit", .{
+                .committed = self.last_commit_serial,
+                .latest = ctx.render_serial,
+                .dirty = ctx.pipeline_dirty,
+                .verdict = verdict,
+                .stale_commits = self.total_stale_commits,
+                .throttle_skips = self.total_throttled_skips,
             });
-            log.info(.diag, "wayland summary  request_frame={}  skipped={}  commits={}  frame_done={}  max_dt_ms={d:.1}", .{
-                wayland_mod.Wayland.request_frame_count,
-                wayland_mod.Wayland.request_frame_skipped,
-                wayland_mod.Wayland.request_frame_commit_count,
-                wayland_mod.Wayland.frame_done_count,
-                @as(f64, @floatFromInt(wayland_mod.Wayland.last_frame_done_dt_max_ns)) / ms_f,
+            log.info(.diag, "wayland summary", .{
+                .request_frame = wayland_mod.Wayland.request_frame_count,
+                .skipped = wayland_mod.Wayland.request_frame_skipped,
+                .commits = wayland_mod.Wayland.request_frame_commit_count,
+                .frame_done = wayland_mod.Wayland.frame_done_count,
+                .max_dt_ms = log.fmt("{d:.1}", .{
+                    @as(f64, @floatFromInt(wayland_mod.Wayland.last_frame_done_dt_max_ns)) / ms_f,
+                }),
             });
         }
 
         gpu_pipeline.GpuPipeline.frame_stats.dump("frame");
 
-        if (self.debug.commits) {
-            log.info(.diag, "phases  poll_ms={d:.1}  poll_calls={}  pty_read_ms={d:.1}  feed_data_ms={d:.1}  prepare_ms={d:.1}  worker_cells_ms={d:.1}  bytes={}  feed_calls={}  snapshots={}", .{
-                @as(f64, @floatFromInt(self.phase_poll_ns)) / ms_f,
-                self.phase_poll_calls,
-                @as(f64, @floatFromInt(self.phase_pty_read_ns)) / ms_f,
-                @as(f64, @floatFromInt(self.phase_feed_data_ns)) / ms_f,
-                @as(f64, @floatFromInt(gpu_worker.snapshotPhaseAccumNs)) / ms_f,
-                @as(f64, @floatFromInt(gpu_worker.captureCellsAccumNs)) / ms_f,
-                self.phase_bytes_read,
-                self.phase_feed_calls,
-                gpu_worker.snapshotPhaseCount,
+        if (self.trace_commits) {
+            log.info(.diag, "phases", .{
+                .poll_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.phase_poll_ns)) / ms_f}),
+                .poll_calls = self.phase_poll_calls,
+                .pty_read_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.phase_pty_read_ns)) / ms_f}),
+                .feed_data_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.phase_feed_data_ns)) / ms_f}),
+                .prepare_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_worker.snapshotPhaseAccumNs)) / ms_f}),
+                .worker_cells_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_worker.captureCellsAccumNs)) / ms_f}),
+                .bytes = self.phase_bytes_read,
+                .feed_calls = self.phase_feed_calls,
+                .snapshots = gpu_worker.snapshotPhaseCount,
             });
-            log.info(.diag, "gpu sched  worker_wait_ms={d:.1}  worker_wait_count={}  buf_starvation_ms={d:.1}  buf_starvation_count={}", .{
-                @as(f64, @floatFromInt(gpu_worker.workerWaitAccumNs)) / ms_f,
-                gpu_worker.workerWaitCount,
-                @as(f64, @floatFromInt(gpu_worker.bufferStarvationAccumNs)) / ms_f,
-                gpu_worker.bufferStarvationCount,
+            log.info(.diag, "gpu sched", .{
+                .worker_wait_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_worker.workerWaitAccumNs)) / ms_f}),
+                .worker_wait_count = gpu_worker.workerWaitCount,
+                .buf_starvation_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_worker.bufferStarvationAccumNs)) / ms_f}),
+                .buf_starvation_count = gpu_worker.bufferStarvationCount,
             });
-            log.info(.diag, "memory  peak_rss_mib={}  peak_anon_mib={}  final_rss_mib={}  final_anon_mib={}", .{
-                self.peak_vmrss_kib / 1024,
-                self.peak_rss_anon_kib / 1024,
-                readProcStatus("VmRSS:") / 1024,
-                readProcStatus("RssAnon:") / 1024,
+            log.info(.diag, "memory", .{
+                .peak_rss_mib = self.peak_vmrss_kib / 1024,
+                .peak_anon_mib = self.peak_rss_anon_kib / 1024,
+                .final_rss_mib = readProcStatus("VmRSS:") / 1024,
+                .final_anon_mib = readProcStatus("RssAnon:") / 1024,
             });
             if (gpu_pipeline.GpuPipeline.phase_frame_count > 0) {
-                log.info(.diag, "gpu pipeline  frames={}  row_build_ms={d:.1}  picture_ms={d:.1}  upload_ms={d:.1}  drawlist_ms={d:.1}  draw_ms={d:.1}", .{
-                    gpu_pipeline.GpuPipeline.phase_frame_count,
-                    @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_row_build_ns)) / ms_f,
-                    @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_picture_ns)) / ms_f,
-                    @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_upload_ns)) / ms_f,
-                    @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_drawlist_ns)) / ms_f,
-                    @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_draw_ns)) / ms_f,
+                log.info(.diag, "gpu pipeline", .{
+                    .frames = gpu_pipeline.GpuPipeline.phase_frame_count,
+                    .row_build_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_row_build_ns)) / ms_f}),
+                    .picture_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_picture_ns)) / ms_f}),
+                    .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_upload_ns)) / ms_f}),
+                    .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_drawlist_ns)) / ms_f}),
+                    .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_draw_ns)) / ms_f}),
                 });
             }
             if (cpu_pipeline.phase_frame_count > 0) {
-                log.info(.diag, "cpu pipeline  frames={}  row_build_ms={d:.1}  picture_ms={d:.1}  upload_ms={d:.1}  drawlist_ms={d:.1}  draw_ms={d:.1}", .{
-                    cpu_pipeline.phase_frame_count,
-                    @as(f64, @floatFromInt(cpu_pipeline.phase_row_build_ns)) / ms_f,
-                    @as(f64, @floatFromInt(cpu_pipeline.phase_picture_ns)) / ms_f,
-                    @as(f64, @floatFromInt(cpu_pipeline.phase_upload_ns)) / ms_f,
-                    @as(f64, @floatFromInt(cpu_pipeline.phase_drawlist_ns)) / ms_f,
-                    @as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f,
+                log.info(.diag, "cpu pipeline", .{
+                    .frames = cpu_pipeline.phase_frame_count,
+                    .row_build_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_row_build_ns)) / ms_f}),
+                    .picture_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_picture_ns)) / ms_f}),
+                    .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_upload_ns)) / ms_f}),
+                    .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_drawlist_ns)) / ms_f}),
+                    .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f}),
                 });
             }
         }
 
-        if (self.debug.commits and self.commit_trace_len > 0) {
-            log.info(.diag, "commit trace  commits={}", .{self.commit_trace_len});
+        if (self.trace_commits and self.commit_trace_len > 0) {
+            log.info(.diag, "commit trace", .{ .commits = self.commit_trace_len });
+            const Path = enum { gpu, cpu, bg, dis, unknown };
             var prev_ms: f32 = 0;
             for (self.commit_trace[0..self.commit_trace_len], 0..) |entry, i| {
-                const path_str: []const u8 = switch (entry.path) {
-                    'g' => "gpu",
-                    'c' => "cpu",
-                    'b' => "bg ",
-                    'd' => "dis",
-                    else => "?  ",
+                const path: Path = switch (entry.path) {
+                    'g' => .gpu,
+                    'c' => .cpu,
+                    'b' => .bg,
+                    'd' => .dis,
+                    else => .unknown,
                 };
-                log.cont("[{:>3}] {s}  t_ms={d:>7.2}  +{d:>6.2}", .{
-                    i, path_str, entry.t_ms, entry.t_ms - prev_ms,
+                log.cont("", .{
+                    .row = i,
+                    .path = path,
+                    .t_ms = log.fmt("{d:.2}", .{entry.t_ms}),
+                    .delta_ms = log.fmt("{d:.2}", .{entry.t_ms - prev_ms}),
                 });
                 prev_ms = entry.t_ms;
             }
         }
 
-        if (self.debug.anyLogs()) {
-            if (ctx.wl_closed) {
-                log.info(.main, "compositor requested close, exiting", .{});
-            } else if (ctx.child_exited) {
-                log.info(.main, "child exit path reached, exiting", .{});
-            }
-            log.info(.main, "exiting", .{});
-        }
+        const Reason = enum { compositor_close, child_exit, other };
+        const reason: Reason = if (ctx.wl_closed) .compositor_close else if (ctx.child_exited) .child_exit else .other;
+        log.info(.main, "exiting", .{ .reason = reason });
 
-        if (self.debug.commits) {
+        if (self.trace_commits) {
             self.t_before_exit_ns = monotonicNowNs() - self.commit_trace_start_ns;
             const last_commit_ms: f32 = if (self.commit_trace_len > 0)
                 self.commit_trace[self.commit_trace_len - 1].t_ms
             else
                 0;
-            log.info(.diag, "timeline  pre_main_ms={d:.1}  first_pty_ms={d:.1}  last_commit_ms={d:.1}  child_exited_ms={d:.1}  main_loop_exit_ms={d:.1}  before_exit_ms={d:.1}", .{
-                @as(f64, @floatFromInt(self.t_premain_ns)) / ms_f,
-                @as(f64, @floatFromInt(self.t_first_pty_ns)) / ms_f,
-                last_commit_ms,
-                @as(f64, @floatFromInt(self.t_child_exited_ns)) / ms_f,
-                @as(f64, @floatFromInt(self.t_main_loop_exit_ns)) / ms_f,
-                @as(f64, @floatFromInt(self.t_before_exit_ns)) / ms_f,
+            log.info(.diag, "timeline", .{
+                .pre_main_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.t_premain_ns)) / ms_f}),
+                .first_pty_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.t_first_pty_ns)) / ms_f}),
+                .last_commit_ms = log.fmt("{d:.2}", .{last_commit_ms}),
+                .child_exited_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.t_child_exited_ns)) / ms_f}),
+                .main_loop_exit_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.t_main_loop_exit_ns)) / ms_f}),
+                .before_exit_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(self.t_before_exit_ns)) / ms_f}),
             });
         }
     }

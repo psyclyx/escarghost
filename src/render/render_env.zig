@@ -11,28 +11,6 @@ pub const RequestedRenderPath = enum {
     gpu,
 };
 
-pub const RendererDebug = struct {
-    startup: bool = false,
-    renderers: bool = false,
-    frames: bool = false,
-    atlas: bool = false,
-    pty: bool = false,
-    commits: bool = false,
-
-    pub fn anyLogs(self: RendererDebug) bool {
-        return self.startup or self.renderers or self.frames or self.atlas or self.pty or self.commits;
-    }
-
-    pub fn enableAllLogs(self: *RendererDebug) void {
-        self.startup = true;
-        self.renderers = true;
-        self.frames = true;
-        self.atlas = true;
-        self.pty = true;
-        self.commits = true;
-    }
-};
-
 fn eql(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
@@ -47,43 +25,21 @@ pub fn parseRequestedRenderPath(value: ?[]const u8) RequestedRenderPath {
     return .auto;
 }
 
-pub fn parseRendererDebug(value: ?[]const u8) RendererDebug {
-    var result: RendererDebug = .{};
-    const raw = value orelse return result;
+/// `SCRGO_TRACE=commits` (or `1` / `on`) opts into the commit-trace
+/// profiling subsystem: phase counters, mem-poll thread, recorded
+/// commit timeline, and exit summary. This is a tracing flag, not a
+/// log scope — scope filtering happens in `log.zig` via `SCRGO_LOG`.
+pub fn parseTraceCommits(value: ?[]const u8) bool {
+    const raw = value orelse return false;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return result;
-
-    if (eql(trimmed, "0") or eql(trimmed, "false") or eql(trimmed, "off")) return result;
-    if (eql(trimmed, "1") or eql(trimmed, "true") or eql(trimmed, "on") or eql(trimmed, "log") or eql(trimmed, "trace")) {
-        result.enableAllLogs();
-        return result;
-    }
-    if (eql(trimmed, "all")) {
-        result.enableAllLogs();
-        return result;
-    }
-
+    if (trimmed.len == 0) return false;
+    if (eql(trimmed, "0") or eql(trimmed, "false") or eql(trimmed, "off")) return false;
+    if (eql(trimmed, "1") or eql(trimmed, "true") or eql(trimmed, "on") or eql(trimmed, "all")) return true;
     var it = std.mem.tokenizeAny(u8, trimmed, ", ");
     while (it.next()) |token| {
-        if (eql(token, "log") or eql(token, "trace") or eql(token, "verbose")) {
-            result.enableAllLogs();
-        } else if (eql(token, "startup")) {
-            result.startup = true;
-        } else if (eql(token, "renderers") or eql(token, "renderer") or eql(token, "helper") or eql(token, "gpu") or eql(token, "ipc")) {
-            result.renderers = true;
-        } else if (eql(token, "frames") or eql(token, "frame") or eql(token, "render")) {
-            result.frames = true;
-        } else if (eql(token, "atlas")) {
-            result.atlas = true;
-        } else if (eql(token, "pty")) {
-            result.pty = true;
-        } else if (eql(token, "commits") or eql(token, "commit")) {
-            result.commits = true;
-        } else if (eql(token, "all")) {
-            result.enableAllLogs();
-        }
+        if (eql(token, "commits") or eql(token, "commit") or eql(token, "all") or eql(token, "1") or eql(token, "on") or eql(token, "true")) return true;
     }
-    return result;
+    return false;
 }
 
 pub const SyncExtendConfig = struct {

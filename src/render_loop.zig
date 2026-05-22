@@ -88,7 +88,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
             // Track how long we're stuck without a released buffer so
             // we can see at exit whether compositor release latency is
             // the throughput bottleneck.
-            if (s.debug.renderer_debug.commits or s.debug.warn_slow_budget_ms != null) {
+            if (s.diag.trace_commits or s.debug.warn_slow_budget_ms != null) {
                 const now = diagnostics.monotonicNowNs();
                 if (s.render.buffer_starvation_start_ns == 0) s.render.buffer_starvation_start_ns = now;
             }
@@ -99,25 +99,26 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     };
     if (s.render.buffer_starvation_start_ns != 0) {
         const starvation_ns = diagnostics.monotonicNowNs() - s.render.buffer_starvation_start_ns;
-        if (s.debug.renderer_debug.commits) {
+        if (s.diag.trace_commits) {
             gpu_worker.bufferStarvationAccumNs += starvation_ns;
             gpu_worker.bufferStarvationCount += 1;
         }
         if (s.debug.warn_slow_budget_ms) |budget_ms| {
             const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
             if (starvation_ns > budget_ns) {
-                log.warn(.frame, "buffer starvation  elapsed_ms={d:.1}  budget_ms={}  reason=compositor_holding_dmabuf", .{
-                    @as(f64, @floatFromInt(starvation_ns)) / @as(f64, std.time.ns_per_ms),
-                    budget_ms,
+                log.warn(.frame, "buffer starvation", .{
+                    .elapsed_ms = log.fmt("{d:.1}", .{
+                        @as(f64, @floatFromInt(starvation_ns)) / @as(f64, std.time.ns_per_ms),
+                    }),
+                    .budget_ms = budget_ms,
+                    .reason = "compositor_holding_dmabuf",
                 });
             }
         }
         s.render.buffer_starvation_start_ns = 0;
     }
     log.setFrame(.frame, s.render.render_serial);
-    if (s.debug.renderer_debug.renderers) {
-        log.info(.frame, "queued gpu frame", .{});
-    }
+    log.info(.frame, "queued gpu frame", .{});
     s.render.gpu_snapshot_dirty = false;
 }
 
@@ -152,9 +153,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
         };
         s.render.needs_redraw = false;
         log.setFrame(.frame, s.render.render_serial);
-        if (s.debug.renderer_debug.frames) {
-            log.info(.frame, "queued cpu frame  width={}  height={}", .{ wl.width, wl.height });
-        }
+        log.info(.frame, "queued cpu frame", .{ .width = wl.width, .height = wl.height });
         return;
     }
     s.render.needs_redraw = false;
@@ -162,9 +161,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
 
 pub fn noteGpuUnavailable(s: *app_state.AppState) void {
     s.refs.gpu.stop();
-    if (s.debug.renderer_debug.renderers) {
-        log.warn(.gpu, "unavailable, switching to cpu and scheduling restart", .{});
-    }
+    log.warn(.gpu, "unavailable, switching to cpu and scheduling restart", .{});
     if (s.render.active_render_path == .gpu) {
         s.render.active_render_path = .cpu;
         s.render.needs_redraw = true;

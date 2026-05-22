@@ -1,6 +1,5 @@
 const std = @import("std");
 const perf = @import("perf.zig");
-const render_env = @import("render/render_env.zig");
 const log = @import("log.zig");
 
 const wl = @cImport({
@@ -22,14 +21,6 @@ const egl = @cImport({
 const xkb = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
 });
-
-fn rendererLogEnabled() bool {
-    if (std.c.getenv("SCRGO_LOG")) |value| {
-        const options = render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
-        return options.startup or options.renderers;
-    }
-    return false;
-}
 
 const time_c = @cImport(@cInclude("time.h"));
 
@@ -612,9 +603,7 @@ pub const Wayland = struct {
 
     fn xdgToplevelClose(data: ?*anyopaque, _: ?*wl.xdg_toplevel) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
-        if (rendererLogEnabled()) {
-            log.info(.wayland, "xdg_toplevel.close received", .{});
-        }
+        log.info(.wayland, "xdg_toplevel.close received", .{});
         self.closed = true;
     }
 
@@ -914,12 +903,11 @@ pub const Wayland = struct {
         }
         last_frame_done_ns = now_ns;
         frame_done_count += 1;
-        if (log_frame_events) {
-            log.info(.wayland, "frame_done  seq={}  dt_ms={d:.1}", .{ frame_done_count, dt_ms });
-        }
+        log.info(.wayland, "frame_done", .{
+            .seq = frame_done_count,
+            .dt_ms = log.fmt("{d:.1}", .{dt_ms}),
+        });
     }
-
-    pub var log_frame_events: bool = false;
 
     fn monotonicNowNsLocal() u64 {
         var ts: time_c.struct_timespec = undefined;

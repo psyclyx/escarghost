@@ -8,7 +8,6 @@ const atlas_ref_mod = @import("render/atlas_ref.zig");
 const atlas_worker = @import("render/atlas_worker.zig");
 const cpu_worker = @import("render/cpu_worker.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
-const render_env = @import("render/render_env.zig");
 const diagnostics = @import("diagnostics.zig");
 
 pub const RenderPath = enum {
@@ -141,7 +140,6 @@ pub const Lifecycle = struct {
 };
 
 pub const DebugFlags = struct {
-    renderer_debug: render_env.RendererDebug = .{},
     warn_slow_budget_ms: ?u32 = null,
 };
 

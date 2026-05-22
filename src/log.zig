@@ -1,19 +1,26 @@
 //! Process-wide logger. One line per call, with a consistent prefix
 //! across every thread and code path.
 //!
-//! Line format:
-//!     +1234.5ms  Δ12.3ms  [scope]    f#42  message
+//! Line shape:
+//!     +1234.5ms  [scope]   Δ12.3ms  f#42  message  k=v  k=v
 //!
-//! Each column is an independent piece of information:
-//!   - process-relative time (always)
-//!   - per-scope delta since the previous log in the same scope
-//!   - scope tag (per-scope color)
-//!   - ambient frame number for the scope (when set)
-//!   - message
+//! - `+ms`:        monotonic time since process_start.
+//! - `[scope]`:    per-scope color; padded to fixed width.
+//! - `Δms`:        time since the previous log in the same scope, in the
+//!                 scope color so it visually clusters with the tag.
+//! - `f#N`:        ambient frame # for the scope; six spaces when unset.
+//! - `message`:    free-form text body.
+//! - `k=v`:        structured data, taken from a struct literal at the
+//!                 call site. Field names are pulled out at comptime; the
+//!                 value is rendered + colored based on its Zig type.
+//!                 `log.fmt("{d:.1}", .{x})` wraps a value that needs a
+//!                 custom format spec.
 //!
-//! Color is one rendering of these columns; it's disabled when stderr
-//! isn't a TTY or NO_COLOR is set, and turning it off doesn't change
-//! the data layout.
+//! Scope filtering: `SCRGO_LOG=<scope>[,<scope>]*` enables those scopes.
+//! Token names match the `Scope` enum names exactly (`gpu`, `cpu`,
+//! `frame`, ...). `all` / `1` / `on` enables every scope; `0` / `off`
+//! disables all. Only `info`-level messages are gated; `warn` and `err`
+//! always emit.
 //!
 //! `init()` must run once near the top of `main` so process-start is
 //! stamped before anything logs.
@@ -60,13 +67,22 @@ var initialized: bool = false;
 var write_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t);
 var scope_state: [std.meta.fields(Scope).len]ScopeState =
     [_]ScopeState{.{}} ** std.meta.fields(Scope).len;
+var scope_enabled: [std.meta.fields(Scope).len]bool =
+    [_]bool{false} ** std.meta.fields(Scope).len;
 
 const sgr_reset = "\x1b[0m";
-const sgr_dim = "\x1b[90m";
 const sgr_bold = "\x1b[1m";
 const sgr_yellow = "\x1b[33m";
 const sgr_red = "\x1b[31m";
-const sgr_frame = "\x1b[96m";
+
+// Value-type colors (used for the `value` half of `key=value` pairs).
+const sgr_val_num = "\x1b[96m"; // bright cyan
+const sgr_val_bool = "\x1b[93m"; // bright yellow
+const sgr_val_str = "\x1b[92m"; // bright green
+const sgr_val_enum = "\x1b[95m"; // bright magenta
+const sgr_val_err = "\x1b[91m"; // bright red
+const sgr_val_null = "\x1b[90m"; // gray (only place we use gray; it's
+// explicitly "value is absent")
 
 fn scopeColor(s: Scope) []const u8 {
     return switch (s) {
@@ -76,7 +92,7 @@ fn scopeColor(s: Scope) []const u8 {
         .atlas => "\x1b[35m", // magenta
         .wayland => "\x1b[34m", // blue
         .pty => "\x1b[93m", // bright yellow
-        .diag => "\x1b[90m", // gray
+        .diag => "\x1b[33m", // yellow
         .input => "\x1b[95m", // bright magenta
         .frame => "\x1b[94m", // bright blue
     };
@@ -104,6 +120,31 @@ pub fn init() void {
             color_enabled = true;
         }
     }
+    if (c.getenv("SCRGO_LOG")) |v| {
+        parseScopeTokens(std.mem.sliceTo(v, 0));
+    }
+}
+
+fn parseScopeTokens(value: []const u8) void {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return;
+    if (eqIgnoreAny(trimmed, &.{ "0", "off", "false" })) return;
+    if (eqIgnoreAny(trimmed, &.{ "1", "on", "true", "all" })) {
+        for (&scope_enabled) |*e| e.* = true;
+        return;
+    }
+    var it = std.mem.tokenizeAny(u8, trimmed, ", ");
+    while (it.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(token, "all")) {
+            for (&scope_enabled) |*e| e.* = true;
+            continue;
+        }
+        inline for (std.meta.fields(Scope)) |f| {
+            if (std.ascii.eqlIgnoreCase(token, f.name)) {
+                scope_enabled[f.value] = true;
+            }
+        }
+    }
 }
 
 fn eqIgnoreAny(needle: []const u8, options: []const []const u8) bool {
@@ -113,30 +154,66 @@ fn eqIgnoreAny(needle: []const u8, options: []const []const u8) bool {
     return false;
 }
 
+pub fn isScopeEnabled(scope: Scope) bool {
+    return scope_enabled[@intFromEnum(scope)];
+}
+
 /// Set the ambient frame number for `scope`. Subsequent log calls in
 /// that scope will render `f#N`. Pass `null` to clear.
 pub fn setFrame(scope: Scope, frame: ?u64) void {
     scope_state[@intFromEnum(scope)].frame = frame;
 }
 
-pub fn info(scope: Scope, comptime fmt: []const u8, args: anytype) void {
-    emit(scope, .info, fmt, args);
+/// Pre-formatted value wrapper. Use when the default type-based
+/// rendering picks the wrong precision/specifier:
+///
+///     log.info(.gpu, "frame", .{ .ms = log.fmt("{d:.1}", .{x}) });
+///
+/// The bytes are stored inline (no allocation) so the wrapper is safe to
+/// pass through anonymous struct literals.
+pub const Fmt = struct {
+    buf: [64]u8 = undefined,
+    len: u32 = 0,
+
+    pub fn slice(self: *const Fmt) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn fmt(comptime format: []const u8, args: anytype) Fmt {
+    var f: Fmt = .{};
+    if (std.fmt.bufPrint(&f.buf, format, args)) |written| {
+        f.len = @intCast(written.len);
+    } else |_| {
+        f.len = 0;
+    }
+    return f;
 }
 
-pub fn warn(scope: Scope, comptime fmt: []const u8, args: anytype) void {
-    emit(scope, .warn, fmt, args);
+pub fn info(scope: Scope, comptime msg: []const u8, data: anytype) void {
+    if (!scope_enabled[@intFromEnum(scope)]) return;
+    emit(scope, .info, msg, data);
 }
 
-pub fn err(scope: Scope, comptime fmt: []const u8, args: anytype) void {
-    emit(scope, .err, fmt, args);
+pub fn warn(scope: Scope, comptime msg: []const u8, data: anytype) void {
+    emit(scope, .warn, msg, data);
 }
 
-/// Continuation line — same scope context, no prefix, two-space indent.
-/// For tabular dumps where a full prefix on every row would dominate.
-pub fn cont(comptime fmt: []const u8, args: anytype) void {
+pub fn err(scope: Scope, comptime msg: []const u8, data: anytype) void {
+    emit(scope, .err, msg, data);
+}
+
+/// Continuation row — no prefix, two-space indent. Used by the
+/// commit-trace dump where a full prefix on every row would dominate.
+pub fn cont(comptime msg: []const u8, data: anytype) void {
     var line: Line = .{};
     line.write("  ");
-    line.print(fmt, args);
+    line.write(msg);
+    const fields = @typeInfo(@TypeOf(data)).@"struct".fields;
+    if (fields.len != 0) {
+        if (msg.len != 0) line.write("  ");
+        writeData(&line, data);
+    }
     line.write("\n");
     flush(line.slice());
 }
@@ -152,9 +229,14 @@ const Line = struct {
         self.n += k;
     }
 
-    fn print(self: *Line, comptime fmt: []const u8, args: anytype) void {
-        const written = std.fmt.bufPrint(self.buf[self.n..], fmt, args) catch return;
-        self.n += written.len;
+    fn print(self: *Line, comptime format: []const u8, args: anytype) void {
+        if (std.fmt.bufPrint(self.buf[self.n..], format, args)) |written| {
+            self.n += written.len;
+        } else |_| {}
+    }
+
+    fn sgr(self: *Line, code: []const u8) void {
+        if (color_enabled) self.write(code);
     }
 
     fn slice(self: *const Line) []const u8 {
@@ -162,7 +244,18 @@ const Line = struct {
     }
 };
 
-fn emit(scope: Scope, level: Level, comptime fmt: []const u8, args: anytype) void {
+fn scopeTagBlock(comptime scope: Scope) []const u8 {
+    return comptime "[" ++ @tagName(scope) ++ "]" ++
+        (" " ** (tag_width - @tagName(scope).len));
+}
+
+fn scopeTagBlockRuntime(scope: Scope) []const u8 {
+    return switch (scope) {
+        inline else => |s| comptime scopeTagBlock(s),
+    };
+}
+
+fn emit(scope: Scope, level: Level, comptime msg: []const u8, data: anytype) void {
     const ns = nowNs();
     const state = &scope_state[@intFromEnum(scope)];
     const start = if (initialized) process_start_ns else ns;
@@ -178,59 +271,134 @@ fn emit(scope: Scope, level: Level, comptime fmt: []const u8, args: anytype) voi
 
     var line: Line = .{};
 
-    // Process-relative time, right-aligned in 10 chars: "+12345.6ms".
-    if (color_enabled) line.write(sgr_dim);
+    // Time block: "+12345.6ms" (11 chars). Default color — counts matter,
+    // but they shouldn't be the visual center of the line.
     line.print("+{d:>8.1}ms", .{elapsed_ms});
-    if (color_enabled) line.write(sgr_reset);
     line.write("  ");
 
-    // Per-scope delta or blank pad (same width as "Δ1234.5ms" = 10 bytes
-    // visible — Δ is one display column though it's a multi-byte UTF-8
-    // glyph, so blank pad is 9 spaces to align visually).
+    // Scope tag + delta share the scope color so they read as one block.
+    line.sgr(scopeColor(scope));
+    line.write(scopeTagBlockRuntime(scope));
+    line.write(" ");
     if (delta_ns) |d| {
         const delta_ms = @as(f64, @floatFromInt(d)) / ms_div;
-        if (color_enabled) line.write(sgr_dim);
         line.print("Δ{d:>6.1}ms", .{delta_ms});
-        if (color_enabled) line.write(sgr_reset);
     } else {
-        line.write("         ");
+        line.write("         "); // 9 visual cols, matches "Δ123.4ms"
     }
+    line.sgr(sgr_reset);
     line.write("  ");
 
-    // Scope tag in brackets, padded to fixed width.
-    const tag_name = @tagName(scope);
-    if (color_enabled) line.write(scopeColor(scope));
-    line.print("[{s}]", .{tag_name});
-    if (color_enabled) line.write(sgr_reset);
-    var pad: usize = tag_width - tag_name.len;
-    while (pad > 0) : (pad -= 1) line.write(" ");
-    line.write("  ");
-
-    // Ambient frame number for this scope. Pad to "f#NNNN" = 6 bytes.
+    // Frame block: "f#NNNN" (6 chars), or 6 spaces if unset.
     if (state.frame) |f| {
-        if (color_enabled) line.write(sgr_frame);
         line.print("f#{d:<4}", .{f});
-        if (color_enabled) line.write(sgr_reset);
     } else {
         line.write("      ");
     }
     line.write("  ");
 
-    // Level overlay colors the message body, leaves the scope tag alone
-    // so scope identity stays visible on warn/err lines.
+    // Message body. Warn/err overlay colors the body only, so the scope
+    // tag stays identifiable on noisy lines.
     switch (level) {
         .info => {},
-        .warn => if (color_enabled) line.write(sgr_yellow ++ sgr_bold),
-        .err => if (color_enabled) line.write(sgr_red ++ sgr_bold),
+        .warn => line.sgr(sgr_yellow ++ sgr_bold),
+        .err => line.sgr(sgr_red ++ sgr_bold),
     }
-    line.print(fmt, args);
+    line.write(msg);
     switch (level) {
         .info => {},
-        .warn, .err => if (color_enabled) line.write(sgr_reset),
+        .warn, .err => line.sgr(sgr_reset),
     }
-    line.write("\n");
 
+    const fields = @typeInfo(@TypeOf(data)).@"struct".fields;
+    if (fields.len != 0) {
+        if (msg.len != 0) line.write("  ");
+        writeData(&line, data);
+    }
+
+    line.write("\n");
     flush(line.slice());
+}
+
+fn writeData(line: *Line, data: anytype) void {
+    const T = @TypeOf(data);
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields, 0..) |field, i| {
+        if (i != 0) line.write("  ");
+        line.write(field.name);
+        line.write("=");
+        writeValue(line, @field(data, field.name));
+    }
+}
+
+fn writeValue(line: *Line, value: anytype) void {
+    const T = @TypeOf(value);
+
+    if (T == Fmt) {
+        line.sgr(sgr_val_num);
+        line.write(value.slice());
+        line.sgr(sgr_reset);
+        return;
+    }
+
+    const ti = @typeInfo(T);
+    switch (ti) {
+        .bool => {
+            line.sgr(sgr_val_bool);
+            line.print("{}", .{value});
+            line.sgr(sgr_reset);
+        },
+        .int, .comptime_int => {
+            line.sgr(sgr_val_num);
+            line.print("{}", .{value});
+            line.sgr(sgr_reset);
+        },
+        .float, .comptime_float => {
+            line.sgr(sgr_val_num);
+            line.print("{d:.2}", .{value});
+            line.sgr(sgr_reset);
+        },
+        .@"enum" => {
+            line.sgr(sgr_val_enum);
+            line.write(@tagName(value));
+            line.sgr(sgr_reset);
+        },
+        .error_set => {
+            line.sgr(sgr_val_err);
+            line.write(@errorName(value));
+            line.sgr(sgr_reset);
+        },
+        .optional => {
+            if (value) |v| writeValue(line, v) else {
+                line.sgr(sgr_val_null);
+                line.write("null");
+                line.sgr(sgr_reset);
+            }
+        },
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                if (p.child == u8) {
+                    line.sgr(sgr_val_str);
+                    line.write(value);
+                    line.sgr(sgr_reset);
+                } else {
+                    line.print("{any}", .{value});
+                }
+            },
+            .one => {
+                const child_ti = @typeInfo(p.child);
+                if (child_ti == .array and child_ti.array.child == u8) {
+                    line.sgr(sgr_val_str);
+                    line.print("{s}", .{value});
+                    line.sgr(sgr_reset);
+                } else {
+                    line.print("{*}", .{value});
+                }
+            },
+            else => line.print("{any}", .{value}),
+        },
+        else => line.print("{any}", .{value}),
+    }
 }
 
 fn flush(bytes: []const u8) void {

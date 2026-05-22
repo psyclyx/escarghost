@@ -97,9 +97,11 @@ pub const GpuPipeline = struct {
     config: render_env.RenderConfig,
 
     scratch_ready: bool = false,
-    debug_log_renderers: bool = false,
-    debug_log_frames: bool = false,
-    debug_log_atlas: bool = false,
+    /// Enables expensive per-frame GL instrumentation: glFinish to wait
+    /// for the draw to complete before reading back, glReadPixels to
+    /// sample the FBO, and the scene-sample log line. Driven by
+    /// SCRGO_TRACE; off in normal use.
+    trace_frames: bool = false,
     debug_reset_atlas_each_frame: bool = false,
 
     pub var frame_stats: perf.FrameStats = .{};
@@ -283,10 +285,8 @@ pub const GpuPipeline = struct {
         self.debug_reset_atlas_each_frame = enabled;
     }
 
-    pub fn setDebugLogs(self: *GpuPipeline, options: render_env.RendererDebug) void {
-        self.debug_log_renderers = options.renderers;
-        self.debug_log_frames = options.frames;
-        self.debug_log_atlas = options.atlas;
+    pub fn setTraceFrames(self: *GpuPipeline, enabled: bool) void {
+        self.trace_frames = enabled;
     }
 
     /// Resize the drawable. Pure window-resize; cell metrics are unchanged.
@@ -326,9 +326,7 @@ pub const GpuPipeline = struct {
         self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
 
-        if (self.debug_log_atlas) {
-            log.info(.gpu, "atlas snapshot  identity={}", .{identity});
-        }
+        log.info(.gpu, "atlas snapshot", .{ .identity = identity });
         return atlas;
     }
 
@@ -577,7 +575,7 @@ pub const GpuPipeline = struct {
         // fire-and-forget; for a readback we need the FBO to actually have
         // its contents before glReadPixels samples it. (The cost is paid
         // only when frame logging is on.)
-        if (self.debug_log_frames) gl.glFinish() else gl.glFlush();
+        if (self.trace_frames) gl.glFinish() else gl.glFlush();
         phase_draw_ns += draw_t0.elapsedNs();
         phase_frame_count += 1;
 
@@ -588,13 +586,14 @@ pub const GpuPipeline = struct {
         var error_count: u32 = 0;
         while (gl_err != gl.GL_NO_ERROR and error_count < 4) {
             error_count += 1;
-            if (self.debug_log_frames) {
-                log.warn(.gpu, "GL error after drawPass  code=0x{x}  frame={}", .{ gl_err, phase_frame_count });
-            }
+            log.warn(.gpu, "GL error after drawPass", .{
+                .code = log.fmt("0x{x}", .{gl_err}),
+                .frame = phase_frame_count,
+            });
             gl_err = gl.glGetError();
         }
 
-        if (self.debug_log_frames) {
+        if (self.trace_frames) {
             // Sample 5 pixels across the FBO to see what actually landed in
             // it. If the dmabuf is all bg color (or all zero) while scene
             // stats show content, the snail/GL pipeline produced an empty
@@ -607,17 +606,19 @@ pub const GpuPipeline = struct {
             for (sample_xs, 0..) |x, i| {
                 gl.glReadPixels(x, sample_y, 1, 1, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, &pixels[i]);
             }
-            log.info(.gpu, "scene  frame={}  rects={}  blobs={}  glyphs={}  rows={}  px=[{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}]", .{
-                phase_frame_count,
-                scene_shapes,
-                scene_text_blobs,
-                total_glyphs,
-                built.rows.len,
-                pixels[0][0], pixels[0][1], pixels[0][2],
-                pixels[1][0], pixels[1][1], pixels[1][2],
-                pixels[2][0], pixels[2][1], pixels[2][2],
-                pixels[3][0], pixels[3][1], pixels[3][2],
-                pixels[4][0], pixels[4][1], pixels[4][2],
+            log.info(.gpu, "scene", .{
+                .frame = phase_frame_count,
+                .rects = scene_shapes,
+                .blobs = scene_text_blobs,
+                .glyphs = total_glyphs,
+                .rows = built.rows.len,
+                .px = log.fmt("[{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}]", .{
+                    pixels[0][0], pixels[0][1], pixels[0][2],
+                    pixels[1][0], pixels[1][1], pixels[1][2],
+                    pixels[2][0], pixels[2][1], pixels[2][2],
+                    pixels[3][0], pixels[3][1], pixels[3][2],
+                    pixels[4][0], pixels[4][1], pixels[4][2],
+                }),
             });
         }
     }

@@ -15,16 +15,6 @@ const c = @cImport({
     @cInclude("stdlib.h");
 });
 
-fn rendererDebugOptions() render_env.RendererDebug {
-    if (c.getenv("SCRGO_LOG")) |value|
-        return render_env.parseRendererDebug(std.mem.sliceTo(value, 0));
-    return .{};
-}
-
-fn cpuRendererDebugEnabled() bool {
-    return rendererDebugOptions().renderers;
-}
-
 pub const BufferCount = 2;
 const SnapshotSlotCount = 2;
 
@@ -101,7 +91,7 @@ pub const Frontend = struct {
             self.response_fds = [_]c_int{-1} ** 2;
         }
         self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
-        if (cpuRendererDebugEnabled()) log.info(.cpu, "spawned", .{});
+        log.info(.cpu, "spawned", .{});
     }
 
     pub fn start(
@@ -118,7 +108,7 @@ pub const Frontend = struct {
         self.atlas_thread = atlas_thread;
         try self.ensureBuffers(shm_opaque, width, height);
         self.active = true;
-        if (cpuRendererDebugEnabled()) log.info(.cpu, "started  width={}  height={}", .{ width, height });
+        log.info(.cpu, "started", .{ .width = width, .height = height });
     }
 
     pub fn stop(self: *Frontend) void {
@@ -142,7 +132,7 @@ pub const Frontend = struct {
         self.render_in_flight = false;
         self.stop_requested = false;
         self.snapshot_busy = [_]bool{false} ** SnapshotSlotCount;
-        if (cpuRendererDebugEnabled()) log.info(.cpu, "stopped", .{});
+        log.info(.cpu, "stopped", .{});
     }
 
     pub fn ensureBuffers(self: *Frontend, shm_opaque: *anyopaque, width: u32, height: u32) !void {
@@ -157,7 +147,11 @@ pub const Frontend = struct {
         }
         self.width = width;
         self.height = height;
-        if (cpuRendererDebugEnabled()) log.info(.cpu, "buffers ready  width={}  height={}  count={}", .{ width, height, self.buffer_count });
+        log.info(.cpu, "buffers ready", .{
+            .width = width,
+            .height = height,
+            .count = self.buffer_count,
+        });
     }
 
     pub fn freeBufferIndex(self: *Frontend) ?u8 {
@@ -213,11 +207,11 @@ pub const Frontend = struct {
         self.render_in_flight = true;
         _ = c.pthread_cond_signal(&self.cond);
         log.setFrame(.cpu, serial);
-        if (cpuRendererDebugEnabled()) log.info(.cpu, "queue frame  buffer={}  snapshot={}  width={}  height={}", .{
-            buffer_index,
-            snapshot_slot,
-            width,
-            height,
+        log.info(.cpu, "queue frame", .{
+            .buffer = buffer_index,
+            .snapshot = snapshot_slot,
+            .width = width,
+            .height = height,
         });
     }
 
@@ -243,9 +237,9 @@ pub const Frontend = struct {
     }
 
     fn workerMain(self: *Frontend) void {
-        if (cpuRendererDebugEnabled()) log.info(.cpu, "thread running", .{});
+        log.info(.cpu, "thread running", .{});
         var ctx = cpu_pipeline.CpuPipeline.init(std.heap.smp_allocator) catch |e| {
-            log.err(.cpu, "init failed  err={s}", .{@errorName(e)});
+            log.err(.cpu, "init failed", .{ .err = e });
             return;
         };
         defer ctx.deinit();
@@ -275,8 +269,9 @@ pub const Frontend = struct {
                     const snapshot_slot = request.snapshot_slot;
                     log.setFrame(.cpu, request.serial);
                     if (buffer_index >= self.buffer_count or snapshot_slot >= SnapshotSlotCount) {
-                        log.warn(.cpu, "reject frame  buffer={}  snapshot={}", .{
-                            buffer_index, snapshot_slot,
+                        log.warn(.cpu, "reject frame", .{
+                            .buffer = buffer_index,
+                            .snapshot = snapshot_slot,
                         });
                         writeResponse(self.response_fds[1], .{
                             .tag = .failed,
@@ -289,7 +284,7 @@ pub const Frontend = struct {
 
                     const buffer = &self.buffers[buffer_index];
                     const map_ptr = buffer.map_ptr orelse {
-                        log.warn(.cpu, "missing shm map  buffer={}", .{buffer_index});
+                        log.warn(.cpu, "missing shm map", .{ .buffer = buffer_index });
                         writeResponse(self.response_fds[1], .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
@@ -313,7 +308,7 @@ pub const Frontend = struct {
                         request.cell_width,
                         request.cell_height,
                     ) catch |e| {
-                        log.err(.cpu, "render failed  buffer={}  err={s}", .{ buffer_index, @errorName(e) });
+                        log.err(.cpu, "render failed", .{ .buffer = buffer_index, .err = e });
                         writeResponse(self.response_fds[1], .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
@@ -327,8 +322,10 @@ pub const Frontend = struct {
                         if (self.atlas_thread) |thread| thread.requestMany(&misses);
                     }
                     const elapsed_ms = timer.elapsedMs();
-                    if (cpuRendererDebugEnabled()) log.info(.cpu, "frame complete  buffer={}  snapshot={}  elapsed_ms={d:.1}", .{
-                        buffer_index, snapshot_slot, elapsed_ms,
+                    log.info(.cpu, "frame complete", .{
+                        .buffer = buffer_index,
+                        .snapshot = snapshot_slot,
+                        .elapsed_ms = log.fmt("{d:.1}", .{elapsed_ms}),
                     });
                     writeResponse(self.response_fds[1], .{
                         .tag = .frame,
@@ -338,8 +335,9 @@ pub const Frontend = struct {
                     });
                     if (warn_slow_budget_ms) |budget_ms| {
                         if (elapsed_ms > @as(f64, @floatFromInt(budget_ms))) {
-                            log.warn(.cpu, "slow frame  elapsed_ms={d:.1}  budget_ms={}", .{
-                                elapsed_ms, budget_ms,
+                            log.warn(.cpu, "slow frame", .{
+                                .elapsed_ms = log.fmt("{d:.1}", .{elapsed_ms}),
+                                .budget_ms = budget_ms,
                             });
                         }
                     }

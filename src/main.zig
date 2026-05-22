@@ -30,12 +30,6 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 
 const monotonicNowNs = diagnostics.monotonicNowNs;
 
-fn rendererDebugOptions() render_env.RendererDebug {
-    if (getenv("SCRGO_LOG")) |value|
-        return render_env.parseRendererDebug(value);
-    return .{};
-}
-
 pub fn main(init: std.process.Init) !void {
     log.init();
     var state: app_state.AppState = .{};
@@ -89,31 +83,23 @@ pub fn main(init: std.process.Init) !void {
     // ── Phase 0: config + spawn GPU thread ──
     var cfg = try config_mod.load(allocator);
     defer cfg.deinit(allocator);
-    state.debug.renderer_debug = rendererDebugOptions();
     state.debug.warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
-    wayland_mod.Wayland.log_frame_events = state.debug.renderer_debug.frames;
-    state.diag.debug = state.debug.renderer_debug;
-    // Background memory poller (SCRGO_LOG=commits). Mirrors what the
+    state.diag.trace_commits = render_env.parseTraceCommits(getenv("SCRGO_TRACE"));
+    // Background memory poller (SCRGO_TRACE=commits). Mirrors what the
     // bench's poller thread sees from outside the process.
     const mem_thread = state.diag.startMemPollThread();
     defer state.diag.stopMemPollThread(mem_thread);
     const runtime_flags = render_env.parseRuntimeFlags(getenv("SCRGO_FLAGS"));
     const requested_render_path = render_env.parseRequestedRenderPath(getenv("SCRGO_RENDERER"));
-    if (state.debug.renderer_debug.startup) {
-        log.info(.main, "debug flags  startup={}  renderers={}  frames={}  atlas={}  pty={}  reset_atlas={}", .{
-            state.debug.renderer_debug.startup,
-            state.debug.renderer_debug.renderers,
-            state.debug.renderer_debug.frames,
-            state.debug.renderer_debug.atlas,
-            state.debug.renderer_debug.pty,
-            runtime_flags.reset_atlas_each_frame,
-        });
-        log.info(.main, "requested renderer  mode={s}", .{@tagName(requested_render_path)});
-    }
+    log.info(.main, "startup", .{
+        .reset_atlas = runtime_flags.reset_atlas_each_frame,
+        .renderer = requested_render_path,
+        .trace_commits = state.diag.trace_commits,
+    });
 
     const gpu_allowed = requested_render_path != .cpu;
-    if (state.debug.renderer_debug.startup and !gpu_allowed) {
-        log.info(.gpu, "disabled  reason=SCRGO_RENDERER=cpu", .{});
+    if (!gpu_allowed) {
+        log.info(.gpu, "disabled", .{ .reason = "SCRGO_RENDERER=cpu" });
     }
 
     var gpu: gpu_worker.GpuWorker = .{};
@@ -129,21 +115,17 @@ pub fn main(init: std.process.Init) !void {
     var cpu: cpu_renderer_worker.Frontend = .{};
     defer cpu.stop();
     cpu.spawnThread() catch |e| {
-        log.err(.cpu, "thread spawn failed  err={s}", .{@errorName(e)});
+        log.err(.cpu, "thread spawn failed", .{ .err = e });
     };
-    if (state.debug.renderer_debug.startup) {
-        log.info(.cpu, "thread spawned", .{});
-    }
+    log.info(.cpu, "thread spawned", .{});
 
     // Start GPU thread early — it begins EGL init immediately, no deps needed
     if (gpu_allowed) {
         gpu.start() catch |e| {
-            log.err(.gpu, "thread start failed  err={s}", .{@errorName(e)});
+            log.err(.gpu, "thread start failed", .{ .err = e });
             state.render.gpu_restart.scheduleRetry();
         };
-        if (state.debug.renderer_debug.startup) {
-            log.info(.gpu, "thread started", .{});
-        }
+        log.info(.gpu, "thread started", .{});
     }
 
     // Start atlas thread with font+atlas bootstrap — overlaps with Wayland init
@@ -163,18 +145,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (wl.commitSolidBackground(cfg.background.r, cfg.background.g, cfg.background.b, 255)) {
         state.diag.recordCommit('b');
-        if (state.debug.renderer_debug.startup) {
-            log.info(.frame, "bg committed  path=solid", .{});
-        }
+        log.info(.frame, "bg committed", .{ .path = "solid" });
     } else if (wl.shm) |shm| {
         var bg_frame = cpu_pipeline.ShmFrame.create(@ptrCast(shm), wl.width, wl.height);
         if (bg_frame) |*frame| {
             frame.fillBackground(cfg.background);
             frame.commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
             state.diag.recordCommit('b');
-            if (state.debug.renderer_debug.startup) {
-                log.info(.frame, "bg committed  path=shm", .{});
-            }
+            log.info(.frame, "bg committed", .{ .path = "shm" });
             frame.destroy();
         }
     }
@@ -192,9 +170,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(atlas_thread.bootstrap_font_path);
     const atlas_ref_ptr = atlas_thread.atlas_ref;
     state.refs.atlas_ref = atlas_ref_ptr;
-    if (state.debug.renderer_debug.startup) {
-        log.info(.atlas, "font ready", .{});
-    }
+    log.info(.atlas, "font ready", .{});
 
     var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
     defer bootstrap_atlas_lease.release();
@@ -214,9 +190,7 @@ pub fn main(init: std.process.Init) !void {
         try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
     defer pty.close();
 
-    if (state.debug.renderer_debug.startup) {
-        log.info(.pty, "forked  cols={}  rows={}", .{ grid.cols, grid.rows });
-    }
+    log.info(.pty, "forked", .{ .cols = grid.cols, .rows = grid.rows });
 
     var term: terminal_mod.Terminal = undefined;
     try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
@@ -228,29 +202,23 @@ pub fn main(init: std.process.Init) !void {
         if (atlas_thread.bootstrap_err) |err| return err;
         return error.BootstrapFailed;
     }
-    if (state.debug.renderer_debug.startup) {
-        log.info(.atlas, "ready", .{});
-    }
+    log.info(.atlas, "ready", .{});
 
     if (wl.shm) |shm| {
         cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |e| {
-            log.err(.cpu, "start failed  err={s}", .{@errorName(e)});
+            log.err(.cpu, "start failed", .{ .err = e });
         };
     }
-    if (state.debug.renderer_debug.startup) {
-        log.info(.cpu, "started", .{});
-    }
+    log.info(.cpu, "started", .{});
 
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
         gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |e| {
-            log.err(.gpu, "initial configure failed  err={s}", .{@errorName(e)});
+            log.err(.gpu, "initial configure failed", .{ .err = e });
             gpu.stop();
             state.render.gpu_restart.scheduleRetry();
         };
-        if (state.debug.renderer_debug.startup) {
-            log.info(.gpu, "configured", .{});
-        }
+        log.info(.gpu, "configured", .{});
     } else if (gpu.active) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
     }
@@ -310,12 +278,10 @@ pub fn main(init: std.process.Init) !void {
     var drain_deadline_ns: u64 = 0;
     const drain_timeout_ns: u64 = 250 * std.time.ns_per_ms;
 
-    if (state.debug.renderer_debug.startup) {
-        log.info(.main, "loop entry", .{});
-    }
+    log.info(.main, "loop entry", .{});
 
     main_loop: while (!wl.closed) {
-        if (state.debug.renderer_debug.commits and child_exited and state.diag.t_child_exited_ns == 0) {
+        if (state.diag.trace_commits and child_exited and state.diag.t_child_exited_ns == 0) {
             state.diag.t_child_exited_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
         }
         if (child_exited and !draining) {
@@ -330,9 +296,7 @@ pub fn main(init: std.process.Init) !void {
             }
             draining = true;
             drain_deadline_ns = monotonicNowNs() + drain_timeout_ns;
-            if (state.debug.renderer_debug.startup) {
-                log.info(.main, "child exited, draining final frame", .{});
-            }
+            log.info(.main, "child exited, draining final frame", .{});
         }
 
         if (draining) {
@@ -344,23 +308,19 @@ pub fn main(init: std.process.Init) !void {
             const renderers_idle = !gpu.render_in_flight and !cpu.render_in_flight;
             if (painted and renderers_idle) break;
             if (monotonicNowNs() >= drain_deadline_ns) {
-                if (state.debug.renderer_debug.startup) {
-                    log.warn(.main, "drain timed out", .{});
-                }
+                log.warn(.main, "drain timed out", .{});
                 break;
             }
         }
 
         if (!gpu.active and state.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and state.render.gpu_restart.due()) {
             gpu.start() catch |err| {
-                log.err(.gpu, "restart failed: {}", .{err});
+                log.err(.gpu, "restart failed", .{ .err = err });
                 state.render.gpu_restart.scheduleRetry();
                 continue;
             };
             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
-            if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                log.info(.gpu, "restarting", .{});
-            }
+            log.info(.gpu, "restarting", .{});
             state.render.gpu_restart.deadline_ns = null;
         }
 
@@ -375,7 +335,7 @@ pub fn main(init: std.process.Init) !void {
             state.render.gpu_reconfigure_requested = false;
             if (gpu.active and gpu.context_ready) {
                 gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |err| {
-                    log.err(.gpu, "reconfigure failed: {}", .{err});
+                    log.err(.gpu, "reconfigure failed", .{ .err = err });
                     render_loop.noteGpuUnavailable(&state);
                     continue;
                 };
@@ -406,9 +366,9 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (atlas_thread.active) atlas_thread.responseFd() else -1, .events = if (atlas_thread.active) c.POLLIN else 0, .revents = 0 },
         };
 
-        const poll_t0 = if (state.debug.renderer_debug.commits) monotonicNowNs() else 0;
+        const poll_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
         const poll_rc = c.poll(&pollfds, 5, poll_timeout);
-        if (state.debug.renderer_debug.commits) {
+        if (state.diag.trace_commits) {
             state.diag.phase_poll_ns += monotonicNowNs() - poll_t0;
             state.diag.phase_poll_calls += 1;
         }
@@ -437,14 +397,12 @@ pub fn main(init: std.process.Init) !void {
             if (resp_opt) |resp| {
                 switch (resp.tag) {
                     .context_ready => {
-                        if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                            log.info(.gpu, "context ready", .{});
-                        }
+                        log.info(.gpu, "context ready", .{});
                         if (gpu.atlas_ref == null) {
                             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
                         }
                         gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |e| {
-                            log.err(.gpu, "configure after context_ready failed  err={s}", .{@errorName(e)});
+                            log.err(.gpu, "configure after context_ready failed", .{ .err = e });
                             render_loop.noteGpuUnavailable(&state);
                             continue;
                         };
@@ -452,15 +410,13 @@ pub fn main(init: std.process.Init) !void {
                     .ready => {
                         if (wl.linux_dmabuf) |linux_dmabuf| {
                             gpu.installBuffers(@ptrCast(linux_dmabuf)) catch |e| {
-                                log.err(.gpu, "dmabuf import failed  err={s}", .{@errorName(e)});
+                                log.err(.gpu, "dmabuf import failed", .{ .err = e });
                                 render_loop.noteGpuUnavailable(&state);
                                 continue;
                             };
                             state.render.gpu_snapshot_dirty = true;
                             state.render.gpu_restart.clear();
-                            if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                                log.info(.gpu, "ready", .{});
-                            }
+                            log.info(.gpu, "ready", .{});
                         } else {
                             render_loop.noteGpuUnavailable(&state);
                         }
@@ -471,9 +427,7 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommit('d');
                         } else {
                             log.setFrame(.frame, resp.serial);
-                            if (state.debug.renderer_debug.renderers) {
-                                log.info(.gpu, "frame ready  buffer={}", .{resp.buffer_index});
-                            }
+                            log.info(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
                                 // Commit immediately. If the compositor
                                 // still has the prior frame pending,
@@ -487,15 +441,11 @@ pub fn main(init: std.process.Init) !void {
                                 state.diag.recordCommitSerial('g', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                                 if (!wl.frame_pending) wl.requestFrame();
                                 if (state.render.active_render_path != .gpu) {
-                                    if (state.debug.renderer_debug.frames) {
-                                        log.info(.frame, "path switch  from=cpu  to=gpu", .{});
-                                    }
+                                    log.info(.frame, "path switch", .{ .from = "cpu", .to = "gpu" });
                                     state.render.active_render_path = .gpu;
                                 }
                                 if (!gpu.first_frame_presented) {
-                                    if (state.debug.renderer_debug.frames or state.debug.renderer_debug.renderers or state.debug.renderer_debug.startup) {
-                                        log.info(.gpu, "first paint", .{});
-                                    }
+                                    log.info(.gpu, "first paint", .{});
                                     gpu.first_frame_presented = true;
                                 }
                                 render_loop.markFirstContentPaint(&state);
@@ -539,20 +489,18 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
                             log.setFrame(.frame, resp.serial);
-                            if (state.debug.renderer_debug.frames) {
-                                log.info(.cpu, "frame committed  buffer={}", .{resp.buffer_index});
-                            }
+                            log.info(.cpu, "frame committed", .{ .buffer = resp.buffer_index });
                             render_loop.markFirstContentPaint(&state);
-                        } else if (state.debug.renderer_debug.frames) {
+                        } else {
                             const reason: []const u8 = if (!buffer_ok)
                                 "bad_buffer_index"
                             else if (!path_ok)
                                 "active_path_is_gpu"
                             else
                                 "size_mismatch";
-                            log.warn(.cpu, "frame dropped  buffer={}  reason={s}", .{
-                                resp.buffer_index,
-                                reason,
+                            log.warn(.cpu, "frame dropped", .{
+                                .buffer = resp.buffer_index,
+                                .reason = reason,
                             });
                         }
                         // Only clear dirty if no new PTY data arrived
@@ -573,16 +521,14 @@ pub fn main(init: std.process.Init) !void {
             if (resp_opt) |resp| {
                 switch (resp.tag) {
                     .updated => {
-                        if (state.debug.renderer_debug.renderers or state.debug.renderer_debug.atlas) {
-                            log.info(.atlas, "applied  codepoints={}  added_pages={}", .{
-                                resp.requested_count,
-                                resp.added_pages,
-                            });
-                        }
+                        log.info(.atlas, "applied", .{
+                            .codepoints = resp.requested_count,
+                            .added_pages = resp.added_pages,
+                        });
                         render_loop.markRenderDirty(&state);
                     },
                     .failed => {
-                        log.err(.atlas, "update failed  codepoints={}", .{resp.requested_count});
+                        log.err(.atlas, "update failed", .{ .codepoints = resp.requested_count });
                     },
                     .font_ready, .bootstrap_ready => {},
                 }
@@ -607,38 +553,32 @@ pub fn main(init: std.process.Init) !void {
             const read_start_ns = monotonicNowNs();
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
             while (true) {
-                const read_t0 = if (state.debug.renderer_debug.commits) monotonicNowNs() else 0;
+                const read_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
                 const n = pty.read(&pty_buf) catch |e| switch (e) {
                     error.WouldBlock => break,
                     else => {
-                        if (state.debug.renderer_debug.startup or state.debug.renderer_debug.pty) {
-                            log.err(.pty, "read failed, exiting  err={s}", .{@errorName(e)});
-                        }
+                        log.err(.pty, "read failed, exiting", .{ .err = e });
                         child_exited = true;
                         break;
                     },
                 };
                 if (n == 0) {
-                    if (state.debug.renderer_debug.startup or state.debug.renderer_debug.pty) {
-                        log.info(.pty, "eof, exiting", .{});
-                    }
+                    log.info(.pty, "eof, exiting", .{});
                     child_exited = true;
                     break;
                 }
-                if (state.debug.renderer_debug.pty) {
-                    log.info(.pty, "read  bytes={}", .{n});
-                }
-                if (state.debug.renderer_debug.commits) {
+                log.info(.pty, "read", .{ .bytes = n });
+                if (state.diag.trace_commits) {
                     state.diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
                     state.diag.phase_bytes_read += @intCast(n);
                 }
-                const feed_t0 = if (state.debug.renderer_debug.commits) monotonicNowNs() else 0;
+                const feed_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
                 term.feedData(pty_buf[0..n]);
-                if (state.debug.renderer_debug.commits) {
+                if (state.diag.trace_commits) {
                     state.diag.phase_feed_data_ns += monotonicNowNs() - feed_t0;
                     state.diag.phase_feed_calls += 1;
                 }
-                if (state.debug.renderer_debug.commits and state.diag.t_first_pty_ns == 0) {
+                if (state.diag.trace_commits and state.diag.t_first_pty_ns == 0) {
                     state.diag.t_first_pty_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
                 }
                 state.lifecycle.first_pty_data_seen = true;
@@ -649,11 +589,9 @@ pub fn main(init: std.process.Init) !void {
 
         if (!child_exited) {
             if (pty.checkChild()) |status| {
-                if (state.debug.renderer_debug.startup or state.debug.renderer_debug.pty) {
-                    log.info(.pty, "child exited, exiting  status={}", .{status});
-                }
+                log.info(.pty, "child exited, exiting", .{ .status = status });
                 child_exited = true;
-                if (state.debug.renderer_debug.commits and state.diag.t_child_exited_ns == 0) {
+                if (state.diag.trace_commits and state.diag.t_child_exited_ns == 0) {
                     state.diag.t_child_exited_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
                 }
             }
@@ -665,12 +603,10 @@ pub fn main(init: std.process.Init) !void {
         render_loop.maybeQueueGpuFrame(&state);
     }
 
-    if (state.debug.renderer_debug.commits) {
+    if (state.diag.trace_commits) {
         state.diag.t_main_loop_exit_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
     }
-    if (state.debug.renderer_debug.startup) {
-        log.info(.main, "loop exit", .{});
-    }
+    log.info(.main, "loop exit", .{});
     state.diag.dumpExitReport(.{
         .wl_closed = wl.closed,
         .child_exited = child_exited,
