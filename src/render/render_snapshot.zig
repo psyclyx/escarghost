@@ -49,7 +49,12 @@ pub const Header = struct {
     cursor_visible: u8 = 0,
     cursor_in_viewport: u8 = 0,
     cursor_has_color: u8 = 0,
-    reserved: u8 = 0,
+    /// Visual bell is in flight for this frame. Snapshot has already
+    /// been captured with default_fg/default_bg swapped and per-cell
+    /// `inverse` toggled, so renderers don't need any special
+    /// handling — it's surfaced here so diagnostics can tell why the
+    /// screen briefly inverted.
+    bell_visual: u8 = 0,
     /// Absolute screen-y of viewport row 0. Used by selection
     /// resolution to convert anchor/head screen coordinates back into
     /// viewport rows. Zero when there's no scrollback.
@@ -108,6 +113,7 @@ pub fn prepare(
     term: *terminal_mod.Terminal,
     selection: ?selection_mod.Snapshot,
     scrollbar: ?ScrollbarOverlay,
+    bell_visual: bool,
 ) !void {
     const t0 = monotonicNs();
     try term.updateRenderState();
@@ -115,6 +121,7 @@ pub fn prepare(
     updateRenderStateCount += 1;
     snapshot.selection = selection;
     snapshot.scrollbar = scrollbar;
+    snapshot.header.bell_visual = @intFromBool(bell_visual);
 }
 
 /// Walk the terminal's render_state (already populated by `prepare`) into
@@ -125,8 +132,13 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atl
     const cursor = term.getCursor();
     const primary = atlas.primaryFaceIndex() catch 0;
 
-    snapshot.header.default_fg = colors.foreground;
-    snapshot.header.default_bg = colors.background;
+    // Visual bell: swap default fg/bg here. Per-cell inverse is also
+    // toggled below so cells with explicit fg/bg overrides participate
+    // in the flash — the combined effect is "every visible color
+    // inverts for the duration of the bell".
+    const bell_active = snapshot.header.bell_visual != 0;
+    snapshot.header.default_fg = if (bell_active) colors.background else colors.foreground;
+    snapshot.header.default_bg = if (bell_active) colors.foreground else colors.background;
     snapshot.header.cursor_color = colors.cursor orelse colors.foreground;
     snapshot.header.cursor_x = cursor.x;
     snapshot.header.cursor_y = cursor.y;
@@ -157,11 +169,14 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atl
             if (cell_index >= MaxCells) break;
 
             const info = term.getCellInfo();
+            // Visual bell flips `inverse` so per-cell fg/bg overrides
+            // participate alongside the swapped defaults.
+            const inv = (info.style.inverse != false) != bell_active;
             const flags: CellFlags = .{
                 .has_text = info.has_text,
                 .has_fg = info.fg != null,
                 .has_bg = info.bg != null,
-                .inverse = info.style.inverse != false,
+                .inverse = inv,
                 .faint = info.style.faint != false,
                 .underline = info.style.underline != 0,
                 .strikethrough = info.style.strikethrough != false,
@@ -217,7 +232,8 @@ pub fn capture(
     atlas: *const snail.TextAtlas,
     selection: ?selection_mod.Snapshot,
     scrollbar: ?ScrollbarOverlay,
+    bell_visual: bool,
 ) !void {
-    try prepare(snapshot, term, selection, scrollbar);
+    try prepare(snapshot, term, selection, scrollbar, bell_visual);
     try captureCells(snapshot, term, atlas);
 }

@@ -9,6 +9,7 @@ const atlas_worker = @import("render/atlas_worker.zig");
 const cpu_worker = @import("render/cpu_worker.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
 const diagnostics = @import("diagnostics.zig");
+const bell_mod = @import("bell.zig");
 
 pub const RenderPath = enum {
     cpu,
@@ -91,6 +92,7 @@ pub const Refs = struct {
     gpu: *gpu_worker.GpuWorker = undefined,
     cpu: *cpu_worker.Frontend = undefined,
     atlas_thread: *atlas_worker.AtlasWorker = undefined,
+    bell: *bell_mod.Manager = undefined,
 };
 
 pub const Metrics = struct {

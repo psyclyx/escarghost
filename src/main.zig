@@ -16,6 +16,7 @@ const render_loop = @import("render_loop.zig");
 const input = @import("input.zig");
 const log = @import("log.zig");
 const cli = @import("cli.zig");
+const bell_mod = @import("bell.zig");
 
 const c = @cImport({
     @cInclude("poll.h");
@@ -221,6 +222,14 @@ pub fn main(init: std.process.Init) !void {
     try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
+    // Bell handler — installed before any PTY data can flow.
+    var bell = try bell_mod.Manager.init(allocator, cfg.bell);
+    defer bell.deinit();
+    bell_mod.g_manager = &bell;
+    defer bell_mod.g_manager = null;
+    term.on_bell = bell_mod.callback;
+    state.refs.bell = &bell;
+
     // ── Phase 4: wait for atlas (ASCII rasterization), start renderers ──
     const atlas_resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
     if (atlas_resp.tag == .failed) {
@@ -370,6 +379,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         render_loop.maybeScheduleScrollbarHide(&state);
+        render_loop.maybeScheduleBellHide(&state);
         render_loop.maybeQueueGpuFrame(&state);
         render_loop.renderActivePath(&state);
         wl.flush();
@@ -381,7 +391,11 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
         const scroll_timeout = render_loop.scrollbarTimeoutMs(&state);
-        const poll_timeout = render_loop.combineTimeout(render_loop.combineTimeout(repeat_timeout, restart_timeout), scroll_timeout);
+        const bell_timeout = bell.visualTimeoutMs();
+        const poll_timeout = render_loop.combineTimeout(
+            render_loop.combineTimeout(render_loop.combineTimeout(repeat_timeout, restart_timeout), scroll_timeout),
+            bell_timeout,
+        );
 
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },

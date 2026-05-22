@@ -1,5 +1,6 @@
 const std = @import("std");
 const color = @import("color");
+const bell_mod = @import("bell.zig");
 const Rgb = color.Rgb;
 
 const c = @cImport({
@@ -53,6 +54,10 @@ pub const Config = struct {
 
     // Scroll
     scroll_lines: u32 = 3, // lines per scroll event
+
+    // Bell behavior. mode=visual matches what users get without
+    // touching config.
+    bell: bell_mod.Config = .{},
 
     // GPU renderer restart policy
     gpu_restart_initial_delay_ms: u32 = 250,
@@ -309,6 +314,23 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
 
     if (obj.get("generate_256_from_base16")) |v| {
         if (v == .bool) cfg.generate_256 = v.bool;
+    }
+
+    if (obj.get("bell")) |bv| {
+        if (bv == .object) {
+            const bo = bv.object;
+            if (bo.get("mode")) |mv| {
+                if (mv == .string) {
+                    cfg.bell.mode = bell_mod.parseMode(mv.string) orelse cfg.bell.mode;
+                }
+            }
+            if (bo.get("visual_duration_ms")) |vv| {
+                if (vv == .integer and vv.integer >= 0) cfg.bell.visual_duration_ms = @intCast(vv.integer);
+            }
+            if (bo.get("audible_debounce_ms")) |vv| {
+                if (vv == .integer and vv.integer >= 0) cfg.bell.audible_debounce_ms = @intCast(vv.integer);
+            }
+        }
     }
 
     if (obj.get("gpu_restart_initial_delay_ms")) |v| {

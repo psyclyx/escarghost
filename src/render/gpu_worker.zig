@@ -513,6 +513,7 @@ pub const GpuWorker = struct {
         serial: u32,
         selection: ?@import("../selection.zig").Snapshot,
         scrollbar: ?render_snapshot.ScrollbarOverlay,
+        bell_visual: bool,
     ) !void {
         if (!self.active or !self.ready) return error.NotReady;
         if (self.render_in_flight or self.request_pending) return error.Busy;
@@ -526,7 +527,7 @@ pub const GpuWorker = struct {
         // again. The acquired lease moves into the request so the atlas
         // outlives iteration; the worker releases it.
         const snap_t0 = monotonicNs();
-        try render_snapshot.prepare(&self.snapshots[snapshot_slot], term, selection, scrollbar);
+        try render_snapshot.prepare(&self.snapshots[snapshot_slot], term, selection, scrollbar, bell_visual);
         snapshotPhaseAccumNs += monotonicNs() - snap_t0;
         snapshotPhaseCount += 1;
         self.snapshot_busy[snapshot_slot] = true;

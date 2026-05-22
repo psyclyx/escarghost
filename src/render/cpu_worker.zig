@@ -179,6 +179,7 @@ pub const Frontend = struct {
         serial: u32,
         selection: ?@import("../selection.zig").Snapshot,
         scrollbar: ?render_snapshot.ScrollbarOverlay,
+        bell_visual: bool,
     ) !void {
         if (!self.active) return error.Inactive;
         if (self.render_in_flight or self.request_pending) return error.Busy;
@@ -187,7 +188,7 @@ pub const Frontend = struct {
 
         var atlas_lease = self.atlas_ref.acquire();
         defer atlas_lease.release();
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get(), selection, scrollbar);
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get(), selection, scrollbar, bell_visual);
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);

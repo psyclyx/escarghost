@@ -70,6 +70,19 @@ pub fn maybeScheduleScrollbarHide(s: *app_state.AppState) void {
     markRenderDirty(s);
 }
 
+/// Called once per loop iteration. Marks a redraw when the visual
+/// bell deadline has elapsed so the trailing non-inverted frame
+/// commits. `clearVisualIfExpired` is called only after the render
+/// is queued so the dirty cycle picks up the still-inverted snapshot
+/// followed by the un-inverted one.
+pub fn maybeScheduleBellHide(s: *app_state.AppState) void {
+    const bell = s.refs.bell;
+    if (bell.visual_until_ns == 0) return;
+    if (diagnostics.monotonicNowNs() < bell.visual_until_ns) return;
+    bell.visual_until_ns = 0;
+    markRenderDirty(s);
+}
+
 /// Vsync-gate the GPU render. Without this we'd kick off the render
 /// whenever PTY produced fresh data — which lands at arbitrary phase
 /// inside the vsync window. If the data arrives 12 ms into a 16.7 ms
@@ -83,7 +96,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     if (s.render.target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !s.render.gpu_snapshot_dirty) return;
     if (wl.frame_pending) return;
-    gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s)) catch |err| switch (err) {
+    gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), s.refs.bell.isVisualActive()) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer so
             // we can see at exit whether compositor release latency is
@@ -147,6 +160,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             s.render.render_serial,
             s.input.selection.toSnapshot(),
             currentScrollbarOverlay(s),
+            s.refs.bell.isVisualActive(),
         ) catch |err| switch (err) {
             error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,

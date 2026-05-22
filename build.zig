@@ -301,17 +301,23 @@ pub fn build(b: *std.Build) void {
     // ── headless tests (`zig build test`, plus per-suite aliases) ──────
     const test_step = b.step("test", "Run all headless tests");
 
-    // cli.zig has no ghostty/snail/wayland deps — its tests can always run.
-    const cli_module = b.createModule(.{
-        .root_source_file = b.path("src/cli.zig"),
-        .target = deps.target,
-        .optimize = deps.optimize,
-        .link_libc = true,
-    });
-    const cli_tests = b.addTest(.{ .root_module = cli_module });
-    const run_cli_tests = b.addRunArtifact(cli_tests);
-    test_step.dependOn(&run_cli_tests.step);
-    b.step("test-cli", "Run CLI parser tests").dependOn(&run_cli_tests.step);
+    // cli.zig + bell.zig have no ghostty/snail/wayland deps — their
+    // tests can always run.
+    inline for (.{
+        .{ .src = "src/cli.zig", .step = "test-cli", .desc = "Run CLI parser tests" },
+        .{ .src = "src/bell.zig", .step = "test-bell", .desc = "Run bell manager tests" },
+    }) |t| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(t.src),
+            .target = deps.target,
+            .optimize = deps.optimize,
+            .link_libc = true,
+        });
+        const tests = b.addTest(.{ .root_module = mod });
+        const run = b.addRunArtifact(tests);
+        test_step.dependOn(&run.step);
+        b.step(t.step, t.desc).dependOn(&run.step);
+    }
 
     if (vt_include != null and vt_static_lib != null) {
         const headless_opts: HeadlessOptions = .{
