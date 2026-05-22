@@ -14,7 +14,7 @@ const atlas_worker = @import("atlas_worker.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
-const shared_dmabuf = @import("shared_dmabuf.zig");
+const gpu_buffer = @import("gpu_buffer.zig");
 const terminal_mod = @import("terminal.zig");
 const row_build = @import("row_build.zig");
 const perf = @import("perf.zig");
@@ -53,7 +53,7 @@ fn gpuDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("scrgo[gpu-renderer] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
-pub const MaxBuffers = shared_dmabuf.MaxBuffers;
+pub const MaxBuffers = gpu_buffer.MaxBuffers;
 const SnapshotSlotCount = 2;
 
 /// Cumulative time spent in `render_snapshot.prepare` on the main thread
@@ -244,7 +244,7 @@ const OffscreenEgl = struct {
 const drm_format_mod_invalid: u64 = (1 << 56) - 1;
 
 const DmabufTarget = struct {
-    desc: shared_dmabuf.BufferDesc = .{},
+    desc: gpu_buffer.BufferDesc = .{},
     bo: ?*c.struct_gbm_bo = null,
     import_fd: c_int = -1,
     export_fd: c_int = -1,
@@ -412,12 +412,12 @@ pub const GpuWorker = struct {
     snapshot_busy: [SnapshotSlotCount]bool = [_]bool{false} ** SnapshotSlotCount,
 
     // Buffer descriptors populated by worker, read by main after "ready"
-    buffer_descs: [MaxBuffers]shared_dmabuf.BufferDesc = [_]shared_dmabuf.BufferDesc{.{}} ** MaxBuffers,
+    buffer_descs: [MaxBuffers]gpu_buffer.BufferDesc = [_]gpu_buffer.BufferDesc{.{}} ** MaxBuffers,
     buffer_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
     buffer_count: u8 = 0,
 
     // GpuWorker-side state
-    buffers: [MaxBuffers]shared_dmabuf.FrontendBuffer = undefined,
+    buffers: [MaxBuffers]gpu_buffer.FrontendBuffer = undefined,
     frontend_buffer_count: usize = 0,
 
     active: bool = false,
@@ -592,7 +592,7 @@ pub const GpuWorker = struct {
         self.destroyFrontendBuffers();
         const count = @min(@as(usize, self.buffer_count), MaxBuffers);
         for (0..count) |i| {
-            self.buffers[i] = try shared_dmabuf.FrontendBuffer.create(
+            self.buffers[i] = try gpu_buffer.FrontendBuffer.create(
                 dmabuf_opaque,
                 self.buffer_export_fds[i],
                 self.buffer_descs[i],

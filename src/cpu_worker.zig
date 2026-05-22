@@ -4,7 +4,7 @@ const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_worker = @import("atlas_worker.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
-const shared_shm = @import("shared_shm.zig");
+const cpu_buffer = @import("cpu_buffer.zig");
 const cpu_pipeline = @import("cpu_pipeline.zig");
 const perf = @import("perf.zig");
 
@@ -76,7 +76,7 @@ pub const Frontend = struct {
     active: bool = false,
     snapshots: [SnapshotSlotCount]render_snapshot.SharedSnapshot = [_]render_snapshot.SharedSnapshot{.{}} ** SnapshotSlotCount,
     snapshot_busy: [SnapshotSlotCount]bool = [_]bool{false} ** SnapshotSlotCount,
-    buffers: [BufferCount]shared_shm.SharedBuffer = undefined,
+    buffers: [BufferCount]cpu_buffer.SharedBuffer = undefined,
     buffer_count: usize = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -159,7 +159,7 @@ pub const Frontend = struct {
         self.destroyBuffers();
         errdefer self.destroyBuffers();
         for (0..BufferCount) |i| {
-            self.buffers[i] = try shared_shm.SharedBuffer.create(shm_opaque, width, height);
+            self.buffers[i] = try cpu_buffer.SharedBuffer.create(shm_opaque, width, height);
             self.buffers[i].attachListener();
             self.buffer_count += 1;
         }
