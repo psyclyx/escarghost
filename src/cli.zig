@@ -39,7 +39,12 @@ pub const Args = struct {
     /// Number of `-v` levels accumulated. Mapped to log scopes by
     /// `applyVerbosity`.
     verbosity: u2 = 0,
+    /// When set, the caller should write the requested completion
+    /// script to stdout and exit instead of starting the terminal.
+    generate_completion: ?CompletionShell = null,
 };
+
+pub const CompletionShell = enum { bash, zsh, fish };
 
 pub const ParseError = error{
     HelpRequested,
@@ -79,6 +84,8 @@ pub const Option = struct {
 
 const renderer_choices = [_][]const u8{ "auto", "cpu", "gpu" };
 
+const completion_choices = [_][]const u8{ "bash", "zsh", "fish" };
+
 pub const option_specs = [_]Option{
     .{ .long = "help", .short = 'h', .help = "Show this help and exit" },
     .{ .long = "version", .short = 'V', .help = "Show version and exit" },
@@ -101,6 +108,12 @@ pub const option_specs = [_]Option{
         .arg = "BACKEND",
         .help = "Renderer backend (default: auto)",
         .completion = .{ .values = &renderer_choices },
+    },
+    .{
+        .long = "generate-completion",
+        .arg = "SHELL",
+        .help = "Print a shell completion script to stdout (bash|zsh|fish) and exit",
+        .completion = .{ .values = &completion_choices },
     },
 };
 
@@ -352,7 +365,29 @@ fn setOption(args: *Args, opt: *const Option, value: []const u8) ParseError!void
         args.renderer = parseRenderer(value) orelse return error.BadArgs;
         return;
     }
+    if (std.mem.eql(u8, opt.long, "generate-completion")) {
+        args.generate_completion = parseCompletionShell(value) orelse return error.BadArgs;
+        return;
+    }
     return error.BadArgs;
+}
+
+fn parseCompletionShell(s: []const u8) ?CompletionShell {
+    if (std.ascii.eqlIgnoreCase(s, "bash")) return .bash;
+    if (std.ascii.eqlIgnoreCase(s, "zsh")) return .zsh;
+    if (std.ascii.eqlIgnoreCase(s, "fish")) return .fish;
+    return null;
+}
+
+/// Dispatch to the correct generator. Used by the runtime
+/// `--generate-completion` path *and* by the install-time codegen
+/// step in build.zig.
+pub fn writeCompletion(writer: *std.Io.Writer, shell: CompletionShell) !void {
+    switch (shell) {
+        .bash => try writeBashCompletion(writer),
+        .zsh => try writeZshCompletion(writer),
+        .fish => try writeFishCompletion(writer),
+    }
 }
 
 fn isAllV(s: []const u8) bool {

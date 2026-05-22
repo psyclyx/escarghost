@@ -267,6 +267,53 @@ fn createWlrClientModule(b: *std.Build, deps: Deps, harness_mod: *std.Build.Modu
     return mod;
 }
 
+/// Generate + install shell completions and the freedesktop entry.
+/// These have no runtime deps on ghostty-vt/snail/Wayland, so they
+/// install whenever the main binary builds — the codegen tool just
+/// imports cli.zig.
+fn installAuxiliaryArtifacts(b: *std.Build, deps: Deps) void {
+    // Codegen tool: depends only on cli.zig.
+    const gen_module = b.createModule(.{
+        .root_source_file = b.path("src/gen_completions.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    gen_module.addImport("cli", b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    }));
+    const gen_exe = b.addExecutable(.{ .name = "gen-completions", .root_module = gen_module });
+    const gen_run = b.addRunArtifact(gen_exe);
+    const out_dir = gen_run.addOutputDirectoryArg("completions");
+
+    // Install each generated file into the conventional location for
+    // that shell. Bash's site dir is `bash-completion/completions/`,
+    // zsh's is `zsh/site-functions/`, fish's is `fish/vendor_completions.d/`.
+    b.getInstallStep().dependOn(&b.addInstallFile(
+        out_dir.path(b, "scrgo.bash"),
+        "share/bash-completion/completions/scrgo",
+    ).step);
+    b.getInstallStep().dependOn(&b.addInstallFile(
+        out_dir.path(b, "_scrgo"),
+        "share/zsh/site-functions/_scrgo",
+    ).step);
+    b.getInstallStep().dependOn(&b.addInstallFile(
+        out_dir.path(b, "scrgo.fish"),
+        "share/fish/vendor_completions.d/scrgo.fish",
+    ).step);
+
+    // Desktop entry — static, copied verbatim. Lives next to the rest
+    // of the dist artifacts so the nix derivation has one source of
+    // truth.
+    b.getInstallStep().dependOn(&b.addInstallFile(
+        b.path("dist/scrgo.desktop"),
+        "share/applications/scrgo.desktop",
+    ).step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -296,6 +343,8 @@ pub fn build(b: *std.Build) void {
         run_cmd.step.dependOn(b.getInstallStep());
         if (b.args) |args| run_cmd.addArgs(args);
         b.step("run", "Run scrgo").dependOn(&run_cmd.step);
+
+        installAuxiliaryArtifacts(b, deps);
     }
 
     // ── headless tests (`zig build test`, plus per-suite aliases) ──────

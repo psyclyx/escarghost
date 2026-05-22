@@ -27,6 +27,7 @@ stdenv.mkDerivation {
     fileset = lib.fileset.unions [
       ../src
       ../protocol
+      ../dist
       ../build.zig
       ../build.zig.zon
     ];
@@ -67,7 +68,8 @@ stdenv.mkDerivation {
   '';
 
   installPhase = ''
-    mkdir -p $out/bin
+    mkdir -p $out/bin $out/share
     cp zig-out/bin/scrgo $out/bin/
+    cp -r zig-out/share/. $out/share/
   '';
 }

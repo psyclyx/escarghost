@@ -65,6 +65,11 @@ pub fn main(init: std.process.Init) !void {
             },
         }
     };
+    if (cli_args.generate_completion) |shell| {
+        var stdout = cli.fdWriter(1);
+        cli.writeCompletion(&stdout.writer, shell) catch {};
+        c._exit(0);
+    }
     cli.applyVerbosity(cli_args.verbosity);
 
     // Mesa hints — don't override if already set (0 = no overwrite)
