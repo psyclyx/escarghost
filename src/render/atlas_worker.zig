@@ -11,6 +11,8 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
     @cInclude("fcntl.h");
+    @cInclude("time.h");
+    @cInclude("errno.h");
     @cInclude("sys/mman.h");
     @cInclude("sys/stat.h");
     @cInclude("fontconfig/fontconfig.h");
@@ -52,12 +54,30 @@ fn atlasDebug(timer: perf.Timer, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("scrgo[atlas-owner] {d:.1}ms: " ++ fmt ++ "\n", .{timer.elapsedMs()} ++ args);
 }
 
+pub const ExtendOutcome = enum {
+    /// A new atlas snapshot was published since the caller's baseline,
+    /// and the worker observed (and drained) the caller's misses before
+    /// publishing. Caller can `refreshAtlas` and re-render.
+    extended,
+    /// The deadline elapsed before the worker drained pending and bumped
+    /// the generation. Caller should ship its current frame.
+    timed_out,
+    /// The worker is inactive or prefetch is disabled. Caller has no
+    /// async path to wait on; ship the current frame.
+    unavailable,
+};
+
 pub const AtlasWorker = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
     cond: c.pthread_cond_t = undefined,
+    /// Signaled by the worker after each extend round (success or fail)
+    /// so `extendBefore` callers waiting with a deadline can wake up and
+    /// re-check the predicate (`pending` drained AND atlas generation
+    /// advanced past their baseline).
+    completion_cond: c.pthread_cond_t = undefined,
     pending: glyph_misses.Set = .{},
     request_pending: bool = false,
     stop_requested: bool = false,
@@ -87,6 +107,8 @@ pub const AtlasWorker = struct {
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
         errdefer _ = c.pthread_cond_destroy(&self.cond);
+        try initCompletionCond(&self.completion_cond);
+        errdefer _ = c.pthread_cond_destroy(&self.completion_cond);
 
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
@@ -113,6 +135,8 @@ pub const AtlasWorker = struct {
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
         errdefer _ = c.pthread_cond_destroy(&self.cond);
+        try initCompletionCond(&self.completion_cond);
+        errdefer _ = c.pthread_cond_destroy(&self.completion_cond);
 
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
@@ -142,6 +166,7 @@ pub const AtlasWorker = struct {
         if (self.response_fds[0] >= 0) _ = c.close(self.response_fds[0]);
         if (self.response_fds[1] >= 0) _ = c.close(self.response_fds[1]);
         self.response_fds = [_]c_int{-1} ** 2;
+        _ = c.pthread_cond_destroy(&self.completion_cond);
         _ = c.pthread_cond_destroy(&self.cond);
         _ = c.pthread_mutex_destroy(&self.mutex);
         self.pending = .{};
@@ -160,6 +185,56 @@ pub const AtlasWorker = struct {
         self.request_pending = !self.pending.isEmpty();
         _ = c.pthread_cond_signal(&self.cond);
         atlasDebug(timer, "queue {} bytes", .{self.pending.len});
+    }
+
+    /// Submit `misses` to the worker and block until the atlas
+    /// generation advances past the caller's baseline AND `pending` has
+    /// drained (i.e. the publish that bumped the generation included the
+    /// caller's misses). Returns `.timed_out` if the worker doesn't get
+    /// there before `deadline_ns` (a CLOCK_MONOTONIC absolute deadline
+    /// in nanoseconds), or `.unavailable` if the worker is inactive /
+    /// prefetch is off.
+    ///
+    /// On `.extended` the caller should `refreshAtlas` and redraw; on
+    /// `.timed_out` they should ship the current frame and rely on the
+    /// async `requestMany` path (which the caller is responsible for
+    /// invoking as a fallback — `extendBefore` does *not* fall back on
+    /// its own, so the caller keeps full control of the response-pipe
+    /// signaling).
+    pub fn extendBefore(
+        self: *AtlasWorker,
+        misses: *const glyph_misses.Set,
+        deadline_ns: u64,
+    ) ExtendOutcome {
+        if (!self.active or !self.prefetch_enabled) return .unavailable;
+        if (misses.isEmpty()) return .extended;
+
+        const baseline_gen = self.atlas_ref.loadGeneration();
+        const timer = perf.Timer.now();
+
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+
+        self.pending.mergeFrom(misses);
+        self.request_pending = !self.pending.isEmpty();
+        _ = c.pthread_cond_signal(&self.cond);
+
+        var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 0 };
+        nsToTimespec(deadline_ns, &ts);
+
+        // Wait predicate: `pending` is drained (worker absorbed our merge
+        // into a local batch) AND generation has advanced (publish
+        // happened against that batch). Both together guarantee our
+        // misses are reflected in the published snapshot.
+        while (!(self.pending.isEmpty() and self.atlas_ref.loadGeneration() != baseline_gen)) {
+            const rc = c.pthread_cond_timedwait(&self.completion_cond, &self.mutex, &ts);
+            if (rc == c.ETIMEDOUT) {
+                atlasDebug(timer, "extendBefore timed out", .{});
+                return .timed_out;
+            }
+        }
+        atlasDebug(timer, "extendBefore satisfied in {d:.2}ms", .{timer.elapsedMs()});
+        return .extended;
     }
 
     pub fn readResponse(self: *AtlasWorker) !?Response {
@@ -221,7 +296,9 @@ pub const AtlasWorker = struct {
 
             // Goes through AtlasRef.extension_lock so a concurrent sync
             // extend on the render thread doesn't race the publish.
-            const result = self.atlas_ref.extend(current, pending_text) catch {
+            const result_err = self.atlas_ref.extend(current, pending_text);
+            self.signalRoundComplete();
+            const result = result_err catch {
                 atlasDebug(timer, "extend failed for {} bytes", .{pending_text.len});
                 writeResponse(self.response_fds[1], .{
                     .tag = .failed,
@@ -240,6 +317,15 @@ pub const AtlasWorker = struct {
                 .added_pages = 0,
             });
         }
+    }
+
+    /// Wake any `extendBefore` callers waiting on `completion_cond` so
+    /// they re-check the (pending-drained + gen-advanced) predicate.
+    /// Called by the worker after each extend round, success or failure.
+    fn signalRoundComplete(self: *AtlasWorker) void {
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+        _ = c.pthread_cond_broadcast(&self.completion_cond);
     }
 
     fn prefetchEnabled() bool {
@@ -445,4 +531,21 @@ fn mmapFontFile(path: []const u8) ![]const u8 {
 
 fn writeResponse(fd: c_int, response: Response) void {
     _ = c.write(fd, &response, @sizeOf(Response));
+}
+
+/// Initialize a condvar that interprets `pthread_cond_timedwait`
+/// deadlines as CLOCK_MONOTONIC values. The default attr uses
+/// CLOCK_REALTIME, which would let wall-clock adjustments (NTP slew,
+/// suspend) skew our budget-bound waits.
+fn initCompletionCond(cond: *c.pthread_cond_t) !void {
+    var attr: c.pthread_condattr_t = undefined;
+    if (c.pthread_condattr_init(&attr) != 0) return error.CondAttrInitFailed;
+    defer _ = c.pthread_condattr_destroy(&attr);
+    if (c.pthread_condattr_setclock(&attr, c.CLOCK_MONOTONIC) != 0) return error.CondAttrSetClockFailed;
+    if (c.pthread_cond_init(cond, &attr) != 0) return error.CondInitFailed;
+}
+
+fn nsToTimespec(ns: u64, out: *c.struct_timespec) void {
+    out.tv_sec = @intCast(ns / std.time.ns_per_s);
+    out.tv_nsec = @intCast(ns % std.time.ns_per_s);
 }

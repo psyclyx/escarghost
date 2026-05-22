@@ -1,4 +1,5 @@
 const std = @import("std");
+const perf = @import("perf.zig");
 const render_env = @import("render/render_env.zig");
 
 const wl = @cImport({
@@ -899,6 +900,16 @@ pub const Wayland = struct {
             const dt = now_ns - last_frame_done_ns;
             if (dt > last_frame_done_dt_max_ns) last_frame_done_dt_max_ns = dt;
             dt_ms = @as(f64, @floatFromInt(dt)) / @as(f64, std.time.ns_per_ms);
+            // Surface the most recent inter-callback interval as the
+            // observed vsync period for the sync-extend budget. The GPU
+            // worker reads this atomically on the next miss-frame to
+            // decide how much wall time it can spend extending the
+            // atlas before having to ship the partial draw. Clamp to a
+            // plausible range so a spurious long gap (e.g. compositor
+            // skipping a callback under load) doesn't make the budget
+            // over-generous on the next frame.
+            const clamped = std.math.clamp(dt, 4 * std.time.ns_per_ms, 33 * std.time.ns_per_ms);
+            perf.vsync_period_ns.store(clamped, .release);
         }
         last_frame_done_ns = now_ns;
         frame_done_count += 1;

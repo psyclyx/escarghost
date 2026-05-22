@@ -3,6 +3,14 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
+/// Observed vsync period in nanoseconds — written by the wayland frame
+/// callback from the inter-callback interval, read by the GPU worker
+/// thread when computing the sync-extend budget. Zero until at least
+/// two frames have been observed. Single writer (main thread), single
+/// reader (gpu worker); relaxed atomic since we tolerate a one-frame
+/// lag in the budget calculation.
+pub var vsync_period_ns: std.atomic.Value(u64) = .init(0);
+
 /// High-resolution monotonic timer using clock_gettime(CLOCK_MONOTONIC).
 /// Avoids std.time overhead and gives ns precision.
 pub const Timer = struct {

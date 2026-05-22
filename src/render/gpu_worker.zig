@@ -666,6 +666,15 @@ pub const GpuWorker = struct {
         const warn_slow_budget_ms = render_env.parseWarnSlowMs(
             if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
         );
+        const sync_extend_cfg = render_env.parseSyncExtend(
+            if (c.getenv("SCRGO_SYNC_EXTEND")) |v| std.mem.sliceTo(v, 0) else null,
+        );
+        // Previous iteration's full frame cost (draw_t0 → end of fence
+        // wait), used to predict how much wall time the second draw +
+        // fence will need when sizing the sync-extend deadline. Zero
+        // until the first frame completes, which gates the sync retry
+        // (no data → don't risk it).
+        var last_full_frame_ns: u64 = 0;
         var diag_frame_counter: u64 = 0;
 
         // Phase 1: EGL + snail.Renderer init (no deps needed)
@@ -887,13 +896,58 @@ pub const GpuWorker = struct {
                     };
 
                     if (!misses.isEmpty()) {
-                        // Kick off async atlas extension but still commit the
-                        // frame we drew — the atlas thread can't always
-                        // satisfy a miss in one round (e.g. when it produces
-                        // a snapshot whose glyph_map says present but the LUT
-                        // says missing), and we'd rather show partial text
-                        // than spin forever waiting.
-                        if (self.atlas_thread) |at| at.requestMany(&misses);
+                        // Bounded sync retry (controlled by
+                        // SCRGO_SYNC_EXTEND): give the atlas thread a
+                        // deadline to publish a snapshot covering this
+                        // frame's misses, then redraw with the extended
+                        // atlas. The redraw paints over the first one
+                        // in the same dmabuf FBO — every frame is a
+                        // full repaint (see gpu_pipeline.zig:171), so
+                        // the second paint cleanly wins. On timeout we
+                        // ship the partial frame and rely on the async
+                        // requestMany below to dirty the next vsync via
+                        // the atlas worker's response pipe.
+                        //
+                        // The deadline is derived from data, not a
+                        // fixed env knob: vsync period - elapsed -
+                        // predicted-second-frame - safety. We require
+                        // historical frame data (last_full_frame_ns) to
+                        // size the prediction, so the first frame after
+                        // startup always bails to async.
+                        if (self.atlas_thread) |at| sync_retry: {
+                            if (!sync_extend_cfg.enabled) break :sync_retry;
+                            if (last_full_frame_ns == 0) break :sync_retry;
+                            const vsync_ns = perf.vsync_period_ns.load(.acquire);
+                            if (vsync_ns == 0) break :sync_retry;
+                            const now_ns = monotonicNs();
+                            const elapsed_ns = now_ns - draw_t0;
+                            const safety_ns: u64 = std.time.ns_per_ms;
+                            const reserved = elapsed_ns + last_full_frame_ns + safety_ns;
+                            if (reserved >= vsync_ns) break :sync_retry;
+                            var budget_ns = vsync_ns - reserved;
+                            if (sync_extend_cfg.cap_ms) |cap_ms| {
+                                const cap_ns = @as(u64, cap_ms) * std.time.ns_per_ms;
+                                budget_ns = @min(budget_ns, cap_ns);
+                            }
+                            // Don't bother if the headroom is so small
+                            // the round-trip + ensureText would chew
+                            // most of it.
+                            if (budget_ns < 500 * std.time.ns_per_us) break :sync_retry;
+                            const deadline_ns = now_ns + budget_ns;
+                            switch (at.extendBefore(&misses, deadline_ns)) {
+                                .extended => {
+                                    misses = .{};
+                                    r.drawSnapshot(&self.snapshots[request.snapshot_slot], &misses) catch {
+                                        // Original draw is still in the FBO; fall through.
+                                        misses = .{};
+                                    };
+                                },
+                                .timed_out, .unavailable => {},
+                            }
+                        }
+                        if (self.atlas_thread) |at| {
+                            if (!misses.isEmpty()) at.requestMany(&misses);
+                        }
                     }
 
                     // Block on the GPU until every command issued by
@@ -912,6 +966,10 @@ pub const GpuWorker = struct {
                         c.glDeleteSync(fence_sync);
                     }
                     const gpu_wait_elapsed_ns = monotonicNs() - gpu_wait_t0;
+                    // Record total wall-time for this iteration so the
+                    // next miss-frame's sync-extend budget can predict
+                    // how much the redraw + fence wait will cost.
+                    last_full_frame_ns = monotonicNs() - draw_t0;
 
                     gpuDebug(timer, "render complete buffer={} in {d:.1}ms", .{
                         request.buffer_index,

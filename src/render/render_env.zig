@@ -86,6 +86,48 @@ pub fn parseRendererDebug(value: ?[]const u8) RendererDebug {
     return result;
 }
 
+pub const SyncExtendConfig = struct {
+    enabled: bool,
+    /// Upper bound (ms) on the auto-computed budget. `null` means no
+    /// cap — the budget is whatever the vsync-headroom calculation
+    /// allows. A positive cap is useful for forcing the renderer to
+    /// give up earlier than the headroom would suggest (e.g. while
+    /// investigating frame-time issues).
+    cap_ms: ?u32,
+};
+
+/// Parses `SCRGO_SYNC_EXTEND`. Controls whether the GPU renderer will,
+/// on a miss-frame, block briefly waiting for the atlas thread to
+/// publish an extended snapshot and then redraw with the new atlas
+/// before shipping. The budget itself is derived per-frame from the
+/// observed vsync period, the previous frame's full cost, and the time
+/// already spent on the current frame's first draw — this knob only
+/// disables the retry or caps the derived budget.
+///
+/// - unset / "auto" / "on" / "true" / "1" → enabled, no cap (default)
+/// - "off" / "0" / "false"                → disabled (ship partial,
+///                                           async-fix next frame, as
+///                                           if this feature didn't
+///                                           exist)
+/// - integer N                            → enabled, cap auto budget
+///                                           at N ms
+pub fn parseSyncExtend(value: ?[]const u8) SyncExtendConfig {
+    const raw = value orelse return .{ .enabled = true, .cap_ms = null };
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .{ .enabled = true, .cap_ms = null };
+    if (eql(trimmed, "0") or eql(trimmed, "off") or eql(trimmed, "false")) {
+        return .{ .enabled = false, .cap_ms = null };
+    }
+    if (eql(trimmed, "auto") or eql(trimmed, "1") or eql(trimmed, "on") or eql(trimmed, "true")) {
+        return .{ .enabled = true, .cap_ms = null };
+    }
+    const n = std.fmt.parseInt(u32, trimmed, 10) catch {
+        return .{ .enabled = true, .cap_ms = null };
+    };
+    if (n == 0) return .{ .enabled = false, .cap_ms = null };
+    return .{ .enabled = true, .cap_ms = n };
+}
+
 /// Parses `SCRGO_WARN_SLOW_MS`. Returns the per-frame budget in
 /// milliseconds when warnings are enabled, or null when disabled.
 ///
