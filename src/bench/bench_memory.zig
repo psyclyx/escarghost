@@ -12,7 +12,7 @@
 //!                for "how much does this terminal actually allocate".
 
 const std = @import("std");
-const h = @import("wlr_harness.zig");
+const h = @import("wlr_harness");
 const posix = h.posix;
 const stats_mod = @import("bench_stats.zig");
 const spec_mod = @import("bench_spec.zig");

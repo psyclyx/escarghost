@@ -6,7 +6,7 @@ const render_snapshot = @import("render_snapshot.zig");
 const render_common = @import("render_common.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const row_build = @import("row_build.zig");
-const color = @import("../color.zig");
+const color = @import("color");
 const perf = @import("../perf.zig");
 const Rgb = color.Rgb;
 

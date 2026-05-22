@@ -8,8 +8,8 @@
 //! in `wlr_harness.zig`.
 
 const std = @import("std");
-const perf = @import("perf.zig");
-const h = @import("wlr_harness.zig");
+const perf = @import("perf");
+const h = @import("wlr_harness");
 const posix = h.posix;
 
 pub fn main(init: std.process.Init) !void {

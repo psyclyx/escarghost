@@ -1,5 +1,5 @@
 const std = @import("std");
-const color = @import("color.zig");
+const color = @import("color");
 const Rgb = color.Rgb;
 
 const c = @cImport({

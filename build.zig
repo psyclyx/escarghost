@@ -84,6 +84,19 @@ fn addLocalProtocol(
     );
 }
 
+/// color.zig is referenced by terminal/config (used by headless tests)
+/// and by render/* (used by main). Promoting it to a named module
+/// avoids "file exists in modules X and Y" when both the test modules
+/// and main_module would otherwise each adopt it as a sibling file.
+fn createColorModule(b: *std.Build, deps: Deps) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/color.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+}
+
 fn createSnailModule(b: *std.Build, deps: Deps) *std.Build.Module {
     const snail_dep = b.dependency("snail", .{});
     const snail_opts = b.addOptions();
@@ -134,6 +147,7 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     mod.addIncludePath(.{ .cwd_relative = opts.vt_include });
     mod.addObjectFile(.{ .cwd_relative = opts.vt_static_lib });
     mod.addImport("snail", createSnailModule(b, deps));
+    mod.addImport("color", createColorModule(b, deps));
 
     mod.linkSystemLibrary("wayland-client", .{});
     mod.linkSystemLibrary("wayland-egl", .{});
@@ -167,7 +181,10 @@ const HeadlessOptions = struct {
     vt_static_lib: []const u8,
 };
 
-/// Module for headless test binaries: libghostty-vt + libc only.
+/// Module for headless test binaries: libghostty-vt + libc only. The
+/// tests live under src/test/, so terminal/config/selection — which
+/// stay at src/ top level — are exposed by name through addImport;
+/// Zig forbids `../` imports across a module's root directory.
 fn createHeadlessModule(b: *std.Build, deps: Deps, opts: HeadlessOptions, comptime root: []const u8) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path(root),
@@ -177,16 +194,45 @@ fn createHeadlessModule(b: *std.Build, deps: Deps, opts: HeadlessOptions, compti
     });
     mod.addIncludePath(.{ .cwd_relative = opts.vt_include });
     mod.addObjectFile(.{ .cwd_relative = opts.vt_static_lib });
+
+    // terminal.zig pulls in the libghostty-vt headers; color.zig is its
+    // only first-party dependency. config.zig also depends on color.
+    const color_mod = createColorModule(b, deps);
+    const terminal_mod = b.createModule(.{
+        .root_source_file = b.path("src/terminal.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    terminal_mod.addIncludePath(.{ .cwd_relative = opts.vt_include });
+    terminal_mod.addImport("color", color_mod);
+    const config_mod = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    config_mod.addImport("color", color_mod);
+    const selection_mod = b.createModule(.{
+        .root_source_file = b.path("src/selection.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    mod.addImport("terminal_mod", terminal_mod);
+    mod.addImport("config_mod", config_mod);
+    mod.addImport("selection_mod", selection_mod);
+
     return mod;
 }
 
-/// Module for wlroots-protocol clients (integration test, bench suite):
-/// wayland-client + xkbcommon + the three wlroots protocols. These
-/// binaries spawn scrgo as a child rather than embedding it, so they
-/// don't link libghostty-vt or snail.
-fn createWlrClientModule(b: *std.Build, deps: Deps, wayland_scanner: []const u8, comptime root: []const u8) *std.Build.Module {
+/// Wlroots-protocol harness used by integration_test and bench_suite.
+/// Owns wlr_harness.zig + the three wlroots protocol .c files; the
+/// downstream binaries pull it in via addImport("wlr_harness", ...) so
+/// each binary doesn't have to redeclare the protocol generators.
+fn createHarnessModule(b: *std.Build, deps: Deps, wayland_scanner: []const u8) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path(root),
+        .root_source_file = b.path("src/harness/wlr_harness.zig"),
         .target = deps.target,
         .optimize = deps.optimize,
         .link_libc = true,
@@ -196,6 +242,28 @@ fn createWlrClientModule(b: *std.Build, deps: Deps, wayland_scanner: []const u8,
     addLocalProtocol(b, mod, wayland_scanner, "protocol/wlr-foreign-toplevel-management-unstable-v1.xml", "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h", "wlr-foreign-toplevel-management-unstable-v1-protocol.c");
     addLocalProtocol(b, mod, wayland_scanner, "protocol/wlr-screencopy-unstable-v1.xml", "wlr-screencopy-unstable-v1-client-protocol.h", "wlr-screencopy-unstable-v1-protocol.c");
     addLocalProtocol(b, mod, wayland_scanner, "protocol/virtual-keyboard-unstable-v1.xml", "virtual-keyboard-unstable-v1-client-protocol.h", "virtual-keyboard-unstable-v1-protocol.c");
+    return mod;
+}
+
+/// Module for wlroots-protocol clients (integration test, bench suite):
+/// pulls in the shared harness module + perf, both surfaced via
+/// addImport because they live outside the binary's src/{test,bench}/
+/// module root.
+fn createWlrClientModule(b: *std.Build, deps: Deps, harness_mod: *std.Build.Module, comptime root: []const u8) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    const perf_mod = b.createModule(.{
+        .root_source_file = b.path("src/perf.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    mod.addImport("perf", perf_mod);
+    mod.addImport("wlr_harness", harness_mod);
     return mod;
 }
 
@@ -238,13 +306,13 @@ pub fn build(b: *std.Build) void {
         };
         const test_step = b.step("test", "Run all headless tests");
 
-        const headless_module = createHeadlessModule(b, deps, headless_opts, "src/headless_test.zig");
+        const headless_module = createHeadlessModule(b, deps, headless_opts, "src/test/headless_test.zig");
         const headless_tests = b.addTest(.{ .root_module = headless_module });
         const run_headless_tests = b.addRunArtifact(headless_tests);
         test_step.dependOn(&run_headless_tests.step);
         b.step("test-headless", "Run headless terminal tests").dependOn(&run_headless_tests.step);
 
-        const input_module = createHeadlessModule(b, deps, headless_opts, "src/headless_input_test.zig");
+        const input_module = createHeadlessModule(b, deps, headless_opts, "src/test/headless_input_test.zig");
         const input_tests = b.addTest(.{ .root_module = input_module });
         const run_input_tests = b.addRunArtifact(input_tests);
         test_step.dependOn(&run_input_tests.step);
@@ -256,12 +324,14 @@ pub fn build(b: *std.Build) void {
     // with no args does not produce them. Their nix derivations supply
     // wayland-scanner without libghostty-vt or snail.
     if (wayland_scanner) |scanner| {
-        const it_module = createWlrClientModule(b, deps, scanner, "src/integration_test.zig");
+        const harness_module = createHarnessModule(b, deps, scanner);
+
+        const it_module = createWlrClientModule(b, deps, harness_module, "src/test/integration_test.zig");
         const it_exe = b.addExecutable(.{ .name = "scrgo-integration-test", .root_module = it_module });
         const it_install = b.addInstallArtifact(it_exe, .{});
         b.step("integration-test", "Build the integration-test binary").dependOn(&it_install.step);
 
-        const bench_module = createWlrClientModule(b, deps, scanner, "src/bench_suite.zig");
+        const bench_module = createWlrClientModule(b, deps, harness_module, "src/bench/bench_suite.zig");
         const bench_exe = b.addExecutable(.{ .name = "scrgo-bench-suite", .root_module = bench_module });
         const bench_install = b.addInstallArtifact(bench_exe, .{});
         b.step("bench-suite", "Build the bench-suite binary").dependOn(&bench_install.step);

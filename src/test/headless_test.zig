@@ -5,14 +5,14 @@
 
 const std = @import("std");
 const testing = std.testing;
-const terminal_mod = @import("terminal.zig");
-const config_mod = @import("config.zig");
+const terminal_mod = @import("terminal_mod");
+const config_mod = @import("config_mod");
 
 // Pull in pure-Zig modules whose tests should run alongside the
 // terminal-wrapper checks. Anything that doesn't transitively need libghostty
 // can hang off here without paying for a separate test target.
 comptime {
-    _ = @import("selection.zig");
+    _ = @import("selection_mod");
 }
 
 const default_sequences = [_][]const u8{

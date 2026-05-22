@@ -3,8 +3,8 @@
 //! hashes, report wall time + throughput + distinct fps.
 
 const std = @import("std");
-const perf = @import("perf.zig");
-const h = @import("wlr_harness.zig");
+const perf = @import("perf");
+const h = @import("wlr_harness");
 const posix = h.posix;
 const spec_mod = @import("bench_spec.zig");
 

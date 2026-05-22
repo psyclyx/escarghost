@@ -6,8 +6,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const terminal_mod = @import("terminal.zig");
-const config_mod = @import("config.zig");
+const terminal_mod = @import("terminal_mod");
+const config_mod = @import("config_mod");
 
 const c = @cImport({
     @cInclude("pty.h");

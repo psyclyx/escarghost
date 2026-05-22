@@ -2,7 +2,7 @@ const std = @import("std");
 const snail = @import("snail");
 const terminal_mod = @import("../terminal.zig");
 const render_common = @import("render_common.zig");
-const color = @import("../color.zig");
+const color = @import("color");
 const selection_mod = @import("../selection.zig");
 const Rgb = color.Rgb;
 

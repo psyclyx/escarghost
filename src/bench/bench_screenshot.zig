@@ -7,7 +7,7 @@
 //! with feh, eog, or convert with `convert *.ppm out.png`.
 
 const std = @import("std");
-const h = @import("wlr_harness.zig");
+const h = @import("wlr_harness");
 const posix = h.posix;
 const spec_mod = @import("bench_spec.zig");
 
