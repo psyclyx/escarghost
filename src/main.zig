@@ -6,13 +6,10 @@ const terminal_mod = @import("terminal.zig");
 const renderer_mod = @import("renderer.zig");
 const shm_render = @import("shm_render.zig");
 const render_env = @import("render_env.zig");
-const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const cpu_renderer_worker = @import("cpu_worker.zig");
 const gpu_renderer = @import("gpu_renderer.zig");
 const perf = @import("perf.zig");
-const selection_mod = @import("selection.zig");
-const render_snapshot = @import("render_snapshot.zig");
 const clipboard_mod = @import("clipboard.zig");
 const diagnostics = @import("diagnostics.zig");
 const app_state = @import("app_state.zig");
@@ -20,22 +17,11 @@ const render_loop = @import("render_loop.zig");
 const input = @import("input.zig");
 
 const c = @cImport({
-    @cDefine("_GNU_SOURCE", "1");
     @cInclude("poll.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
-    @cInclude("time.h");
-    @cInclude("sys/mman.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/socket.h");
-    @cInclude("sys/wait.h");
-    @cInclude("fcntl.h");
-    @cInclude("signal.h");
     @cInclude("unistd.h");
 });
-
-const ghostty_c = @cImport(@cInclude("ghostty/vt.h"));
-const xkb_syms = @cImport(@cInclude("xkbcommon/xkbcommon-keysyms.h"));
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     const ptr = c.getenv(name) orelse return null;
