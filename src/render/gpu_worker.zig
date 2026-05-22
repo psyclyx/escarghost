@@ -15,9 +15,9 @@ const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const gpu_buffer = @import("gpu_buffer.zig");
-const terminal_mod = @import("terminal.zig");
+const terminal_mod = @import("../terminal.zig");
 const row_build = @import("row_build.zig");
-const perf = @import("perf.zig");
+const perf = @import("../perf.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
@@ -519,7 +519,7 @@ pub const GpuWorker = struct {
         self: *GpuWorker,
         term: *terminal_mod.Terminal,
         serial: u32,
-        selection: ?@import("selection.zig").Snapshot,
+        selection: ?@import("../selection.zig").Snapshot,
         scrollbar: ?render_snapshot.ScrollbarOverlay,
     ) !void {
         if (!self.active or !self.ready) return error.NotReady;

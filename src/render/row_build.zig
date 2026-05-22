@@ -12,10 +12,10 @@ const snail = @import("snail");
 const render_snapshot = @import("render_snapshot.zig");
 const render_common = @import("render_common.zig");
 const glyph_misses = @import("glyph_misses.zig");
-const color = @import("color.zig");
-const selection_mod = @import("selection.zig");
+const color = @import("../color.zig");
+const selection_mod = @import("../selection.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
-const perf = @import("perf.zig");
+const perf = @import("../perf.zig");
 const Rgb = color.Rgb;
 
 /// Sub-phase counters for `buildSnapshot`. Single writer (the GPU

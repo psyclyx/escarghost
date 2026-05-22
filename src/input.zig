@@ -5,8 +5,8 @@ const render_loop = @import("render_loop.zig");
 const selection_mod = @import("selection.zig");
 const clipboard_mod = @import("clipboard.zig");
 const wayland_mod = @import("wayland.zig");
-const render_snapshot = @import("render_snapshot.zig");
-const gpu_pipeline = @import("gpu_pipeline.zig");
+const render_snapshot = @import("render/render_snapshot.zig");
+const gpu_pipeline = @import("render/gpu_pipeline.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");

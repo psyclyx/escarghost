@@ -1,4 +1,4 @@
-const color = @import("color.zig");
+const color = @import("../color.zig");
 const Rgb = color.Rgb;
 
 pub const ResolvedCellColors = struct {

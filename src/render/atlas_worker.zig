@@ -3,7 +3,7 @@ const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const glyph_misses = @import("glyph_misses.zig");
-const perf = @import("perf.zig");
+const perf = @import("../perf.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");

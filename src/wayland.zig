@@ -1,5 +1,5 @@
 const std = @import("std");
-const render_env = @import("render_env.zig");
+const render_env = @import("render/render_env.zig");
 
 const wl = @cImport({
     @cInclude("wayland-client.h");

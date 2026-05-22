@@ -1,9 +1,9 @@
 const std = @import("std");
-const render_env = @import("render_env.zig");
+const render_env = @import("render/render_env.zig");
 const wayland_mod = @import("wayland.zig");
-const gpu_pipeline = @import("gpu_pipeline.zig");
-const cpu_pipeline = @import("cpu_pipeline.zig");
-const gpu_worker = @import("gpu_worker.zig");
+const gpu_pipeline = @import("render/gpu_pipeline.zig");
+const cpu_pipeline = @import("render/cpu_pipeline.zig");
+const gpu_worker = @import("render/gpu_worker.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");

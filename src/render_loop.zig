@@ -1,8 +1,8 @@
 const std = @import("std");
 const app_state = @import("app_state.zig");
 const diagnostics = @import("diagnostics.zig");
-const render_snapshot = @import("render_snapshot.zig");
-const gpu_worker = @import("gpu_worker.zig");
+const render_snapshot = @import("render/render_snapshot.zig");
+const gpu_worker = @import("render/gpu_worker.zig");
 
 const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 

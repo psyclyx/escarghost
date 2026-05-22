@@ -4,11 +4,11 @@ const clipboard_mod = @import("clipboard.zig");
 const terminal_mod = @import("terminal.zig");
 const pty_mod = @import("pty.zig");
 const wayland_mod = @import("wayland.zig");
-const atlas_ref_mod = @import("atlas_ref.zig");
-const atlas_worker = @import("atlas_worker.zig");
-const cpu_worker = @import("cpu_worker.zig");
-const gpu_worker = @import("gpu_worker.zig");
-const render_env = @import("render_env.zig");
+const atlas_ref_mod = @import("render/atlas_ref.zig");
+const atlas_worker = @import("render/atlas_worker.zig");
+const cpu_worker = @import("render/cpu_worker.zig");
+const gpu_worker = @import("render/gpu_worker.zig");
+const render_env = @import("render/render_env.zig");
 const diagnostics = @import("diagnostics.zig");
 
 pub const RenderPath = enum {
