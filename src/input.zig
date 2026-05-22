@@ -473,6 +473,15 @@ pub fn onFocus(focused: bool) void {
     _ = focused;
 }
 
+/// IME / on-screen-keyboard commit. Bytes were already finalized at
+/// a text-input-v3 `done` boundary, so we forward straight to the
+/// PTY — same path as utf8 from a hardware key.
+pub fn onTextCommit(text: []const u8) void {
+    if (text.len == 0) return;
+    state.refs.term.scrollToBottom();
+    state.refs.pty.write(text) catch {};
+}
+
 fn nowMs() i64 {
     var ts: c.struct_timespec = undefined;
     if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;

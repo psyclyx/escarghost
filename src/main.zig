@@ -328,6 +328,7 @@ pub fn main(init: std.process.Init) !void {
     wl.on_touch = input.onTouch;
     wl.on_resize = input.onResize;
     wl.on_focus = input.onFocus;
+    wl.on_text_commit = input.onTextCommit;
 
     // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
     var pty_buf: [65536]u8 = undefined;

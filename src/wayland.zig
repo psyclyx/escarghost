@@ -12,6 +12,7 @@ const wl = @cImport({
     @cInclude("cursor-shape-v1-client-protocol.h");
     @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
     @cInclude("primary-selection-unstable-v1-client-protocol.h");
+    @cInclude("text-input-unstable-v3-client-protocol.h");
 });
 
 const egl = @cImport({
@@ -98,6 +99,24 @@ pub const Wayland = struct {
     data_device: ?*wl.wl_data_device = null,
     primary_selection_manager: ?*wl.zwp_primary_selection_device_manager_v1 = null,
     primary_selection_device: ?*wl.zwp_primary_selection_device_v1 = null,
+    text_input_manager: ?*wl.zwp_text_input_manager_v3 = null,
+    text_input: ?*wl.zwp_text_input_v3 = null,
+    /// Client-side serial bumped on every text-input `commit` request.
+    /// The server's `done` event echoes back the serial that was
+    /// current when it processed our state — used by the protocol to
+    /// disambiguate stale dones if we ever start caring.
+    ti_serial: u32 = 0,
+    /// Buffered text from `commit_string` events. Applied to the PTY
+    /// on the next `done`. Fixed-size buffer keeps allocation out of
+    /// Wayland callbacks; CJK commits typically fit in <16 bytes.
+    /// Overflow is dropped with a warning rather than allocating mid-
+    /// callback.
+    ti_commit_buf: [512]u8 = undefined,
+    ti_commit_len: usize = 0,
+    /// True while the compositor's text-input has focus on our
+    /// surface, set/cleared by enter/leave events. Independent of
+    /// keyboard focus, though in practice they track together.
+    ti_focused: bool = false,
     /// Most-recent serial we received from a pointer or keyboard event.
     /// wl_data_device_manager_set_selection (and the primary variant)
     /// require a serial from a compositor-visible input event, so we
@@ -166,6 +185,9 @@ pub const Wayland = struct {
     on_touch: ?*const fn (TouchEvent) void = null,
     on_resize: ?*const fn (u32, u32) void = null,
     on_focus: ?*const fn (bool) void = null,
+    /// Bytes from a text-input-v3 commit_string event (already
+    /// applied at the `done` boundary). Sent verbatim to the PTY.
+    on_text_commit: ?*const fn ([]const u8) void = null,
 
     pub fn init(self: *Wayland, width: u32, height: u32, title: [:0]const u8) !void {
         self.shm = null;
@@ -185,6 +207,11 @@ pub const Wayland = struct {
         self.data_device = null;
         self.primary_selection_manager = null;
         self.primary_selection_device = null;
+        self.text_input_manager = null;
+        self.text_input = null;
+        self.ti_serial = 0;
+        self.ti_commit_len = 0;
+        self.ti_focused = false;
         self.last_input_serial = 0;
         self.decoration = null;
         self.frame_callback = null;
@@ -223,6 +250,7 @@ pub const Wayland = struct {
         self.on_touch = null;
         self.on_resize = null;
         self.on_focus = null;
+        self.on_text_commit = null;
         self.touch_simulate = false;
         self.pointer_simulating_down = false;
         self.width = width;
@@ -279,6 +307,7 @@ pub const Wayland = struct {
         // advertise either manager get a no-op; copy/paste falls back
         // to internal-only.
         self.ensureClipboardDevices();
+        self.ensureTextInput();
     }
 
     /// EGL Phase 1: display + context. Kept separate from initEglSurface()
@@ -369,6 +398,8 @@ pub const Wayland = struct {
         if (self.single_pixel_buffer_manager) |mgr| wl.wp_single_pixel_buffer_manager_v1_destroy(mgr);
         if (self.linux_dmabuf) |linux_dmabuf| wl.zwp_linux_dmabuf_v1_destroy(linux_dmabuf);
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
+        if (self.text_input) |ti| wl.zwp_text_input_v3_destroy(ti);
+        if (self.text_input_manager) |mgr| wl.zwp_text_input_manager_v3_destroy(mgr);
         if (self.primary_selection_device) |d| wl.zwp_primary_selection_device_v1_destroy(d);
         if (self.primary_selection_manager) |mgr| wl.zwp_primary_selection_device_manager_v1_destroy(mgr);
         if (self.data_device) |d| wl.wl_data_device_destroy(d);
@@ -568,6 +599,8 @@ pub const Wayland = struct {
             self.data_device_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wl_data_device_manager_interface, @min(version, 3)));
         } else if (std.mem.eql(u8, iface, "zwp_primary_selection_device_manager_v1")) {
             self.primary_selection_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_primary_selection_device_manager_v1_interface, 1));
+        } else if (std.mem.eql(u8, iface, "zwp_text_input_manager_v3")) {
+            self.text_input_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_text_input_manager_v3_interface, 1));
         }
     }
 
@@ -586,6 +619,19 @@ pub const Wayland = struct {
             if (self.primary_selection_manager) |mgr| {
                 self.primary_selection_device = wl.zwp_primary_selection_device_manager_v1_get_device(mgr, seat);
             }
+        }
+    }
+
+    /// Bring up the per-seat zwp_text_input_v3 once both manager and
+    /// seat are available. Idempotent; called from ensureClipboardDevices
+    /// after the init roundtrip and harmlessly retried elsewhere.
+    fn ensureTextInput(self: *Wayland) void {
+        if (self.text_input != null) return;
+        const seat = self.seat orelse return;
+        const mgr = self.text_input_manager orelse return;
+        self.text_input = wl.zwp_text_input_manager_v3_get_text_input(mgr, seat);
+        if (self.text_input) |ti| {
+            _ = wl.zwp_text_input_v3_add_listener(ti, &text_input_listener, @ptrCast(self));
         }
     }
 
@@ -750,6 +796,7 @@ pub const Wayland = struct {
     fn keyboardEnter(data: ?*anyopaque, _: ?*wl.wl_keyboard, _: u32, _: ?*wl.wl_surface, _: ?*wl.wl_array) callconv(.c) void {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.focused = true;
+        self.textInputEnable();
         if (self.on_focus) |cb| cb(true);
     }
 
@@ -757,7 +804,35 @@ pub const Wayland = struct {
         const self: *Wayland = @ptrCast(@alignCast(data));
         self.focused = false;
         self.repeat_key = null;
+        self.textInputDisable();
         if (self.on_focus) |cb| cb(false);
+    }
+
+    /// Tell the compositor's IME stack that we're accepting text and
+    /// to surface the on-screen keyboard if appropriate. The content
+    /// type is set to (purpose=terminal, hint=none) on every enable so
+    /// compositors that ignore stale types still see the right
+    /// configuration; this is what suppresses autocorrect, autocaps,
+    /// and spellcheck — without it the OSK acts like we're writing
+    /// prose.
+    fn textInputEnable(self: *Wayland) void {
+        const ti = self.text_input orelse return;
+        wl.zwp_text_input_v3_enable(ti);
+        wl.zwp_text_input_v3_set_content_type(
+            ti,
+            wl.ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+            wl.ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_TERMINAL,
+        );
+        self.ti_serial +%= 1;
+        wl.zwp_text_input_v3_commit(ti);
+    }
+
+    fn textInputDisable(self: *Wayland) void {
+        const ti = self.text_input orelse return;
+        wl.zwp_text_input_v3_disable(ti);
+        self.ti_serial +%= 1;
+        wl.zwp_text_input_v3_commit(ti);
+        self.ti_commit_len = 0;
     }
 
     fn keyboardKey(data: ?*anyopaque, _: ?*wl.wl_keyboard, serial: u32, _: u32, key: u32, state: u32) callconv(.c) void {
@@ -1018,6 +1093,78 @@ pub const Wayland = struct {
 
     fn touchShape(_: ?*anyopaque, _: ?*wl.wl_touch, _: i32, _: i32, _: i32) callconv(.c) void {}
     fn touchOrientation(_: ?*anyopaque, _: ?*wl.wl_touch, _: i32, _: i32) callconv(.c) void {}
+
+    // ── zwp_text_input_v3 ──
+
+    const text_input_listener = wl.zwp_text_input_v3_listener{
+        .enter = textInputEnter,
+        .leave = textInputLeave,
+        .preedit_string = textInputPreedit,
+        .commit_string = textInputCommitString,
+        .delete_surrounding_text = textInputDeleteSurrounding,
+        .done = textInputDone,
+    };
+
+    fn textInputEnter(data: ?*anyopaque, _: ?*wl.zwp_text_input_v3, _: ?*wl.wl_surface) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        self.ti_focused = true;
+        // The protocol says we receive `enter` *after* requesting
+        // text-input on a surface, but compositors also send a fresh
+        // `enter` when focus returns and may have lost our previous
+        // enable. Re-enable + re-set content type so the OSK comes up
+        // with terminal semantics.
+        self.textInputEnable();
+    }
+
+    fn textInputLeave(data: ?*anyopaque, _: ?*wl.zwp_text_input_v3, _: ?*wl.wl_surface) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        self.ti_focused = false;
+        self.ti_commit_len = 0;
+    }
+
+    fn textInputPreedit(_: ?*anyopaque, _: ?*wl.zwp_text_input_v3, _: [*c]const u8, _: i32, _: i32) callconv(.c) void {
+        // Preedit text isn't rendered yet — the renderer would have
+        // to host non-cell-aligned glyphs at the cursor. For Latin
+        // OSKs (the common touch case) preedit is empty so this is a
+        // no-op; CJK IMEs send a preedit string we'll commit on
+        // confirmation via commit_string anyway.
+    }
+
+    fn textInputCommitString(data: ?*anyopaque, _: ?*wl.zwp_text_input_v3, text: [*c]const u8) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        if (text == null) {
+            self.ti_commit_len = 0;
+            return;
+        }
+        const s = std.mem.span(text);
+        if (s.len > self.ti_commit_buf.len) {
+            // Drop overlong commits rather than allocate in the
+            // callback. 512 bytes covers any realistic IME commit.
+            log.warn(.wayland, "text-input commit_string overflow", .{ .len = s.len });
+            self.ti_commit_len = 0;
+            return;
+        }
+        @memcpy(self.ti_commit_buf[0..s.len], s);
+        self.ti_commit_len = s.len;
+    }
+
+    fn textInputDeleteSurrounding(_: ?*anyopaque, _: ?*wl.zwp_text_input_v3, before: u32, after: u32) callconv(.c) void {
+        // Terminals don't have an editable text buffer the IME can
+        // operate on, so we can't honor a deletion request. Log it
+        // for debugging; for Latin OSKs this never fires.
+        log.warn(.wayland, "text-input delete_surrounding_text ignored", .{
+            .before = before,
+            .after = after,
+        });
+    }
+
+    fn textInputDone(data: ?*anyopaque, _: ?*wl.zwp_text_input_v3, _: u32) callconv(.c) void {
+        const self: *Wayland = @ptrCast(@alignCast(data));
+        if (self.ti_commit_len == 0) return;
+        const text = self.ti_commit_buf[0..self.ti_commit_len];
+        if (self.on_text_commit) |cb| cb(text);
+        self.ti_commit_len = 0;
+    }
 
     // ── Frame callback ──
 
