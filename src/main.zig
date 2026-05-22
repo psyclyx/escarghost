@@ -157,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
     try atlas_thread.startWithBootstrap(.{
         .allocator = allocator,
         .font_path_cfg = cfg.font_path,
+        .fallback_fonts = cfg.fallback_fonts,
         .font_size = cfg.font_size,
     });
     defer atlas_thread.stop();

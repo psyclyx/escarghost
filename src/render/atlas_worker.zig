@@ -35,6 +35,11 @@ pub const Response = extern struct {
 pub const BootstrapConfig = struct {
     allocator: std.mem.Allocator,
     font_path_cfg: []const u8,
+    /// Fontconfig family names (or any FcNameParse-able pattern) tried
+    /// in order when the primary font lacks a glyph. Empty = no
+    /// fallback chain. Caller owns the slice & contents; bootstrap
+    /// reads them and drops the references after resolving.
+    fallback_fonts: []const []const u8 = &.{},
     font_size: f32,
 };
 
@@ -329,14 +334,38 @@ pub const AtlasWorker = struct {
     fn runBootstrap(self: *AtlasWorker, config: BootstrapConfig) !void {
         const alloc = config.allocator;
 
-        // Phase 1: parse the font into a TextAtlas. No rasterization yet, but
-        // cellMetrics already works against the parsed font config.
-        const font_path = try findFontPathFc(alloc, config.font_path_cfg);
+        // Phase 1: parse the primary font into a TextAtlas. Fallbacks
+        // (if any) are resolved through fontconfig and appended as
+        // additional FaceSpec entries with `fallback = true` so snail's
+        // shaper consults them only when the primary face's cmap is
+        // missing the codepoint. No rasterization happens here.
+        const font_path = if (config.font_path_cfg.len > 0)
+            try alloc.dupe(u8, config.font_path_cfg)
+        else
+            try resolveFontByQuery(alloc, "monospace");
         errdefer alloc.free(font_path);
 
         const font_data = try mmapFontFile(font_path);
 
-        var initial_atlas = try snail.TextAtlas.init(alloc, &.{.{ .data = font_data }});
+        var specs: std.ArrayListUnmanaged(snail.FaceSpec) = .empty;
+        defer specs.deinit(alloc);
+        try specs.append(alloc, .{ .data = font_data });
+
+        for (config.fallback_fonts) |name| {
+            const path = resolveFontByQuery(alloc, name) catch |err| {
+                log.warn(.atlas, "fallback lookup failed", .{ .name = name, .err = err });
+                continue;
+            };
+            defer alloc.free(path);
+            const data = mmapFontFile(path) catch |err| {
+                log.warn(.atlas, "fallback mmap failed", .{ .name = name, .err = err });
+                continue;
+            };
+            try specs.append(alloc, .{ .data = data, .fallback = true });
+            log.info(.atlas, "fallback registered", .{ .name = name, .path = path });
+        }
+
+        var initial_atlas = try snail.TextAtlas.init(alloc, specs.items);
         errdefer initial_atlas.deinit();
 
         const atlas_ref = try alloc.create(atlas_ref_mod.AtlasRef);
@@ -345,7 +374,7 @@ pub const AtlasWorker = struct {
 
         self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
-        log.info(.atlas, "font ready", .{});
+        log.info(.atlas, "font ready", .{ .fallbacks = specs.items.len - 1 });
 
         // Tell main it can compute cell metrics and fork the PTY now.
         // Glyph rasterization happens lazily via the atlas-thread miss
@@ -356,16 +385,14 @@ pub const AtlasWorker = struct {
     }
 };
 
-fn findFontPathFc(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
-    if (config_path.len > 0) return try allocator.dupe(u8, config_path);
+/// Resolve a fontconfig query (typically a family name) to a font file
+/// path. The cache used by `findFontPathFc` is monospace-specific and
+/// doesn't apply here, so this is unconditionally a fontconfig call.
+fn findFontByName(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
+    const query_z = try allocator.dupeZ(u8, query);
+    defer allocator.free(query_z);
 
-    // Fast path: on-disk cache of the previous "monospace" resolution.
-    // Skips fontconfig's XML parse (~1.5 ms cold) when nothing relevant
-    // has changed. See font_path_cache.zig-style comment near
-    // tryReadFontPathCache for the invalidation strategy and tradeoff.
-    if (tryReadFontPathCache(allocator)) |cached| return cached;
-
-    const pattern = c.FcNameParse("monospace") orelse return error.NoFontFound;
+    const pattern = c.FcNameParse(query_z.ptr) orelse return error.NoFontFound;
     defer c.FcPatternDestroy(pattern);
 
     _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
@@ -380,16 +407,46 @@ fn findFontPathFc(allocator: std.mem.Allocator, config_path: []const u8) ![]cons
         return error.NoFontFound;
 
     const path = std.mem.sliceTo(file_ptr, 0);
-    writeFontPathCache(path);
+    return try allocator.dupe(u8, path);
+}
+
+/// Resolve a fontconfig query (typically a family name like
+/// "monospace" or "Noto Color Emoji") to a font file path. Reads /
+/// writes a per-query cache so subsequent launches skip the fontconfig
+/// XML parse.
+fn resolveFontByQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
+    if (tryReadFontPathCache(allocator, query)) |cached| return cached;
+
+    const query_z = try allocator.dupeZ(u8, query);
+    defer allocator.free(query_z);
+
+    const pattern = c.FcNameParse(query_z.ptr) orelse return error.NoFontFound;
+    defer c.FcPatternDestroy(pattern);
+
+    _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
+    c.FcDefaultSubstitute(pattern);
+
+    var result: c.FcResult = undefined;
+    const match = c.FcFontMatch(null, pattern, &result) orelse return error.NoFontFound;
+    defer c.FcPatternDestroy(match);
+
+    var file_ptr: [*c]u8 = undefined;
+    if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch)
+        return error.NoFontFound;
+
+    const path = std.mem.sliceTo(file_ptr, 0);
+    writeFontPathCache(query, path);
     return try allocator.dupe(u8, path);
 }
 
 // ── Font path cache ────────────────────────────────────────────────────────
 //
-// Caches the fontconfig "monospace" resolution at
-// $XDG_CACHE_HOME/scrgo/font-path (or ~/.cache/scrgo/font-path) so that
-// subsequent launches can skip fontconfig's XML parse — about 1.5 ms of
-// wall time on a typical cold start.
+// Caches each fontconfig query's resolution at
+// $XDG_CACHE_HOME/scrgo/font-<sanitized>-<hash> (or ~/.cache/...) so
+// subsequent launches skip fontconfig's XML parse — about 1.5 ms per
+// query on a typical cold start. One file per query, so the primary
+// ("monospace") and each fallback (e.g. "Noto Color Emoji") share the
+// same invalidation logic but don't fight over a single cache file.
 //
 // Invalidation: the cache file's mtime is compared against:
 //   - /etc/fonts/fonts.conf            (system fontconfig config)
@@ -406,18 +463,37 @@ fn findFontPathFc(allocator: std.mem.Allocator, config_path: []const u8) ![]cons
 // file. We accept that residual stale window in exchange for the 1.5 ms
 // saving on every cold start.
 
-const font_cache_rel = "scrgo/font-path";
-
-fn buildCachePathZ(buf: []u8) ?[:0]const u8 {
+/// Build the cache file path for `query` into `buf`. Filename format:
+/// `font-<sanitized>-<8hex>` — sanitized form is human-readable for
+/// debugging; the hash suffix kills collisions between similar-looking
+/// queries (e.g. "Foo Bar" vs "Foo_Bar"). Returns null if neither
+/// XDG_CACHE_HOME nor HOME is set.
+fn buildCachePathZ(buf: []u8, query: []const u8) ?[:0]const u8 {
+    var name_buf: [128]u8 = undefined;
+    const name = sanitizedCacheName(&name_buf, query);
+    const hash: u32 = @truncate(std.hash.Wyhash.hash(0, query));
     if (c.getenv("XDG_CACHE_HOME")) |xdg_z| {
         const xdg = std.mem.sliceTo(xdg_z, 0);
-        return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ xdg, font_cache_rel }) catch null;
+        return std.fmt.bufPrintZ(buf, "{s}/scrgo/font-{s}-{x:0>8}", .{ xdg, name, hash }) catch null;
     }
     if (c.getenv("HOME")) |home_z| {
         const home = std.mem.sliceTo(home_z, 0);
-        return std.fmt.bufPrintZ(buf, "{s}/.cache/{s}", .{ home, font_cache_rel }) catch null;
+        return std.fmt.bufPrintZ(buf, "{s}/.cache/scrgo/font-{s}-{x:0>8}", .{ home, name, hash }) catch null;
     }
     return null;
+}
+
+fn sanitizedCacheName(out: []u8, query: []const u8) []const u8 {
+    const n = @min(out.len, query.len);
+    for (0..n) |i| {
+        const b = query[i];
+        out[i] = switch (b) {
+            'A'...'Z' => b - 'A' + 'a',
+            'a'...'z', '0'...'9' => b,
+            else => '_',
+        };
+    }
+    return out[0..n];
 }
 
 fn mtimeNs(path_z: [*:0]const u8) ?i128 {
@@ -449,9 +525,9 @@ fn cacheInvalidated(cache_mtime: i128) bool {
     return false;
 }
 
-fn tryReadFontPathCache(allocator: std.mem.Allocator) ?[]const u8 {
+fn tryReadFontPathCache(allocator: std.mem.Allocator, query: []const u8) ?[]const u8 {
     var path_buf: [4096]u8 = undefined;
-    const cache_z = buildCachePathZ(&path_buf) orelse return null;
+    const cache_z = buildCachePathZ(&path_buf, query) orelse return null;
 
     const cache_mtime = mtimeNs(cache_z.ptr) orelse return null;
     if (cacheInvalidated(cache_mtime)) return null;
@@ -473,9 +549,9 @@ fn tryReadFontPathCache(allocator: std.mem.Allocator) ?[]const u8 {
     return allocator.dupe(u8, trimmed) catch null;
 }
 
-fn writeFontPathCache(path: []const u8) void {
+fn writeFontPathCache(query: []const u8, path: []const u8) void {
     var path_buf: [4096]u8 = undefined;
-    const cache_z = buildCachePathZ(&path_buf) orelse return;
+    const cache_z = buildCachePathZ(&path_buf, query) orelse return;
 
     const last_slash = std.mem.lastIndexOfScalar(u8, cache_z, '/') orelse return;
     var dir_buf: [4096]u8 = undefined;

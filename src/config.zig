@@ -22,6 +22,11 @@ pub const pt_to_px: f32 = 96.0 / 72.0;
 
 pub const Config = struct {
     font_path: []const u8,
+    /// Fontconfig query strings tried (in order) when the primary font
+    /// is missing a glyph. Each entry is a fontconfig pattern — usually
+    /// just a family name like "Noto Color Emoji" or "Symbols Nerd
+    /// Font". Owned when `owns_fallback_fonts` is set.
+    fallback_fonts: []const []const u8 = &.{},
     /// Pixel-em size (already converted from the user-facing point size
     /// written in the config file). Passed straight to snail.
     font_size: f32,
@@ -57,10 +62,15 @@ pub const Config = struct {
     // Track ownership of heap-allocated strings
     owns_font_path: bool = false,
     owns_shell: bool = false,
+    owns_fallback_fonts: bool = false,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.owns_font_path) allocator.free(self.font_path);
         if (self.owns_shell) allocator.free(self.shell);
+        if (self.owns_fallback_fonts) {
+            for (self.fallback_fonts) |f| allocator.free(f);
+            allocator.free(self.fallback_fonts);
+        }
     }
 };
 
@@ -245,6 +255,25 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
         if (v == .string) {
             cfg.font_path = try allocator.dupe(u8, v.string);
             cfg.owns_font_path = true;
+        }
+    }
+
+    if (obj.get("fallback_fonts")) |v| {
+        if (v == .array) {
+            const arr = v.array.items;
+            const list = try allocator.alloc([]const u8, arr.len);
+            errdefer allocator.free(list);
+            var owned: usize = 0;
+            errdefer {
+                for (list[0..owned]) |s| allocator.free(s);
+            }
+            for (arr) |item| {
+                if (item != .string) continue;
+                list[owned] = try allocator.dupe(u8, item.string);
+                owned += 1;
+            }
+            cfg.fallback_fonts = list[0..owned];
+            cfg.owns_fallback_fonts = true;
         }
     }
 
