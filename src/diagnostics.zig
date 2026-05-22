@@ -1,7 +1,7 @@
 const std = @import("std");
 const render_env = @import("render_env.zig");
 const wayland_mod = @import("wayland.zig");
-const renderer_mod = @import("renderer.zig");
+const gpu_pipeline = @import("gpu_pipeline.zig");
 const shm_render = @import("shm_render.zig");
 const gpu_renderer = @import("gpu_renderer.zig");
 
@@ -237,7 +237,7 @@ pub const Diagnostics = struct {
             );
         }
 
-        renderer_mod.Renderer.frame_stats.log("frame");
+        gpu_pipeline.GpuPipeline.frame_stats.log("frame");
 
         if (self.debug.commits) {
             std.debug.print(
@@ -272,16 +272,16 @@ pub const Diagnostics = struct {
                     readProcStatus("RssAnon:") / 1024,
                 },
             );
-            if (renderer_mod.Renderer.phase_frame_count > 0) {
+            if (gpu_pipeline.GpuPipeline.phase_frame_count > 0) {
                 std.debug.print(
                     "scrgo: gpu pipeline  frames={}  row_build={d:.1}ms  picture={d:.1}ms  upload={d:.1}ms  drawlist={d:.1}ms  draw={d:.1}ms\n",
                     .{
-                        renderer_mod.Renderer.phase_frame_count,
-                        @as(f64, @floatFromInt(renderer_mod.Renderer.phase_row_build_ns)) / ms_f,
-                        @as(f64, @floatFromInt(renderer_mod.Renderer.phase_picture_ns)) / ms_f,
-                        @as(f64, @floatFromInt(renderer_mod.Renderer.phase_upload_ns)) / ms_f,
-                        @as(f64, @floatFromInt(renderer_mod.Renderer.phase_drawlist_ns)) / ms_f,
-                        @as(f64, @floatFromInt(renderer_mod.Renderer.phase_draw_ns)) / ms_f,
+                        gpu_pipeline.GpuPipeline.phase_frame_count,
+                        @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_row_build_ns)) / ms_f,
+                        @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_picture_ns)) / ms_f,
+                        @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_upload_ns)) / ms_f,
+                        @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_drawlist_ns)) / ms_f,
+                        @as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_draw_ns)) / ms_f,
                     },
                 );
             }

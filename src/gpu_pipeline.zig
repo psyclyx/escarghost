@@ -61,7 +61,7 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
 
 /// GPU renderer state. Owned exclusively by the GPU renderer thread.
 /// Reads the shared atlas (via AtlasRef, lock-free).
-pub const Renderer = struct {
+pub const GpuPipeline = struct {
     allocator: std.mem.Allocator,
     atlas_ref: *atlas_ref_mod.AtlasRef,
     /// Lease on the current atlas snapshot. Swapped (and the old one
@@ -120,7 +120,7 @@ pub const Renderer = struct {
         font_size: f32,
         cell_width: f32,
         cell_height: f32,
-    ) !Renderer {
+    ) !GpuPipeline {
         var gl_renderer = try snail.Gles30Renderer.init(allocator);
         errdefer gl_renderer.deinit();
 
@@ -151,7 +151,7 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn deinit(self: *Renderer) void {
+    pub fn deinit(self: *GpuPipeline) void {
         self.ephemeral_blobs.deinit();
         if (self.scratch_ready) self.allocator.free(self.scratch_rects);
         self.draw_buf.deinit(self.allocator);
@@ -162,14 +162,14 @@ pub const Renderer = struct {
         self.gl_renderer.deinit();
     }
 
-    fn currentAtlas(self: *const Renderer) *const snail.TextAtlas {
+    fn currentAtlas(self: *const GpuPipeline) *const snail.TextAtlas {
         return self.atlas_lease.get();
     }
 
     /// No-op kept for API stability with the gpu_renderer worker. We
     /// don't keep per-dmabuf paint state anymore — every frame paints
     /// itself fully into whichever dmabuf the caller bound.
-    pub fn setActiveTarget(self: *Renderer, idx: u8) void {
+    pub fn setActiveTarget(self: *GpuPipeline, idx: u8) void {
         _ = self;
         _ = idx;
     }
@@ -180,7 +180,7 @@ pub const Renderer = struct {
     /// glyph pages get uploaded here too. Without this, those one-time
     /// costs would land on the first real frames the user sees as
     /// visible jank.
-    pub fn warmPipeline(self: *Renderer) !void {
+    pub fn warmPipeline(self: *GpuPipeline) !void {
         defer {
             self.scene.reset();
             self.builder.reset();
@@ -269,35 +269,35 @@ pub const Renderer = struct {
     /// No-op kept for API stability. With every frame fully repainting
     /// every row, there is no per-dmabuf "seeded" state to invalidate
     /// when the GPU side reinstalls its dmabufs.
-    pub fn notifyTargetsReinstalled(self: *Renderer) void {
+    pub fn notifyTargetsReinstalled(self: *GpuPipeline) void {
         _ = self;
     }
 
-    fn ensureScratch(self: *Renderer) !void {
+    fn ensureScratch(self: *GpuPipeline) !void {
         if (self.scratch_ready) return;
         self.scratch_rects = try self.allocator.alloc(row_build.ColoredRect, row_build.MAX_RECTS_PER_ROW);
         self.scratch_ready = true;
     }
 
-    pub fn setDebugResetAtlas(self: *Renderer, enabled: bool) void {
+    pub fn setDebugResetAtlas(self: *GpuPipeline, enabled: bool) void {
         self.debug_reset_atlas_each_frame = enabled;
     }
 
-    pub fn setDebugLogs(self: *Renderer, options: render_env.RendererDebug) void {
+    pub fn setDebugLogs(self: *GpuPipeline, options: render_env.RendererDebug) void {
         self.debug_log_renderers = options.renderers;
         self.debug_log_frames = options.frames;
         self.debug_log_atlas = options.atlas;
     }
 
     /// Resize the drawable. Pure window-resize; cell metrics are unchanged.
-    pub fn setViewport(self: *Renderer, w: u32, h: u32) void {
+    pub fn setViewport(self: *GpuPipeline, w: u32, h: u32) void {
         if (self.viewport_w == @as(f32, @floatFromInt(w)) and self.viewport_h == @as(f32, @floatFromInt(h))) return;
         self.viewport_w = @floatFromInt(w);
         self.viewport_h = @floatFromInt(h);
     }
 
     /// Update font metrics. No-op when metrics are unchanged.
-    pub fn setMetrics(self: *Renderer, font_size: f32, cell_width: f32, cell_height: f32) void {
+    pub fn setMetrics(self: *GpuPipeline, font_size: f32, cell_width: f32, cell_height: f32) void {
         if (self.font_size == font_size and self.cell_width == cell_width and self.cell_height == cell_height) return;
         self.font_size = font_size;
         self.cell_width = cell_width;
@@ -308,7 +308,7 @@ pub const Renderer = struct {
     /// rebuilds the builder against the fresh atlas. Safe to call only
     /// at frame boundaries: the previous frame's ephemeral blobs must
     /// have been released before the old lease is dropped here.
-    fn refreshAtlas(self: *Renderer) *const snail.TextAtlas {
+    fn refreshAtlas(self: *GpuPipeline) *const snail.TextAtlas {
         var next_lease = self.atlas_ref.acquire();
         const atlas = next_lease.get();
         const identity = atlas.snapshotIdentity();
@@ -332,7 +332,7 @@ pub const Renderer = struct {
         return atlas;
     }
 
-    fn rowMetrics(self: *const Renderer) row_build.Metrics {
+    fn rowMetrics(self: *const GpuPipeline) row_build.Metrics {
         return .{
             .cell_width = self.cell_width,
             .cell_height = self.cell_height,
@@ -344,7 +344,7 @@ pub const Renderer = struct {
     /// snap to integer pixel boundaries by computing both edges in float
     /// (cell_width is fractional) and rounding each separately — never
     /// multiplying `cell_x` by a truncated width.
-    fn emitCursor(self: *const Renderer, picture: *snail.PathPictureBuilder, cursor: row_build.CursorOverlay) !void {
+    fn emitCursor(self: *const GpuPipeline, picture: *snail.PathPictureBuilder, cursor: row_build.CursorOverlay) !void {
         const x0_f = @as(f32, @floatFromInt(cursor.cell_x)) * self.cell_width;
         const y0_f = @as(f32, @floatFromInt(cursor.cell_y)) * self.cell_height;
         const x1_f = @as(f32, @floatFromInt(cursor.cell_x + 1)) * self.cell_width;
@@ -369,7 +369,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn drawState(self: *const Renderer) snail.DrawState {
+    fn drawState(self: *const GpuPipeline) snail.DrawState {
         return .{
             .mvp = snail.Mat4.ortho(0, self.viewport_w, self.viewport_h, 0, -1, 1),
             .surface = .{
@@ -386,7 +386,7 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn drawSnapshot(self: *Renderer, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
+    pub fn drawSnapshot(self: *GpuPipeline, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
         const frame_timer = perf.Timer.now();
         const atlas = self.refreshAtlas();
         try self.ensureScratch();
@@ -432,7 +432,7 @@ pub const Renderer = struct {
         frame_stats.record(frame_timer.elapsedUs());
     }
 
-    fn flushDraw(self: *Renderer, built: row_build.BuiltSnapshot, default_bg: Rgb, default_fg: Rgb) !void {
+    fn flushDraw(self: *GpuPipeline, built: row_build.BuiltSnapshot, default_bg: Rgb, default_fg: Rgb) !void {
         // Full-frame repaint every frame: paint the background, every
         // row's bg/decoration rects, every row's glyphs, the cursor,
         // any selection bands, and the scrollbar. We rely on snail's

@@ -3,7 +3,7 @@ const config_mod = @import("config.zig");
 const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
-const renderer_mod = @import("renderer.zig");
+const gpu_pipeline = @import("gpu_pipeline.zig");
 const shm_render = @import("shm_render.zig");
 const render_env = @import("render_env.zig");
 const atlas_owner = @import("atlas_owner.zig");
@@ -198,12 +198,12 @@ pub fn main(init: std.process.Init) !void {
 
     var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
     defer bootstrap_atlas_lease.release();
-    const cell_metrics = try renderer_mod.computeCellMetrics(bootstrap_atlas_lease.get(), cfg.font_size);
+    const cell_metrics = try gpu_pipeline.computeCellMetrics(bootstrap_atlas_lease.get(), cfg.font_size);
     state.metrics.font_size = cfg.font_size;
     state.metrics.cell_width = cell_metrics.cell_width;
     state.metrics.cell_height = cell_metrics.cell_height;
 
-    const grid = renderer_mod.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, wl.width, wl.height);
+    const grid = gpu_pipeline.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, wl.width, wl.height);
     state.metrics.viewport_w = wl.width;
     state.metrics.viewport_h = wl.height;
 

@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const snail = @import("snail");
-const renderer_mod = @import("renderer.zig");
+const gpu_pipeline = @import("gpu_pipeline.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const atlas_owner = @import("atlas_owner.zig");
 const render_env = @import("render_env.zig");
@@ -682,7 +682,7 @@ pub const Frontend = struct {
 
         var allocator_state: ?DmabufAllocator = null;
         defer if (allocator_state) |*existing| existing.deinit(&egl);
-        var renderer: ?renderer_mod.Renderer = null;
+        var renderer: ?gpu_pipeline.GpuPipeline = null;
         defer if (renderer) |*r| r.deinit();
         var current_width: u32 = 0;
         var current_height: u32 = 0;
@@ -750,7 +750,7 @@ pub const Frontend = struct {
                         r.setMetrics(request.font_size, request.cell_width, request.cell_height);
                         r.setViewport(request.width, request.height);
                     } else {
-                        renderer = renderer_mod.Renderer.init(
+                        renderer = gpu_pipeline.GpuPipeline.init(
                             std.heap.smp_allocator,
                             atlas_ref,
                             request.font_size,
@@ -852,11 +852,11 @@ pub const Frontend = struct {
                     // "draw" number. Cheap reads; we always take them
                     // so the hot path stays branch-free even when the
                     // warning is disabled.
-                    const phase_row_base = renderer_mod.Renderer.phase_row_build_ns;
-                    const phase_pic_base = renderer_mod.Renderer.phase_picture_ns;
-                    const phase_upload_base = renderer_mod.Renderer.phase_upload_ns;
-                    const phase_drawlist_base = renderer_mod.Renderer.phase_drawlist_ns;
-                    const phase_draw_base = renderer_mod.Renderer.phase_draw_ns;
+                    const phase_row_base = gpu_pipeline.GpuPipeline.phase_row_build_ns;
+                    const phase_pic_base = gpu_pipeline.GpuPipeline.phase_picture_ns;
+                    const phase_upload_base = gpu_pipeline.GpuPipeline.phase_upload_ns;
+                    const phase_drawlist_base = gpu_pipeline.GpuPipeline.phase_drawlist_ns;
+                    const phase_draw_base = gpu_pipeline.GpuPipeline.phase_draw_ns;
                     const row_rebuild_base = row_build.phase_row_rebuild_ns;
                     const row_count_base = row_build.phase_row_count;
                     const row_shape_base = row_build.phase_row_shape_ns;
@@ -942,11 +942,11 @@ pub const Frontend = struct {
                         const budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms;
                         if (frame_elapsed_ns > budget_ns) {
                             const ms_f = @as(f64, std.time.ns_per_ms);
-                            const phase_row = renderer_mod.Renderer.phase_row_build_ns - phase_row_base;
-                            const phase_pic = renderer_mod.Renderer.phase_picture_ns - phase_pic_base;
-                            const phase_upload = renderer_mod.Renderer.phase_upload_ns - phase_upload_base;
-                            const phase_drawlist = renderer_mod.Renderer.phase_drawlist_ns - phase_drawlist_base;
-                            const phase_draw = renderer_mod.Renderer.phase_draw_ns - phase_draw_base;
+                            const phase_row = gpu_pipeline.GpuPipeline.phase_row_build_ns - phase_row_base;
+                            const phase_pic = gpu_pipeline.GpuPipeline.phase_picture_ns - phase_pic_base;
+                            const phase_upload = gpu_pipeline.GpuPipeline.phase_upload_ns - phase_upload_base;
+                            const phase_drawlist = gpu_pipeline.GpuPipeline.phase_drawlist_ns - phase_drawlist_base;
+                            const phase_draw = gpu_pipeline.GpuPipeline.phase_draw_ns - phase_draw_base;
                             const row_rebuild = row_build.phase_row_rebuild_ns - row_rebuild_base;
                             const row_count = row_build.phase_row_count - row_count_base;
                             const row_shape = row_build.phase_row_shape_ns - row_shape_base;

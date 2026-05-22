@@ -6,7 +6,7 @@ const selection_mod = @import("selection.zig");
 const clipboard_mod = @import("clipboard.zig");
 const wayland_mod = @import("wayland.zig");
 const render_snapshot = @import("render_snapshot.zig");
-const renderer_mod = @import("renderer.zig");
+const gpu_pipeline = @import("gpu_pipeline.zig");
 
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
@@ -222,7 +222,7 @@ pub fn onMouse(ev: wayland_mod.MouseEvent) void {
 }
 
 pub fn onResize(w: u32, h: u32) void {
-    const grid = renderer_mod.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, w, h);
+    const grid = gpu_pipeline.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, w, h);
     if (grid.cols == 0 or grid.rows == 0) return;
     state.metrics.viewport_w = w;
     state.metrics.viewport_h = h;
@@ -282,11 +282,11 @@ fn zoomReset() void {
 fn applyZoom() void {
     var atlas_lease = state.refs.atlas_ref.acquire();
     defer atlas_lease.release();
-    const cm = renderer_mod.computeCellMetrics(atlas_lease.get(), state.metrics.font_size) catch return;
+    const cm = gpu_pipeline.computeCellMetrics(atlas_lease.get(), state.metrics.font_size) catch return;
     state.metrics.cell_width = cm.cell_width;
     state.metrics.cell_height = cm.cell_height;
 
-    const grid = renderer_mod.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, state.metrics.viewport_w, state.metrics.viewport_h);
+    const grid = gpu_pipeline.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, state.metrics.viewport_w, state.metrics.viewport_h);
     if (grid.cols > 0 and grid.rows > 0) {
         state.refs.term.resize(grid.cols, grid.rows, @intFromFloat(state.metrics.cell_width), @intFromFloat(state.metrics.cell_height)) catch {};
         state.refs.pty.resize(grid.cols, grid.rows, state.metrics.viewport_w, state.metrics.viewport_h);
