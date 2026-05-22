@@ -70,15 +70,28 @@ pub fn maybeScheduleScrollbarHide(s: *app_state.AppState) void {
     markRenderDirty(s);
 }
 
-/// Called once per loop iteration. Marks a redraw when the visual
-/// bell deadline has elapsed so the trailing non-inverted frame
-/// commits. `clearVisualIfExpired` is called only after the render
-/// is queued so the dirty cycle picks up the still-inverted snapshot
-/// followed by the un-inverted one.
-pub fn maybeScheduleBellHide(s: *app_state.AppState) void {
+/// Compute the bell overlay for this snapshot. Returns null when no
+/// bell is active. While the bell is fading, the main loop must keep
+/// dirtying the screen so the overlay alpha is re-sampled — `tickBell`
+/// below handles that and the deadline cleanup.
+pub fn currentBellOverlay(s: *app_state.AppState) ?render_snapshot.BellOverlay {
+    const alpha = s.refs.bell.visualAlpha();
+    if (alpha <= 0) return null;
+    return .{ .alpha = alpha };
+}
+
+/// Called once per loop iteration. While the bell is fading, dirty
+/// the frame so each step of the fade actually paints. When the bell
+/// deadline elapses, dirty once more so the final non-tinted frame
+/// commits.
+pub fn tickBell(s: *app_state.AppState) void {
     const bell = s.refs.bell;
     if (bell.visual_until_ns == 0) return;
-    if (diagnostics.monotonicNowNs() < bell.visual_until_ns) return;
+    if (diagnostics.monotonicNowNs() < bell.visual_until_ns) {
+        // Still fading — re-render so the alpha advances.
+        markRenderDirty(s);
+        return;
+    }
     bell.visual_until_ns = 0;
     markRenderDirty(s);
 }
@@ -96,7 +109,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     if (s.render.target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !s.render.gpu_snapshot_dirty) return;
     if (wl.frame_pending) return;
-    gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), s.refs.bell.isVisualActive()) catch |err| switch (err) {
+    gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), currentBellOverlay(s)) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer so
             // we can see at exit whether compositor release latency is
@@ -160,7 +173,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             s.render.render_serial,
             s.input.selection.toSnapshot(),
             currentScrollbarOverlay(s),
-            s.refs.bell.isVisualActive(),
+            currentBellOverlay(s),
         ) catch |err| switch (err) {
             error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,

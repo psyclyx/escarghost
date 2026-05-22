@@ -393,6 +393,9 @@ pub const BuiltSnapshot = struct {
     /// Optional right-edge scrollbar overlay. Renderers paint a thin
     /// band on top of everything else when present.
     scrollbar: ?render_snapshot.ScrollbarOverlay,
+    /// Visual-bell overlay. Renderers paint a translucent tint over
+    /// the finished frame when present.
+    bell: ?render_snapshot.BellOverlay,
 };
 
 /// Walk a snapshot row-by-row, shape each row's text, and capture cursor
@@ -521,6 +524,7 @@ pub fn buildSnapshot(
         .cursor = cursor,
         .selection_spans = spans,
         .scrollbar = snapshot.scrollbar,
+        .bell = snapshot.bell,
     };
 }
 

@@ -33,6 +33,7 @@ pkgs.mkShell {
     libxkbcommon
     harfbuzz
     fontconfig
+    libpulseaudio
   ];
 
   buildInputs = [
@@ -50,6 +51,7 @@ pkgs.mkShell {
     libxkbcommon
     harfbuzz
     libghostty-vt
+    libpulseaudio
   ];
 
   PKG_CONFIG_PATH = "${libghostty-vt.dev}/share/pkgconfig";

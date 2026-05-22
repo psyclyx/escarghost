@@ -384,7 +384,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         render_loop.maybeScheduleScrollbarHide(&state);
-        render_loop.maybeScheduleBellHide(&state);
+        render_loop.tickBell(&state);
         render_loop.maybeQueueGpuFrame(&state);
         render_loop.renderActivePath(&state);
         wl.flush();

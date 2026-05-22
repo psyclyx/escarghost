@@ -263,6 +263,27 @@ pub const CpuPipeline = struct {
         }
     }
 
+    /// Paint a translucent rect over the whole viewport, tinted with
+    /// default_fg. `alpha` is the visual-bell fade value — 1.0 at the
+    /// strike, fading to 0. Multiplied by 0.25 to land on a soft tint
+    /// rather than a wash.
+    fn paintBellOverlay(
+        picture: *snail.PathPictureBuilder,
+        bell: render_snapshot.BellOverlay,
+        viewport_w: f32,
+        viewport_h: f32,
+        default_fg: Rgb,
+    ) !void {
+        if (bell.alpha <= 0) return;
+        const tint = default_fg.toFloat4(1.0);
+        const a = @min(1.0, @max(0.0, bell.alpha)) * 0.25;
+        try picture.addFilledRect(
+            .{ .x = 0, .y = 0, .w = viewport_w, .h = viewport_h },
+            .{ .paint = .{ .solid = .{ tint[0], tint[1], tint[2], a } } },
+            .identity,
+        );
+    }
+
     /// Paint the right-edge scrollbar overlay (gutter + thumb). Both
     /// renderers share the geometry helpers in render_common so the
     /// scrollbar looks identical regardless of which path is active.
@@ -433,6 +454,13 @@ pub const CpuPipeline = struct {
         // null when the scrollbar should be hidden.
         if (built.scrollbar) |sb| {
             try paintScrollbar(&picture_builder, sb, @floatFromInt(viewport_w), @floatFromInt(viewport_h), default_fg);
+        }
+
+        // Visual-bell overlay: a translucent full-viewport rect tinted
+        // by default_fg, alpha-fading across the bell window. Last in
+        // paint order so the tint blends over text + scrollbar.
+        if (built.bell) |bell| {
+            try paintBellOverlay(&picture_builder, bell, @floatFromInt(viewport_w), @floatFromInt(viewport_h), default_fg);
         }
 
         // Glyph-only frames leave the builder empty; `freeze` would

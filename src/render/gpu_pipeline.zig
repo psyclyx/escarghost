@@ -485,6 +485,21 @@ pub const GpuPipeline = struct {
             );
         }
 
+        // Visual-bell overlay: translucent full-viewport rect tinted by
+        // default_fg. Last in paint order so the tint sits over text +
+        // scrollbar; alpha fades to 0 across the bell window.
+        if (built.bell) |bell| {
+            if (bell.alpha > 0) {
+                const tint = default_fg.toFloat4(1.0);
+                const a = @min(1.0, @max(0.0, bell.alpha)) * 0.25;
+                try picture_builder.addFilledRect(
+                    .{ .x = 0, .y = 0, .w = self.viewport_w, .h = self.viewport_h },
+                    .{ .paint = .{ .solid = .{ tint[0], tint[1], tint[2], a } } },
+                    .identity,
+                );
+            }
+        }
+
         // Picture is optional: a frame that paints only glyphs (no bg
         // rects, no cursor, no scrollbar) leaves the builder empty and
         // `freeze` errors with EmptyPicture. The text-only path still

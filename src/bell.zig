@@ -3,21 +3,21 @@
 //! Modes (set via config):
 //!   off     — drop silently
 //!   visual  — invert the grey ramp for `visual_duration_ms` (default)
-//!   audible — synthesize a short tone via paplay/aplay
+//!   audible — synthesize and play a short tone via libpulse-simple
 //!   both    — visual and audible together
 //!
 //! Both paths are debounced/coalesced so a process spamming `\a` doesn't
-//! turn into a strobe + audio stream. The visual deadline always wins
+//! turn into a strobe + audio stream. The visual deadline always tracks
 //! the latest ring (so the flash duration stays the *configured* time
 //! even under spam); the audible path is rate-limited to one shot per
 //! `audible_debounce_ms`.
 //!
-//! Audio is played by a small worker thread that owns a single spawn
-//! pid. On ring() the manager pushes a token through a pipe; the worker
-//! forks+execvp(paplay) / execvp(aplay) on a synthesized .wav written
-//! at init() and waitpid's the spawned process before returning to its
-//! park state. Failure modes (no audio, no paplay) are swallowed —
-//! we'd rather drop the beep than slow down PTY drain.
+//! Audio is owned by a worker thread that holds a long-lived
+//! pa_simple stream to the PulseAudio (or PipeWire-compatible) server.
+//! The PTY-drain thread pushes a token through a pipe; the worker
+//! wakes, writes a pre-rendered sine burst to the stream, and parks.
+//! If the connection fails (no server, no compatibility layer) the
+//! worker just drops rings — the bell is silent, never a crash.
 
 const std = @import("std");
 
@@ -25,12 +25,12 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("unistd.h");
     @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("sys/stat.h");
     @cInclude("string.h");
     @cInclude("errno.h");
     @cInclude("math.h");
     @cInclude("time.h");
+    @cInclude("pulse/simple.h");
+    @cInclude("pulse/error.h");
 });
 
 /// Bell-local monotonic clock so this module doesn't drag in
@@ -66,6 +66,16 @@ pub fn callback() void {
     if (g_manager) |m| m.ring();
 }
 
+// ── Synthesized waveform ──
+//
+// A gentle two-tone descending chime — G5 (~784 Hz) into E5 (~659 Hz),
+// each ~110 ms with a soft exponential decay so the tail fades rather
+// than cutting off. Low amplitude to avoid startling. Rendered once at
+// startup into `pcm` so each ring is just a pa_simple_write.
+
+const sample_rate: u32 = 44100;
+const sample_count: usize = (@as(usize, sample_rate) * 260) / 1000; // ~260 ms total
+
 pub const Manager = struct {
     cfg: Config = .{},
 
@@ -83,11 +93,10 @@ pub const Manager = struct {
     /// disabled.
     audio_thread: ?std.Thread = null,
     pipe_fds: [2]c_int = .{ -1, -1 },
-    /// Path of the synthesized .wav file. Owned; freed in deinit.
-    /// Created lazily on the first ring so disabled-audio startup is
-    /// allocation-free.
-    wav_path: ?[]u8 = null,
-    /// Allocator used for `wav_path`. Captured at init().
+
+    /// Pre-rendered 16-bit signed PCM of the bell tone. Owned by the
+    /// manager; lives for the life of the process when audio is on.
+    pcm: []i16 = &.{},
     allocator: std.mem.Allocator = undefined,
     stop_requested: std.atomic.Value(bool) = .init(false),
 
@@ -113,15 +122,9 @@ pub const Manager = struct {
         if (self.pipe_fds[0] >= 0) _ = c.close(self.pipe_fds[0]);
         if (self.pipe_fds[1] >= 0) _ = c.close(self.pipe_fds[1]);
         self.pipe_fds = .{ -1, -1 };
-        if (self.wav_path) |p| {
-            // Best-effort cleanup; the file is in /tmp anyway.
-            const path_z = self.allocator.dupeZ(u8, p) catch null;
-            if (path_z) |z| {
-                _ = c.unlink(z.ptr);
-                self.allocator.free(z);
-            }
-            self.allocator.free(p);
-            self.wav_path = null;
+        if (self.pcm.len != 0) {
+            self.allocator.free(self.pcm);
+            self.pcm = &.{};
         }
     }
 
@@ -154,15 +157,32 @@ pub const Manager = struct {
         return nowNs() < self.visual_until_ns;
     }
 
-    /// Time-until-redraw hint for the main loop's poll timeout. Returns
-    /// null when no visual bell is active (so the loop doesn't wake on
-    /// our account).
+    /// Linear-fade opacity for the visual flash, in [0, 1]. Returns 0
+    /// when the bell isn't active so renderers can skip the overlay
+    /// pass entirely.
+    pub fn visualAlpha(self: *const Manager) f32 {
+        if (self.visual_until_ns == 0) return 0;
+        const now = nowNs();
+        if (now >= self.visual_until_ns) return 0;
+        const remaining_ns = self.visual_until_ns - now;
+        const total_ns: u64 = @as(u64, self.cfg.visual_duration_ms) * std.time.ns_per_ms;
+        if (total_ns == 0) return 0;
+        const f = @as(f32, @floatFromInt(remaining_ns)) / @as(f32, @floatFromInt(total_ns));
+        return @max(0.0, @min(1.0, f));
+    }
+
+    /// Poll-timeout hint while the bell fade is in flight. We need to
+    /// wake at frame rate so the alpha steps actually paint, then once
+    /// more to drop the trailing tinted frame. Cap at ~16 ms so we
+    /// don't sleep past a vsync mid-fade. Returns null when no bell
+    /// is active.
     pub fn visualTimeoutMs(self: *const Manager) ?c_int {
         if (self.visual_until_ns == 0) return null;
         const now = nowNs();
         if (now >= self.visual_until_ns) return 0;
-        const delta_ms = (self.visual_until_ns - now) / std.time.ns_per_ms + 1;
-        return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
+        const remaining_ms = (self.visual_until_ns - now) / std.time.ns_per_ms + 1;
+        const frame_ms: u64 = 16;
+        return @intCast(@min(remaining_ms, frame_ms));
     }
 
     /// Clears the visual deadline once consumed. Called after the
@@ -182,14 +202,21 @@ pub const Manager = struct {
         _ = c.fcntl(fds[1], c.F_SETFL, flags | c.O_NONBLOCK);
         self.pipe_fds = fds;
 
-        const wav = try writeBellWav(self.allocator);
-        errdefer self.allocator.free(wav);
-        self.wav_path = wav;
+        self.pcm = try renderBellPcm(self.allocator);
+        errdefer self.allocator.free(self.pcm);
 
         self.audio_thread = try std.Thread.spawn(.{}, audioMain, .{self});
     }
 
     fn audioMain(self: *Manager) void {
+        // Open the PulseAudio connection lazily so we don't pay the
+        // setup cost (or, when no server is running, the connect-fail
+        // delay) on startup. Reopen on each batch of rings if the
+        // previous attempt failed — recovery comes for free when the
+        // user starts a server mid-session.
+        var stream: ?*c.pa_simple = null;
+        defer if (stream) |s| c.pa_simple_free(s);
+
         while (!self.stop_requested.load(.acquire)) {
             var byte: u8 = 0;
             const n = c.read(self.pipe_fds[0], &byte, 1);
@@ -198,139 +225,84 @@ pub const Manager = struct {
                 continue;
             }
             if (byte == 0) return; // shutdown sentinel
-            const wav = self.wav_path orelse continue;
-            playWav(wav);
+
+            if (stream == null) stream = openPulseStream();
+            const s = stream orelse continue; // server unavailable; drop ring
+            const bytes = std.mem.sliceAsBytes(self.pcm);
+            var err: c_int = 0;
+            if (c.pa_simple_write(s, bytes.ptr, bytes.len, &err) < 0) {
+                // Connection went bad; tear it down and let the next
+                // ring re-open.
+                c.pa_simple_free(s);
+                stream = null;
+                continue;
+            }
+            _ = c.pa_simple_drain(s, &err);
         }
     }
 };
 
-// ── Audio synthesis ──
-//
-// 440 Hz sine, 22.05 kHz mono, 16-bit PCM, 120 ms. ~5 KB on disk. We
-// write it once on init to a stable /tmp path so the audio worker can
-// fork+exec `paplay` (or `aplay`) without re-synthesizing each ring.
+fn openPulseStream() ?*c.pa_simple {
+    var spec: c.pa_sample_spec = .{
+        .format = c.PA_SAMPLE_S16NE,
+        .rate = sample_rate,
+        .channels = 1,
+    };
+    var err: c_int = 0;
+    return c.pa_simple_new(
+        null, // default server
+        "scrgo", // application name
+        c.PA_STREAM_PLAYBACK,
+        null, // default device
+        "bell", // stream description
+        &spec,
+        null, // default channel map (mono)
+        null, // default buffer attrs
+        &err,
+    );
+}
 
-const wav_sample_rate: u32 = 22050;
-const wav_duration_ms: u32 = 120;
-const wav_frequency_hz: f32 = 880.0; // close to a 'system beep'
+fn renderBellPcm(allocator: std.mem.Allocator) ![]i16 {
+    const samples = try allocator.alloc(i16, sample_count);
+    errdefer allocator.free(samples);
 
-fn writeBellWav(allocator: std.mem.Allocator) ![]u8 {
-    const path = try synthPath(allocator);
-    errdefer allocator.free(path);
+    // Two-tone descending chime, each tone with an exponential decay
+    // (mimics a struck bar / xylophone tine — much gentler than the
+    // square-edged sine burst it replaces). The faint 3rd harmonic
+    // softens the timbre away from a "pure" PC-speaker sound without
+    // adding harshness. Amplitudes chosen to peak well below clipping
+    // and avoid feeling abrupt.
+    const tone_a_hz: f32 = 783.99; // G5
+    const tone_b_hz: f32 = 659.25; // E5
+    const tone_samples: usize = (@as(usize, sample_rate) * 120) / 1000;
+    const decay_tau: f32 = 0.08; // seconds
+    const peak_amplitude: f32 = 0.18;
 
-    const sample_count: usize = (@as(usize, wav_sample_rate) * wav_duration_ms) / 1000;
-    const byte_count: usize = sample_count * 2; // mono int16
-
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.ensureTotalCapacity(allocator, 44 + byte_count);
-
-    // RIFF header
-    try buf.appendSlice(allocator, "RIFF");
-    try writeU32Le(&buf, allocator, @intCast(36 + byte_count));
-    try buf.appendSlice(allocator, "WAVE");
-    // fmt subchunk
-    try buf.appendSlice(allocator, "fmt ");
-    try writeU32Le(&buf, allocator, 16); // PCM fmt size
-    try writeU16Le(&buf, allocator, 1); // PCM format
-    try writeU16Le(&buf, allocator, 1); // channels
-    try writeU32Le(&buf, allocator, wav_sample_rate);
-    try writeU32Le(&buf, allocator, wav_sample_rate * 2); // byte rate
-    try writeU16Le(&buf, allocator, 2); // block align
-    try writeU16Le(&buf, allocator, 16); // bits per sample
-    // data subchunk
-    try buf.appendSlice(allocator, "data");
-    try writeU32Le(&buf, allocator, @intCast(byte_count));
-
-    // Sine with a short linear attack/release envelope so it sounds
-    // like a beep rather than a click. 8 ms ramps, sustain in between.
-    const ramp_samples: usize = (@as(usize, wav_sample_rate) * 8) / 1000;
     var i: usize = 0;
     while (i < sample_count) : (i += 1) {
-        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(wav_sample_rate));
-        const env: f32 = blk: {
-            if (i < ramp_samples) break :blk @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(ramp_samples));
-            if (i >= sample_count - ramp_samples) {
-                const tail = sample_count - i;
-                break :blk @as(f32, @floatFromInt(tail)) / @as(f32, @floatFromInt(ramp_samples));
-            }
-            break :blk 1.0;
-        };
-        const amplitude: f32 = 0.35 * env;
-        const sample_f: f32 = amplitude * std.math.sin(2.0 * std.math.pi * wav_frequency_hz * t);
-        const sample_i: i16 = @intFromFloat(sample_f * 32767.0);
-        try buf.append(allocator, @bitCast(@as(u8, @truncate(@as(u16, @bitCast(sample_i))))));
-        try buf.append(allocator, @bitCast(@as(u8, @truncate(@as(u16, @bitCast(sample_i)) >> 8))));
+        const in_b = i >= tone_samples;
+        const local_i: usize = if (in_b) i - tone_samples else i;
+        const local_t = @as(f32, @floatFromInt(local_i)) / @as(f32, @floatFromInt(sample_rate));
+        const freq: f32 = if (in_b) tone_b_hz else tone_a_hz;
+
+        // 14 ms raised-cosine attack so the strike eases in rather than
+        // popping. Long enough to feel deliberate, short enough that
+        // the chime still sounds prompt.
+        const attack_samples: f32 = @floatFromInt((@as(usize, sample_rate) * 14) / 1000);
+        const attack_env: f32 = if (@as(f32, @floatFromInt(local_i)) < attack_samples)
+            0.5 - 0.5 * std.math.cos(std.math.pi * @as(f32, @floatFromInt(local_i)) / attack_samples)
+        else
+            1.0;
+        const decay_env: f32 = std.math.exp(-local_t / decay_tau);
+        const env = attack_env * decay_env;
+
+        const sample_f: f32 = peak_amplitude * env *
+            (std.math.sin(2.0 * std.math.pi * freq * local_t) +
+                0.15 * std.math.sin(2.0 * std.math.pi * 3.0 * freq * local_t));
+        const clamped = std.math.clamp(sample_f, -1.0, 1.0);
+        samples[i] = @intFromFloat(clamped * 32767.0);
     }
-
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    const fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
-    if (fd < 0) return error.WavWriteFailed;
-    defer _ = c.close(fd);
-    if (c.write(fd, buf.items.ptr, buf.items.len) != @as(isize, @intCast(buf.items.len))) {
-        return error.WavWriteFailed;
-    }
-
-    return path;
-}
-
-fn writeU16Le(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: u16) !void {
-    try buf.append(allocator, @intCast(v & 0xff));
-    try buf.append(allocator, @intCast((v >> 8) & 0xff));
-}
-
-fn writeU32Le(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: u32) !void {
-    try buf.append(allocator, @intCast(v & 0xff));
-    try buf.append(allocator, @intCast((v >> 8) & 0xff));
-    try buf.append(allocator, @intCast((v >> 16) & 0xff));
-    try buf.append(allocator, @intCast((v >> 24) & 0xff));
-}
-
-fn synthPath(allocator: std.mem.Allocator) ![]u8 {
-    const uid = c.getuid();
-    return try std.fmt.allocPrint(allocator, "/tmp/scrgo-bell-{d}.wav", .{uid});
-}
-
-// ── Playback ──
-//
-// We fork+execvp twice: first try `paplay` (PulseAudio / PipeWire),
-// then `aplay` (ALSA). If neither is on $PATH, the bell is silent —
-// matches the "do whatever is sane, don't go overboard" brief.
-
-fn playWav(path: []const u8) void {
-    const pid = c.fork();
-    if (pid < 0) return;
-    if (pid == 0) {
-        // Child: detach stdio so paplay can't write to our terminal.
-        const devnull = c.open("/dev/null", c.O_RDWR);
-        if (devnull >= 0) {
-            _ = c.dup2(devnull, 0);
-            _ = c.dup2(devnull, 1);
-            _ = c.dup2(devnull, 2);
-            if (devnull > 2) _ = c.close(devnull);
-        }
-
-        var path_buf: [4096]u8 = undefined;
-        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch c._exit(127);
-        const argv0 = "paplay";
-        const argv1 = "aplay";
-        const argv = [_:null]?[*:0]const u8{ undefined, path_z.ptr, null };
-        // Try paplay first.
-        var argv_a = argv;
-        argv_a[0] = argv0;
-        _ = c.execvp(argv0, @ptrCast(&argv_a));
-        // Then aplay.
-        var argv_b = argv;
-        argv_b[0] = argv1;
-        _ = c.execvp(argv1, @ptrCast(&argv_b));
-        c._exit(127);
-    }
-    // Parent: wait for the child so we don't accumulate zombies.
-    // playWav is only called from the audio worker thread, which
-    // serializes rings — at most one bell process exists at a time.
-    var status: c_int = 0;
-    _ = c.waitpid(pid, &status, 0);
+    return samples;
 }
 
 // ── Config parsing ──
