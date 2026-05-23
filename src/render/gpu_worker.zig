@@ -878,7 +878,6 @@ pub const GpuWorker = struct {
                     const hint_runs_base = row_build.phase_hint_runs;
                     const hint_hinted_base = row_build.phase_hint_glyphs_hinted;
                     const hint_fallback_base = row_build.phase_hint_glyphs_fallback;
-                    const hint_errors_base = row_build.phase_hint_run_errors;
 
                     const target = &active_allocator.targets[request.buffer_index];
                     c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
@@ -1022,7 +1021,6 @@ pub const GpuWorker = struct {
                             const hint_runs = row_build.phase_hint_runs - hint_runs_base;
                             const hint_hinted = row_build.phase_hint_glyphs_hinted - hint_hinted_base;
                             const hint_fallback = row_build.phase_hint_glyphs_fallback - hint_fallback_base;
-                            const hint_errors = row_build.phase_hint_run_errors - hint_errors_base;
                             log.warn(.gpu, "slow frame", .{
                                 .elapsed_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f}),
                                 .budget_ms = budget_ms,
@@ -1037,7 +1035,6 @@ pub const GpuWorker = struct {
                                 .hint_runs = hint_runs,
                                 .hint_hinted = hint_hinted,
                                 .hint_fallback = hint_fallback,
-                                .hint_errors = hint_errors,
                                 .rows = row_count,
                                 .pic_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_pic)) / ms_f}),
                                 .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_upload)) / ms_f}),

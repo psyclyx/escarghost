@@ -158,20 +158,22 @@ pub const CpuPipeline = struct {
 
     cpu: snail.CpuRenderer,
     scene: snail.Scene,
-    builder: snail.TextBlobBuilder,
-    /// TrueType hint context. Bound to the atlas at first frame (see
-    /// ensureBuilderForAtlas) and reset whenever the snapshot identity
-    /// changes — including after a sync atlas extension between pass 1
-    /// and pass 2 of renderToMemory.
+    /// Lazily created on the first frame against the atlas snapshot the
+    /// frontend hands us. Rebound (cache-preserving when canRebindFrom
+    /// holds) on subsequent snapshot changes, including the sync-extend
+    /// between pass 1 and pass 2 of renderToMemory.
+    bundle: ?snail.TextBlobBundle = null,
+    /// TrueType hint context. Lazy-initialised next to the bundle and
+    /// rebound on the same events.
     hint_ctx: ?snail.TrueTypeHintContext = null,
 
-    /// Cloned lease on the atlas snapshot the builder is currently
-    /// bound to. Swapped in `ensureBuilderForAtlas` when the caller
+    /// Cloned lease on the atlas snapshot the bundle is currently
+    /// bound to. Swapped in `ensureBundleForAtlas` when the caller
     /// hands us a new identity. `null` until the first frame seeds it.
     /// No blob outlives the frame that built it, so we never need to
     /// retain more than one snapshot.
     atlas_lease: ?atlas_ref_mod.AtlasRef.Lease = null,
-    builder_atlas_identity: u64 = 0,
+    bundle_atlas_identity: u64 = 0,
 
     draw_buf: std.ArrayList(u32) = .empty,
     seg_buf: std.ArrayList(snail.DrawList.Segment) = .empty,
@@ -195,9 +197,6 @@ pub const CpuPipeline = struct {
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
 
-        // Builder needs an atlas to bind to; defer real init to the first frame.
-        const builder = snail.TextBlobBuilder.init(allocator, undefined);
-
         const scratch_rects = try allocator.alloc(row_build.ColoredRect, row_build.MAX_RECTS_PER_ROW);
         errdefer allocator.free(scratch_rects);
 
@@ -205,7 +204,6 @@ pub const CpuPipeline = struct {
             .allocator = allocator,
             .cpu = cpu,
             .scene = scene,
-            .builder = builder,
             .scratch_rects = scratch_rects,
             .config = config,
             .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
@@ -216,28 +214,34 @@ pub const CpuPipeline = struct {
         self.ephemeral_blobs.deinit();
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
-        if (self.builder_atlas_identity != 0) self.builder.deinit();
+        if (self.bundle) |*b| b.deinit();
         if (self.hint_ctx) |*ctx| ctx.deinit();
         if (self.atlas_lease) |*lease| lease.release();
         self.scene.deinit();
         self.allocator.free(self.scratch_rects);
     }
 
-    fn ensureBuilderForAtlas(self: *CpuPipeline, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
+    fn ensureBundleForAtlas(self: *CpuPipeline, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
         const atlas = atlas_lease.get();
         const id = atlas.snapshotIdentity();
-        if (id == self.builder_atlas_identity) return;
-        if (self.builder_atlas_identity != 0) self.builder.deinit();
-        self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
+        if (id == self.bundle_atlas_identity) return;
         const reset_t0 = perf.Timer.now();
-        if (self.hint_ctx) |*ctx| ctx.resetForAtlas(atlas) else self.hint_ctx = snail.TrueTypeHintContext.init(self.allocator, atlas);
+        if (self.bundle) |*b| {
+            b.rebindAtlas(atlas) catch {
+                b.deinit();
+                self.bundle = snail.TextBlobBundle.init(self.allocator, atlas);
+            };
+        } else {
+            self.bundle = snail.TextBlobBundle.init(self.allocator, atlas);
+        }
+        if (self.hint_ctx) |*ctx| ctx.rebindAtlas(atlas) else self.hint_ctx = snail.TrueTypeHintContext.initWithOptions(self.allocator, atlas, .{ .cvt_headroom = 32 });
         const reset_ns = reset_t0.elapsedNs();
         if (self.atlas_lease) |*prev| prev.release();
         self.atlas_lease = atlas_lease.clone();
-        self.builder_atlas_identity = id;
+        self.bundle_atlas_identity = id;
         log.info(.cpu, "atlas snapshot", .{
             .identity = id,
-            .hint_reset_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
+            .rebind_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
         });
     }
 
@@ -347,7 +351,7 @@ pub const CpuPipeline = struct {
         // Reinitialize CPU renderer for this frame's buffer geometry.
         self.cpu.reinitBuffer(@ptrCast(map_ptr), width, height, stride);
 
-        self.ensureBuilderForAtlas(atlas_lease);
+        self.ensureBundleForAtlas(atlas_lease);
 
         const metrics: row_build.Metrics = .{
             .cell_width = cell_width,
@@ -357,6 +361,7 @@ pub const CpuPipeline = struct {
         };
 
         self.scene.reset();
+        self.bundle.?.reset();
 
         var rows_buf: [render_snapshot.MaxRows]row_build.RowDraw = undefined;
         var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
@@ -365,7 +370,7 @@ pub const CpuPipeline = struct {
             snapshot,
             self.allocator,
             metrics,
-            &self.builder,
+            &self.bundle.?,
             self.currentAtlas(),
             atlas_lease.ref,
             self.scratch_rects,
@@ -386,6 +391,7 @@ pub const CpuPipeline = struct {
             const result = self.extendAtlas(atlas_lease, baseline_atlas, misses.text());
             if (result == .extended) {
                 self.scene.reset();
+                self.bundle.?.reset();
                 self.ephemeral_blobs.releaseAll();
                 misses.clear();
                 const rebuild_t0 = perf.Timer.now();
@@ -393,7 +399,7 @@ pub const CpuPipeline = struct {
                     snapshot,
                     self.allocator,
                     metrics,
-                    &self.builder,
+                    &self.bundle.?,
                     self.currentAtlas(),
                     atlas_lease.ref,
                     self.scratch_rects,
@@ -423,7 +429,7 @@ pub const CpuPipeline = struct {
         if (result != .extended) return result;
         var new_lease = atlas_ref.acquire();
         defer new_lease.release();
-        self.ensureBuilderForAtlas(&new_lease);
+        self.ensureBundleForAtlas(&new_lease);
         return .extended;
     }
 

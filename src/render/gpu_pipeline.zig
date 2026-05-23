@@ -115,11 +115,18 @@ pub const GpuPipeline = struct {
 
     gl_renderer: snail.Gles30Renderer,
     scene: snail.Scene,
-    builder: snail.TextBlobBuilder,
-    /// TrueType hint context bound to the current atlas snapshot. Reset
-    /// in refreshAtlas when the snapshot identity changes (which happens
-    /// each time the atlas thread publishes new glyphs). Per-glyph hint
-    /// computations are cached inside until the next reset.
+    /// Bundle that owns every text blob built this frame. Reset at the
+    /// top of each `drawSnapshot`; rebound (cache-preserving) when the
+    /// atlas snapshot changes via `refreshAtlas`. The bundle's hint pool
+    /// is shared across all blobs, so per-blob `text_paint` uploads only
+    /// carry per-blob references — the hint deltas upload once per
+    /// bundle generation as one `text_hint` resource.
+    bundle: snail.TextBlobBundle,
+    /// TrueType hint context bound to the current atlas snapshot.
+    /// Rebound (cache-preserving when `canRebindFrom` holds) on snapshot
+    /// changes via `refreshAtlas`. Per-glyph hint computations are
+    /// cached inside until the cache is cleared by an incompatible
+    /// rebind.
     hint_ctx: snail.TrueTypeHintContext,
 
     last_atlas_gen: u64 = 0,
@@ -180,10 +187,14 @@ pub const GpuPipeline = struct {
         errdefer atlas_lease.release();
         const atlas = atlas_lease.get();
         const initial_identity = atlas.snapshotIdentity();
-        const builder = snail.TextBlobBuilder.init(allocator, atlas);
+        var bundle = snail.TextBlobBundle.init(allocator, atlas);
+        errdefer bundle.deinit();
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
-        const hint_ctx = snail.TrueTypeHintContext.init(allocator, atlas);
+        // CVT headroom of 32 entries tolerates fonts that write past the
+        // declared `cvt ` table size (Berkeley Mono's replacementCharacter,
+        // for one) — matches FreeType/Skia/CoreText behaviour.
+        const hint_ctx = snail.TrueTypeHintContext.initWithOptions(allocator, atlas, .{ .cvt_headroom = 32 });
 
         return .{
             .allocator = allocator,
@@ -191,7 +202,7 @@ pub const GpuPipeline = struct {
             .atlas_lease = atlas_lease,
             .gl_renderer = gl_renderer,
             .scene = scene,
-            .builder = builder,
+            .bundle = bundle,
             .hint_ctx = hint_ctx,
             .last_atlas_gen = atlas_ref.loadGeneration(),
             .last_atlas_identity = initial_identity,
@@ -211,7 +222,7 @@ pub const GpuPipeline = struct {
         if (self.scratch_ready) self.allocator.free(self.scratch_rects);
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
-        self.builder.deinit();
+        self.bundle.deinit();
         self.hint_ctx.deinit();
         self.atlas_lease.release();
         self.scene.deinit();
@@ -239,13 +250,13 @@ pub const GpuPipeline = struct {
     pub fn warmPipeline(self: *GpuPipeline) !void {
         defer {
             self.scene.reset();
-            self.builder.reset();
+            self.bundle.reset();
             self.ephemeral_blobs.releaseAll();
         }
 
         const atlas = self.currentAtlas();
         self.scene.reset();
-        self.builder.reset();
+        self.bundle.reset();
 
         // Path picture: one tiny rect → compiles vector path shader
         // and exercises the path-picture upload path.
@@ -265,27 +276,31 @@ pub const GpuPipeline = struct {
         // Text blob: shape & lay out one glyph → compiles text shader
         // and forces the atlas to be uploaded to the GPU. We pick 'a'
         // because atlas_owner's bootstrap populates ASCII.
-        var shaped = self.atlas_ref.shape(atlas, self.allocator, .{}, "a") catch null;
-        var blob_opt: ?snail.TextBlob = null;
-        defer if (blob_opt) |*b| b.deinit();
-        if (shaped) |*s| {
-            defer s.deinit();
-            _ = self.builder.append(.{
-                .shaped = s,
+        const blob_opt: ?*const snail.TextBlob = blob: {
+            var shaped = self.atlas_ref.shape(atlas, self.allocator, .{}, "a") catch break :blob null;
+            defer shaped.deinit();
+            if (shaped.glyphs.len == 0) break :blob null;
+            var bip = self.bundle.startBlob() catch break :blob null;
+            errdefer bip.abort();
+            _ = bip.append(.{
+                .source = .{ .shaped = shaped.glyphs },
                 .placement = .{
                     .baseline = .{ .x = 0, .y = self.cell_height * baseline_warm },
                     .em = self.font_size,
                 },
                 .fill = .{ .solid = .{ 1, 1, 1, 1 } },
-            }) catch null;
-            blob_opt = self.builder.finish() catch null;
-        }
+            }) catch {
+                bip.abort();
+                break :blob null;
+            };
+            break :blob bip.finish(snail.ResourceKey.named("scrgo.warm")) catch null;
+        };
 
         var manifest = snail.ResourceManifest.init(self.manifest_entries[0..]);
         try manifest.putPathPicture(PICTURE_KEY, &picture);
         try self.scene.addPath(.{ .picture = &picture, .resource_key = PICTURE_KEY });
 
-        if (blob_opt) |*blob| {
+        if (blob_opt) |blob| {
             const text_keys = textKeysFor(blob);
             try manifest.putTextBlob(text_keys, blob);
             try self.scene.addText(.{ .blob = blob, .resources = text_keys });
@@ -364,9 +379,12 @@ pub const GpuPipeline = struct {
     }
 
     /// Pick up the latest atlas snapshot. Swaps the retained lease and
-    /// rebuilds the builder against the fresh atlas. Safe to call only
-    /// at frame boundaries: the previous frame's ephemeral blobs must
-    /// have been released before the old lease is dropped here.
+    /// rebinds the bundle + hint context against the fresh atlas. Safe
+    /// to call only at frame boundaries: the previous frame's blobs and
+    /// ephemeral rects must have been released first (bundle.reset()
+    /// and ephemeral_blobs.releaseAll()). When the new snapshot extends
+    /// the old (the common case for `ensureText` growth) the hint cache
+    /// and bundle hint pool both survive; otherwise both clear.
     fn refreshAtlas(self: *GpuPipeline) *const snail.TextAtlas {
         var next_lease = self.atlas_ref.acquire();
         const atlas = next_lease.get();
@@ -381,19 +399,22 @@ pub const GpuPipeline = struct {
         self.last_atlas_gen = self.atlas_ref.loadGeneration();
         self.last_atlas_identity = identity;
 
-        // Builder is anchored to the prior snapshot; rebuild it.
-        self.builder.deinit();
-        self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
-        // Hint context's per-glyph cache is keyed by atlas identity; clear it.
-        // Timed because the next frame will pay the cost of re-hinting every
-        // glyph it touches, and that has to fit inside the sync-extend budget.
         const reset_t0 = perf.Timer.now();
-        self.hint_ctx.resetForAtlas(atlas);
+        // Bundle and hint context both prefer cache-preserving rebind
+        // when canRebindFrom holds. If the new snapshot is incompatible
+        // (font config changed — never happens at runtime today), the
+        // bundle's rebindAtlas returns an error and we fall back to
+        // deinit+init.
+        self.bundle.rebindAtlas(atlas) catch {
+            self.bundle.deinit();
+            self.bundle = snail.TextBlobBundle.init(self.allocator, atlas);
+        };
+        self.hint_ctx.rebindAtlas(atlas);
         const reset_ns = reset_t0.elapsedNs();
 
         log.info(.gpu, "atlas snapshot", .{
             .identity = identity,
-            .hint_reset_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
+            .rebind_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
         });
         return atlas;
     }
@@ -463,6 +484,9 @@ pub const GpuPipeline = struct {
         // prior frames painted into the *same* dmabuf and we only have
         // to repaint rows that differ from this buffer's recorded era.
         self.scene.reset();
+        // Drop every blob the previous frame produced. Bundle keeps its
+        // arena + hint pool capacity; the next frame's appends reuse it.
+        self.bundle.reset();
 
         var rows_buf: [MAX_SNAPSHOT_ROWS]row_build.RowDraw = undefined;
         var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
@@ -471,7 +495,7 @@ pub const GpuPipeline = struct {
             snapshot,
             self.allocator,
             self.rowMetrics(),
-            &self.builder,
+            &self.bundle,
             atlas,
             self.atlas_ref,
             self.scratch_rects,

@@ -282,12 +282,11 @@ pub const Diagnostics = struct {
                     .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f}),
                 });
             }
-            if (row_build_mod.phase_hint_runs > 0 or row_build_mod.phase_hint_run_errors > 0) {
+            if (row_build_mod.phase_hint_runs > 0) {
                 log.info(.diag, "tt hinter", .{
                     .runs = row_build_mod.phase_hint_runs,
                     .hinted = row_build_mod.phase_hint_glyphs_hinted,
                     .fallback = row_build_mod.phase_hint_glyphs_fallback,
-                    .errors = row_build_mod.phase_hint_run_errors,
                     .prepare_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_prepare_ns)) / ms_f}),
                     .append_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_append_ns)) / ms_f}),
                 });
