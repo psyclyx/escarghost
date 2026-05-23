@@ -96,10 +96,15 @@ pub const Refs = struct {
 };
 
 pub const Metrics = struct {
+    /// Pixel-snapped em used for rasterization and downstream metrics.
+    /// Set from computeCellMetrics at bootstrap / zoom. Zoom steps add
+    /// ±1 to this and re-run computeCellMetrics — snapping integer
+    /// steps is identity, so behavior stays predictable.
     font_size: f32 = 14.0,
     base_font_size: f32 = 14.0,
     cell_width: f32 = 0,
     cell_height: f32 = 0,
+    baseline_offset: f32 = 0,
     viewport_w: u32 = 0,
     viewport_h: u32 = 0,
     scroll_lines: u32 = 3,

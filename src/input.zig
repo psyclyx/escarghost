@@ -7,6 +7,7 @@ const clipboard_mod = @import("clipboard.zig");
 const wayland_mod = @import("wayland.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
+const render_env_mod = @import("render/render_env.zig");
 const log = @import("log.zig");
 
 const c = @cImport({
@@ -112,7 +113,7 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
                 pasteFromClipboard(.clipboard);
                 return;
             },
-            // Debug: Ctrl+Shift+F1/F2/F3
+            // Debug: Ctrl+Shift+F1/F2/F3/F4
             xkb_syms.XKB_KEY_F1 => {
                 debugKillActiveRenderer();
                 return;
@@ -123,6 +124,10 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
             },
             xkb_syms.XKB_KEY_F3 => {
                 debugClearAtlas();
+                return;
+            },
+            xkb_syms.XKB_KEY_F4 => {
+                debugCycleHintMode();
                 return;
             },
             else => {},
@@ -529,8 +534,10 @@ fn applyZoom() void {
     var atlas_lease = state.refs.atlas_ref.acquire();
     defer atlas_lease.release();
     const cm = gpu_pipeline.computeCellMetrics(atlas_lease.get(), state.metrics.font_size) catch return;
+    state.metrics.font_size = cm.em;
     state.metrics.cell_width = cm.cell_width;
     state.metrics.cell_height = cm.cell_height;
+    state.metrics.baseline_offset = cm.baseline_offset;
 
     const grid = gpu_pipeline.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, state.metrics.viewport_w, state.metrics.viewport_h);
     if (grid.cols > 0 and grid.rows > 0) {
@@ -740,6 +747,23 @@ fn debugClearAtlas() void {
     // current atlas's font config bytes.
     render_loop.markRenderDirty(state);
     log.info(.input, "debug atlas clear", .{ .status = "noop" });
+}
+
+fn debugCycleHintMode() void {
+    const next = render_env_mod.cycleHintMode();
+    // Cell metrics depend on mode (.none keeps unsnapped em; .grid/.tt
+    // snap via cellGrid). Recompute and push through the existing
+    // reconfigure path so the worker picks up new metrics + redraws.
+    var atlas_lease = state.refs.atlas_ref.acquire();
+    defer atlas_lease.release();
+    const cm = gpu_pipeline.computeCellMetrics(atlas_lease.get(), state.metrics.font_size) catch return;
+    state.metrics.font_size = cm.em;
+    state.metrics.cell_width = cm.cell_width;
+    state.metrics.cell_height = cm.cell_height;
+    state.metrics.baseline_offset = cm.baseline_offset;
+    state.render.gpu_reconfigure_requested = true;
+    render_loop.markRenderDirty(state);
+    log.info(.input, "debug hint mode", .{ .mode = @tagName(next) });
 }
 
 fn keysymToGhosttyKey(keysym: u32) c_uint {

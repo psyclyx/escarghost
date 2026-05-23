@@ -3,6 +3,7 @@ const wayland_mod = @import("wayland.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const cpu_pipeline = @import("render/cpu_pipeline.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
+const row_build_mod = @import("render/row_build.zig");
 const log = @import("log.zig");
 
 const c = @cImport({
@@ -279,6 +280,16 @@ pub const Diagnostics = struct {
                     .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_upload_ns)) / ms_f}),
                     .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_drawlist_ns)) / ms_f}),
                     .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f}),
+                });
+            }
+            if (row_build_mod.phase_hint_runs > 0 or row_build_mod.phase_hint_run_errors > 0) {
+                log.info(.diag, "tt hinter", .{
+                    .runs = row_build_mod.phase_hint_runs,
+                    .hinted = row_build_mod.phase_hint_glyphs_hinted,
+                    .fallback = row_build_mod.phase_hint_glyphs_fallback,
+                    .errors = row_build_mod.phase_hint_run_errors,
+                    .prepare_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_prepare_ns)) / ms_f}),
+                    .append_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_append_ns)) / ms_f}),
                 });
             }
         }

@@ -13,6 +13,7 @@ const render_common = @import("render_common.zig");
 const row_build = @import("row_build.zig");
 const color = @import("color");
 const perf = @import("../perf.zig");
+const log = @import("../log.zig");
 const Rgb = color.Rgb;
 
 const c = @cImport({
@@ -23,14 +24,16 @@ const c = @cImport({
 
 const wl = @cImport(@cInclude("wayland-client.h"));
 
-const baseline_factor: f32 = row_build.baseline_factor;
-
-// Stable resource keys; see renderer.zig for the same convention on the GPU
-// side.
+// Stable resource keys; see gpu_pipeline.zig for the same convention on the
+// GPU side. Per-blob paint keys come from textKeysFor so hinted-glyph paint
+// records don't collide across rows in the manifest.
 const ATLAS_KEY = snail.ResourceKey.named("scrgo.atlas");
 const PICTURE_KEY = snail.ResourceKey.named("scrgo.rects");
-const TEXT_KEYS: snail.TextResourceKeys = .{ .atlas = ATLAS_KEY };
-const MANIFEST_CAP: usize = 2;
+const MANIFEST_CAP: usize = render_snapshot.MaxRows + 4;
+
+fn textKeysFor(blob: *const snail.TextBlob) snail.TextResourceKeys {
+    return blob.resourceKeys(ATLAS_KEY, snail.ResourceKey.fromId(@intFromPtr(blob)));
+}
 
 /// Pack RGBA bytes into a u32 matching `WL_SHM_FORMAT_ABGR8888` on a
 /// little-endian host (byte order in memory: R, G, B, A). Used by the
@@ -156,6 +159,11 @@ pub const CpuPipeline = struct {
     cpu: snail.CpuRenderer,
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
+    /// TrueType hint context. Bound to the atlas at first frame (see
+    /// ensureBuilderForAtlas) and reset whenever the snapshot identity
+    /// changes — including after a sync atlas extension between pass 1
+    /// and pass 2 of renderToMemory.
+    hint_ctx: ?snail.TrueTypeHintContext = null,
 
     /// Cloned lease on the atlas snapshot the builder is currently
     /// bound to. Swapped in `ensureBuilderForAtlas` when the caller
@@ -209,6 +217,7 @@ pub const CpuPipeline = struct {
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
         if (self.builder_atlas_identity != 0) self.builder.deinit();
+        if (self.hint_ctx) |*ctx| ctx.deinit();
         if (self.atlas_lease) |*lease| lease.release();
         self.scene.deinit();
         self.allocator.free(self.scratch_rects);
@@ -220,9 +229,16 @@ pub const CpuPipeline = struct {
         if (id == self.builder_atlas_identity) return;
         if (self.builder_atlas_identity != 0) self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
+        const reset_t0 = perf.Timer.now();
+        if (self.hint_ctx) |*ctx| ctx.resetForAtlas(atlas) else self.hint_ctx = snail.TrueTypeHintContext.init(self.allocator, atlas);
+        const reset_ns = reset_t0.elapsedNs();
         if (self.atlas_lease) |*prev| prev.release();
         self.atlas_lease = atlas_lease.clone();
         self.builder_atlas_identity = id;
+        log.info(.cpu, "atlas snapshot", .{
+            .identity = id,
+            .hint_reset_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
+        });
     }
 
     fn currentAtlas(self: *CpuPipeline) *const snail.TextAtlas {
@@ -323,6 +339,7 @@ pub const CpuPipeline = struct {
         font_size: f32,
         cell_width: f32,
         cell_height: f32,
+        baseline_offset: f32,
     ) !glyph_misses.Set {
         var misses: glyph_misses.Set = .{};
         const default_bg = snapshot.header.default_bg;
@@ -336,6 +353,7 @@ pub const CpuPipeline = struct {
             .cell_width = cell_width,
             .cell_height = cell_height,
             .font_size = font_size,
+            .baseline_offset = baseline_offset,
         };
 
         self.scene.reset();
@@ -355,6 +373,7 @@ pub const CpuPipeline = struct {
             sel_buf[0..],
             &self.ephemeral_blobs,
             &misses,
+            &self.hint_ctx.?,
         );
         phase_row_build_ns += row_build_t0.elapsedNs();
 
@@ -382,6 +401,7 @@ pub const CpuPipeline = struct {
                     sel_buf[0..],
                     &self.ephemeral_blobs,
                     &misses,
+                    &self.hint_ctx.?,
                 );
                 phase_row_build_ns += rebuild_t0.elapsedNs();
             }
@@ -490,17 +510,19 @@ pub const CpuPipeline = struct {
             };
             const slot = self.overrides[override_index .. override_index + 1];
             override_index += 1;
-            try manifest.putTextBlob(TEXT_KEYS, row_draw.blob);
+            const row_keys = textKeysFor(row_draw.blob);
+            try manifest.putTextBlob(row_keys, row_draw.blob);
             try self.scene.addText(.{
                 .blob = row_draw.blob,
-                .resources = TEXT_KEYS,
+                .resources = row_keys,
                 .instances = slot,
             });
         }
         if (built.cursor) |cursor| {
             if (cursor.inverted_glyph) |blob| {
-                try manifest.putTextBlob(TEXT_KEYS, blob);
-                try self.scene.addText(.{ .blob = blob, .resources = TEXT_KEYS });
+                const cursor_keys = textKeysFor(blob);
+                try manifest.putTextBlob(cursor_keys, blob);
+                try self.scene.addText(.{ .blob = blob, .resources = cursor_keys });
             }
         }
 

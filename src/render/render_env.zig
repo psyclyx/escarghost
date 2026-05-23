@@ -121,6 +121,46 @@ pub fn parseRuntimeFlags(value: ?[]const u8) RuntimeFlags {
     return result;
 }
 
+/// Hint mode that drives both the cell-metrics snap step and the
+/// row_build per-sub-range append path. Mutable at runtime via the
+/// Ctrl+Shift+F4 debug keybinding so we can A/B/C compare without
+/// rebuilding.
+pub const HintMode = enum(u8) {
+    /// No pixel-grid snap, no TT hinter. Glyphs raster at the raw
+    /// requested em; baseline is the synthetic `cell_height * 0.8`.
+    none = 0,
+    /// Pixel-snapped em/cell_width/baseline via `atlas.cellGrid` but
+    /// no TT hinter — the cheap "terminal grid" path.
+    grid = 1,
+    /// Grid snap + snail's `TrueTypeHintContext` best-effort hinter
+    /// applied to every sub-range; this is the default.
+    tt = 2,
+};
+
+/// Mode atomic shared between the main thread (writer, on keybinding)
+/// and the worker threads (readers, per-frame). Initialised to .tt
+/// at startup; `loadHintMode` does the relaxed read on the hot path.
+pub var hint_mode_atomic: std.atomic.Value(u8) = .{ .raw = @intFromEnum(HintMode.tt) };
+
+pub fn loadHintMode() HintMode {
+    return @enumFromInt(hint_mode_atomic.load(.monotonic));
+}
+
+pub fn storeHintMode(mode: HintMode) void {
+    hint_mode_atomic.store(@intFromEnum(mode), .monotonic);
+}
+
+pub fn cycleHintMode() HintMode {
+    const current = loadHintMode();
+    const next: HintMode = switch (current) {
+        .none => .grid,
+        .grid => .tt,
+        .tt => .none,
+    };
+    storeHintMode(next);
+    return next;
+}
+
 /// Per-renderer rendering knobs. Loaded once at startup and held by
 /// both the GPU and CPU pipelines so the ResolveTarget passed into
 /// snail at submit is built from the same source on both backends.

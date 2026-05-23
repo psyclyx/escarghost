@@ -223,9 +223,10 @@ pub fn main(init: std.process.Init) !void {
     var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
     defer bootstrap_atlas_lease.release();
     const cell_metrics = try gpu_pipeline.computeCellMetrics(bootstrap_atlas_lease.get(), cfg.font_size);
-    state.metrics.font_size = cfg.font_size;
+    state.metrics.font_size = cell_metrics.em;
     state.metrics.cell_width = cell_metrics.cell_width;
     state.metrics.cell_height = cell_metrics.cell_height;
+    state.metrics.baseline_offset = cell_metrics.baseline_offset;
 
     const grid = gpu_pipeline.computeGridSize(state.metrics.cell_width, state.metrics.cell_height, wl.width, wl.height);
     state.metrics.viewport_w = wl.width;
@@ -269,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
-        gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |e| {
+        gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height, state.metrics.baseline_offset) catch |e| {
             log.err(.gpu, "initial configure failed", .{ .err = e });
             gpu.stop();
             state.render.gpu_restart.scheduleRetry();
@@ -398,7 +399,7 @@ pub fn main(init: std.process.Init) !void {
         if (state.render.gpu_reconfigure_requested) {
             state.render.gpu_reconfigure_requested = false;
             if (gpu.active and gpu.context_ready) {
-                gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |err| {
+                gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height, state.metrics.baseline_offset) catch |err| {
                     log.err(.gpu, "reconfigure failed", .{ .err = err });
                     render_loop.noteGpuUnavailable(&state);
                     continue;
@@ -479,7 +480,7 @@ pub fn main(init: std.process.Init) !void {
                         if (gpu.atlas_ref == null) {
                             gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
                         }
-                        gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height) catch |e| {
+                        gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height, state.metrics.baseline_offset) catch |e| {
                             log.err(.gpu, "configure after context_ready failed", .{ .err = e });
                             render_loop.noteGpuUnavailable(&state);
                             continue;

@@ -125,6 +125,7 @@ const Request = struct {
     font_size: f32 = 0,
     cell_width: f32 = 0,
     cell_height: f32 = 0,
+    baseline_offset: f32 = 0,
     serial: u32 = 0,
     // Captured snapshot inputs for the worker. The main thread calls
     // `render_snapshot.prepare(term)` before signalling — that's the
@@ -467,7 +468,7 @@ pub const GpuWorker = struct {
         self.atlas_thread = atlas_thread;
     }
 
-    pub fn requestConfigure(self: *GpuWorker, w: u32, h: u32, font_size: f32, cell_width: f32, cell_height: f32) !void {
+    pub fn requestConfigure(self: *GpuWorker, w: u32, h: u32, font_size: f32, cell_width: f32, cell_height: f32, baseline_offset: f32) !void {
         if (!self.active or !self.context_ready) return error.NotReady;
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
@@ -486,6 +487,7 @@ pub const GpuWorker = struct {
             .font_size = font_size,
             .cell_width = cell_width,
             .cell_height = cell_height,
+            .baseline_offset = baseline_offset,
         };
         self.request_pending = true;
         self.ready = false;
@@ -752,7 +754,7 @@ pub const GpuWorker = struct {
 
                     // Init or reconfigure renderer
                     if (renderer) |*r| {
-                        r.setMetrics(request.font_size, request.cell_width, request.cell_height);
+                        r.setMetrics(request.font_size, request.cell_width, request.cell_height, request.baseline_offset);
                         r.setViewport(request.width, request.height);
                     } else {
                         renderer = gpu_pipeline.GpuPipeline.init(
@@ -761,6 +763,7 @@ pub const GpuWorker = struct {
                             request.font_size,
                             request.cell_width,
                             request.cell_height,
+                            request.baseline_offset,
                         ) catch |e| {
                             log.err(.gpu, "renderer init failed", .{ .err = e });
                             writeResponse(self.response_fds[1], .{ .tag = .failed });
@@ -870,6 +873,12 @@ pub const GpuWorker = struct {
                     const row_count_base = row_build.phase_row_count;
                     const row_shape_base = row_build.phase_row_shape_ns;
                     const row_finish_base = row_build.phase_row_finish_ns;
+                    const hint_prepare_base = row_build.phase_hint_prepare_ns;
+                    const hint_append_base = row_build.phase_hint_append_ns;
+                    const hint_runs_base = row_build.phase_hint_runs;
+                    const hint_hinted_base = row_build.phase_hint_glyphs_hinted;
+                    const hint_fallback_base = row_build.phase_hint_glyphs_fallback;
+                    const hint_errors_base = row_build.phase_hint_run_errors;
 
                     const target = &active_allocator.targets[request.buffer_index];
                     c.glBindFramebuffer(c.GL_FRAMEBUFFER, target.framebuffer);
@@ -1008,6 +1017,12 @@ pub const GpuWorker = struct {
                             const row_count = row_build.phase_row_count - row_count_base;
                             const row_shape = row_build.phase_row_shape_ns - row_shape_base;
                             const row_finish = row_build.phase_row_finish_ns - row_finish_base;
+                            const hint_prepare = row_build.phase_hint_prepare_ns - hint_prepare_base;
+                            const hint_append = row_build.phase_hint_append_ns - hint_append_base;
+                            const hint_runs = row_build.phase_hint_runs - hint_runs_base;
+                            const hint_hinted = row_build.phase_hint_glyphs_hinted - hint_hinted_base;
+                            const hint_fallback = row_build.phase_hint_glyphs_fallback - hint_fallback_base;
+                            const hint_errors = row_build.phase_hint_run_errors - hint_errors_base;
                             log.warn(.gpu, "slow frame", .{
                                 .elapsed_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(frame_elapsed_ns)) / ms_f}),
                                 .budget_ms = budget_ms,
@@ -1017,6 +1032,12 @@ pub const GpuWorker = struct {
                                 .rebuild_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_rebuild)) / ms_f}),
                                 .shape_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_shape)) / ms_f}),
                                 .finish_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_finish)) / ms_f}),
+                                .hint_prepare_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(hint_prepare)) / ms_f}),
+                                .hint_append_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(hint_append)) / ms_f}),
+                                .hint_runs = hint_runs,
+                                .hint_hinted = hint_hinted,
+                                .hint_fallback = hint_fallback,
+                                .hint_errors = hint_errors,
                                 .rows = row_count,
                                 .pic_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_pic)) / ms_f}),
                                 .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_upload)) / ms_f}),

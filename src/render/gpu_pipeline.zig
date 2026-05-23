@@ -22,33 +22,76 @@ const MAX_OVERRIDES: usize = MAX_SNAPSHOT_ROWS + 4; // rows + cursor blob
 
 // Stable resource keys. Atlas dedupes across blobs; the picture is rebuilt
 // every frame but reuses the same key so snail's resource cache can identify
-// the upload as a content change rather than a new resource.
+// the upload as a content change rather than a new resource. Per-blob paint
+// keys (derived from blob pointer in textKeysFor) are unique per blob so
+// hinted glyphs' paint records survive the manifest's dedupe.
 const ATLAS_KEY = snail.ResourceKey.named("scrgo.atlas");
 const PICTURE_KEY = snail.ResourceKey.named("scrgo.rects");
-const TEXT_KEYS: snail.TextResourceKeys = .{ .atlas = ATLAS_KEY };
 
-// One atlas + one path picture per frame. snail's manifest dedupes on key.
-const MANIFEST_CAP: usize = 2;
+/// Resource keys for a blob: shared atlas key + (for hinted/painted blobs) a
+/// per-blob paint key derived from the blob pointer. Non-hinted blobs return
+/// `.paint = null`, matching the old single-key behaviour.
+fn textKeysFor(blob: *const snail.TextBlob) snail.TextResourceKeys {
+    return blob.resourceKeys(ATLAS_KEY, snail.ResourceKey.fromId(@intFromPtr(blob)));
+}
 
-// Baseline offset for the warmup glyph; matches row_build.baseline_factor
-// closely enough to keep the warm-up output in a sane place on the
-// dmabuf before we invalidate and repaint.
+// 1 atlas + 1 picture + up to (MAX_SNAPSHOT_ROWS + cursor) paint records.
+const MANIFEST_CAP: usize = MAX_SNAPSHOT_ROWS + 4;
+
+// Baseline offset factor for the warmup glyph. Synthetic — close enough
+// to a typical font's ascent ratio that the warm-up output lands in a
+// sane place on the dmabuf before we invalidate and repaint. Real frames
+// use the font's snapped ascent (CellMetrics.baseline_offset).
 const baseline_warm: f32 = 0.8;
 
-pub const CellMetrics = struct { cell_width: f32, cell_height: f32 };
+pub const CellMetrics = struct {
+    /// Pixel-snapped em. The user's requested font_size rounded to
+    /// the device pixel grid so glyph rasterization happens at integer
+    /// ppem. Stored back into app state so subsequent zoom steps work
+    /// off the snapped value (an unchanged ±1 stays an unchanged ±1).
+    em: f32,
+    /// Font's natural 'M' advance at the snapped em — *not* pixel-
+    /// snapped. A well-behaved monospace font's ligatures (`==`, `=>`,
+    /// `fl`, etc.) have advances that are exact N×em multiples of this,
+    /// so HB's per-glyph positions land on our cell grid by construction.
+    /// Snapping cell_width to whole pixels would drift the cell grid
+    /// away from HB's pen and break long uniform-color stretches.
+    cell_width: f32,
+    /// Line height with @ceil to preserve descender headroom.
+    cell_height: f32,
+    /// Font's snapped ascent. Glyph baselines land at row_y +
+    /// baseline_offset, on whole pixels.
+    baseline_offset: f32,
+};
 
 /// Compute terminal cell dimensions from the atlas's primary face.
-/// Cell width is the font's natural 'M' advance — *not* ceiled. A
-/// well-behaved monospace font's ligatures (`==`, `=>`, `fl`, etc.) have
-/// advances that are exact N×em multiples of this, so HB's natural glyph
-/// advances align with our cell grid by construction. Rounding cell_width
-/// up would compound a fractional-pixel mismatch over a long row and
-/// drift the cursor away from the text.
+/// In `.grid` / `.tt` modes, snaps `em` and `baseline_offset` to whole
+/// pixels via snail's TextCellGrid helper. In `.none` mode, returns
+/// the raw unsnapped em with a synthetic `cell_height * 0.8` baseline,
+/// matching the pre-cellGrid behaviour for A/B comparison.
 pub fn computeCellMetrics(atlas: *const snail.TextAtlas, font_size: f32) !CellMetrics {
-    const cm = try atlas.cellMetrics(.{ .em = font_size });
+    const mode = render_env.loadHintMode();
+    if (mode == .none) {
+        const cm = try atlas.cellMetrics(.{ .em = font_size });
+        const cell_height = @ceil(cm.line_height);
+        return .{
+            .em = font_size,
+            .cell_width = cm.cell_width,
+            .cell_height = cell_height,
+            .baseline_offset = cell_height * 0.8,
+        };
+    }
+    const grid = try atlas.cellGrid(.{
+        .em = font_size,
+        .pixel_step = .{ .x = 1.0, .y = 1.0 },
+        .snap_rule = .nearest,
+    });
+    const cm = try atlas.cellMetrics(.{ .em = grid.em });
     return .{
+        .em = grid.em,
         .cell_width = cm.cell_width,
         .cell_height = @ceil(cm.line_height),
+        .baseline_offset = grid.baseline_offset,
     };
 }
 
@@ -73,6 +116,11 @@ pub const GpuPipeline = struct {
     gl_renderer: snail.Gles30Renderer,
     scene: snail.Scene,
     builder: snail.TextBlobBuilder,
+    /// TrueType hint context bound to the current atlas snapshot. Reset
+    /// in refreshAtlas when the snapshot identity changes (which happens
+    /// each time the atlas thread publishes new glyphs). Per-glyph hint
+    /// computations are cached inside until the next reset.
+    hint_ctx: snail.TrueTypeHintContext,
 
     last_atlas_gen: u64 = 0,
     last_atlas_identity: u64 = 0,
@@ -92,6 +140,7 @@ pub const GpuPipeline = struct {
     cell_width: f32,
     cell_height: f32,
     font_size: f32,
+    baseline_offset: f32,
     viewport_w: f32,
     viewport_h: f32,
     config: render_env.RenderConfig,
@@ -122,6 +171,7 @@ pub const GpuPipeline = struct {
         font_size: f32,
         cell_width: f32,
         cell_height: f32,
+        baseline_offset: f32,
     ) !GpuPipeline {
         var gl_renderer = try snail.Gles30Renderer.init(allocator);
         errdefer gl_renderer.deinit();
@@ -133,6 +183,7 @@ pub const GpuPipeline = struct {
         const builder = snail.TextBlobBuilder.init(allocator, atlas);
         var scene = snail.Scene.init(allocator);
         errdefer scene.deinit();
+        const hint_ctx = snail.TrueTypeHintContext.init(allocator, atlas);
 
         return .{
             .allocator = allocator,
@@ -141,12 +192,14 @@ pub const GpuPipeline = struct {
             .gl_renderer = gl_renderer,
             .scene = scene,
             .builder = builder,
+            .hint_ctx = hint_ctx,
             .last_atlas_gen = atlas_ref.loadGeneration(),
             .last_atlas_identity = initial_identity,
             .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
             .cell_width = cell_width,
             .cell_height = cell_height,
             .font_size = font_size,
+            .baseline_offset = baseline_offset,
             .viewport_w = 0,
             .viewport_h = 0,
             .config = render_env.loadRenderConfigFromEnv(),
@@ -159,6 +212,7 @@ pub const GpuPipeline = struct {
         self.draw_buf.deinit(self.allocator);
         self.seg_buf.deinit(self.allocator);
         self.builder.deinit();
+        self.hint_ctx.deinit();
         self.atlas_lease.release();
         self.scene.deinit();
         self.gl_renderer.deinit();
@@ -232,8 +286,9 @@ pub const GpuPipeline = struct {
         try self.scene.addPath(.{ .picture = &picture, .resource_key = PICTURE_KEY });
 
         if (blob_opt) |*blob| {
-            try manifest.putTextBlob(TEXT_KEYS, blob);
-            try self.scene.addText(.{ .blob = blob, .resources = TEXT_KEYS });
+            const text_keys = textKeysFor(blob);
+            try manifest.putTextBlob(text_keys, blob);
+            try self.scene.addText(.{ .blob = blob, .resources = text_keys });
         }
 
         var prepared = try self.gl_renderer.uploadResourcesBlocking(
@@ -297,11 +352,15 @@ pub const GpuPipeline = struct {
     }
 
     /// Update font metrics. No-op when metrics are unchanged.
-    pub fn setMetrics(self: *GpuPipeline, font_size: f32, cell_width: f32, cell_height: f32) void {
-        if (self.font_size == font_size and self.cell_width == cell_width and self.cell_height == cell_height) return;
+    pub fn setMetrics(self: *GpuPipeline, font_size: f32, cell_width: f32, cell_height: f32, baseline_offset: f32) void {
+        if (self.font_size == font_size and
+            self.cell_width == cell_width and
+            self.cell_height == cell_height and
+            self.baseline_offset == baseline_offset) return;
         self.font_size = font_size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
+        self.baseline_offset = baseline_offset;
     }
 
     /// Pick up the latest atlas snapshot. Swaps the retained lease and
@@ -325,8 +384,17 @@ pub const GpuPipeline = struct {
         // Builder is anchored to the prior snapshot; rebuild it.
         self.builder.deinit();
         self.builder = snail.TextBlobBuilder.init(self.allocator, atlas);
+        // Hint context's per-glyph cache is keyed by atlas identity; clear it.
+        // Timed because the next frame will pay the cost of re-hinting every
+        // glyph it touches, and that has to fit inside the sync-extend budget.
+        const reset_t0 = perf.Timer.now();
+        self.hint_ctx.resetForAtlas(atlas);
+        const reset_ns = reset_t0.elapsedNs();
 
-        log.info(.gpu, "atlas snapshot", .{ .identity = identity });
+        log.info(.gpu, "atlas snapshot", .{
+            .identity = identity,
+            .hint_reset_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
+        });
         return atlas;
     }
 
@@ -335,6 +403,7 @@ pub const GpuPipeline = struct {
             .cell_width = self.cell_width,
             .cell_height = self.cell_height,
             .font_size = self.font_size,
+            .baseline_offset = self.baseline_offset,
         };
     }
 
@@ -410,6 +479,7 @@ pub const GpuPipeline = struct {
             sel_buf[0..],
             &self.ephemeral_blobs,
             misses,
+            &self.hint_ctx,
         );
         phase_row_build_ns += row_build_t0.elapsedNs();
 
@@ -527,17 +597,19 @@ pub const GpuPipeline = struct {
             };
             const slot = self.overrides[override_index .. override_index + 1];
             override_index += 1;
-            try manifest.putTextBlob(TEXT_KEYS, row_draw.blob);
+            const row_keys = textKeysFor(row_draw.blob);
+            try manifest.putTextBlob(row_keys, row_draw.blob);
             try self.scene.addText(.{
                 .blob = row_draw.blob,
-                .resources = TEXT_KEYS,
+                .resources = row_keys,
                 .instances = slot,
             });
         }
         if (built.cursor) |cursor| {
             if (cursor.inverted_glyph) |blob| {
-                try manifest.putTextBlob(TEXT_KEYS, blob);
-                try self.scene.addText(.{ .blob = blob, .resources = TEXT_KEYS });
+                const cursor_keys = textKeysFor(blob);
+                try manifest.putTextBlob(cursor_keys, blob);
+                try self.scene.addText(.{ .blob = blob, .resources = cursor_keys });
             }
         }
 

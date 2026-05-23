@@ -11,12 +11,19 @@ const std = @import("std");
 const snail = @import("snail");
 const render_snapshot = @import("render_snapshot.zig");
 const render_common = @import("render_common.zig");
+const render_env = @import("render_env.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const color = @import("color");
 const selection_mod = @import("../selection.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const perf = @import("../perf.zig");
+const log = @import("../log.zig");
 const Rgb = color.Rgb;
+
+/// One-shot: dump the first hinter exec error's offending range so the
+/// glyph IDs are recoverable for upstream investigation. Atomic CAS so
+/// concurrent CPU + GPU worker threads can't both race the log.
+var hint_error_logged: std.atomic.Value(bool) = .{ .raw = false };
 
 /// Sub-phase counters for `buildSnapshot`. Single writer (the GPU
 /// worker thread, sole caller of buildSnapshot); diagnostic-only readers
@@ -29,7 +36,24 @@ pub var phase_row_shape_ns: u64 = 0;
 pub var phase_row_finish_ns: u64 = 0;
 pub var phase_row_count: u64 = 0;
 
-pub const baseline_factor: f32 = 0.8;
+/// Hint-path counters. `phase_hint_prepare_ns` covers
+/// `TrueTypeHintContext.prepareBestEffortRun` (per-glyph hint compute
+/// on first sight, cache hit otherwise). `phase_hint_append_ns` covers
+/// `TextBlobBuilder.appendPreparedBestEffortHintRun` (writes the hinted
+/// or fallback glyphs into the blob). `phase_hint_runs` is the count
+/// of prepared runs (one per same-fg sub-range). `phase_hint_glyphs_*`
+/// split each run's per-glyph fate so we can see warmup vs steady state.
+/// `phase_hint_run_errors` is the count of sub-ranges that bailed to
+/// the unhinted path because snail's best-effort prepare raised a TT
+/// VM error (InvalidCvtIndex, StackOverflow, etc.) that escapes its
+/// reject classifier. All subsets of `phase_row_rebuild_ns`.
+pub var phase_hint_prepare_ns: u64 = 0;
+pub var phase_hint_append_ns: u64 = 0;
+pub var phase_hint_runs: u64 = 0;
+pub var phase_hint_glyphs_hinted: u64 = 0;
+pub var phase_hint_glyphs_fallback: u64 = 0;
+pub var phase_hint_run_errors: u64 = 0;
+
 pub const MAX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 3;
 
 pub const ColoredRect = struct {
@@ -44,9 +68,13 @@ pub const Metrics = struct {
     cell_width: f32,
     cell_height: f32,
     font_size: f32,
+    /// Pixel-snapped baseline (font's ascent at the snapped em). Glyph
+    /// baselines for a row at `row_y` land at `row_y + baseline_offset`,
+    /// so glyph stems sit on whole pixels.
+    baseline_offset: f32,
 
     pub fn baseline(self: Metrics) f32 {
-        return self.cell_height * baseline_factor;
+        return self.baseline_offset;
     }
 };
 
@@ -102,6 +130,113 @@ fn rgbEq(a: Rgb, b: Rgb) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b;
 }
 
+/// Try `prepareBestEffortRun` + `appendPreparedBestEffortHintRun`. If
+/// snail raises any error (notably TT VM execution errors like
+/// `InvalidCvtIndex` that escape its reject classifier — see
+/// snail/font/tt_exec.zig), fall back to the unhinted `builder.append`
+/// path so the sub-range still paints. Returns whether any glyph in
+/// the sub-range was missing from the atlas. Updates hint counters.
+fn appendHintedOrFallback(
+    builder: *snail.TextBlobBuilder,
+    hint_ctx: *snail.TrueTypeHintContext,
+    allocator: std.mem.Allocator,
+    shaped: *const snail.ShapedText,
+    glyph_range: snail.Range,
+    ppem: snail.TrueTypeHintPpem,
+    placement: snail.TextPlacement,
+    fill_color: [4]f32,
+) !bool {
+    // .none and .grid skip the TT hinter entirely. Cell metrics
+    // already reflect the mode (computeCellMetrics is mode-aware).
+    if (render_env.loadHintMode() != .tt) {
+        const result = try builder.append(.{
+            .shaped = shaped,
+            .glyphs = glyph_range,
+            .placement = placement,
+            .fill = .{ .solid = fill_color },
+        });
+        return result.missing;
+    }
+    const prepare_t0 = perf.Timer.now();
+    var run = hint_ctx.prepareBestEffortRun(allocator, .{
+        .shaped = shaped,
+        .glyphs = glyph_range,
+        .ppem = ppem,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            phase_hint_prepare_ns += prepare_t0.elapsedNs();
+            phase_hint_run_errors += 1;
+            logFirstHintError(err, hint_ctx, allocator, shaped, glyph_range, ppem);
+            const result = try builder.append(.{
+                .shaped = shaped,
+                .glyphs = glyph_range,
+                .placement = placement,
+                .fill = .{ .solid = fill_color },
+            });
+            return result.missing;
+        },
+    };
+    defer run.deinit();
+    phase_hint_prepare_ns += prepare_t0.elapsedNs();
+    phase_hint_runs += 1;
+    phase_hint_glyphs_hinted += run.stats.hinted_count;
+    phase_hint_glyphs_fallback += run.stats.fallback_count;
+
+    const append_t0 = perf.Timer.now();
+    const result = try builder.appendPreparedBestEffortHintRun(&run, placement, fill_color);
+    phase_hint_append_ns += append_t0.elapsedNs();
+    return result.missing;
+}
+
+fn logFirstHintError(
+    err: anyerror,
+    hint_ctx: *snail.TrueTypeHintContext,
+    allocator: std.mem.Allocator,
+    shaped: *const snail.ShapedText,
+    glyph_range: snail.Range,
+    ppem: snail.TrueTypeHintPpem,
+) void {
+    if (hint_error_logged.swap(true, .acq_rel)) return;
+    const resolved = glyph_range.resolve(shaped.glyphs.len);
+
+    // Pinpoint each glyph that the VM chokes on by retrying one-at-a-time.
+    // Only runs once per process so the per-glyph cost is negligible.
+    var bad_glyph_buf: [16]u16 = undefined;
+    var bad_face_buf: [16]u16 = undefined;
+    var bad_src_buf: [16]u32 = undefined;
+    var bad_count: usize = 0;
+    var idx = resolved.start;
+    while (idx < resolved.end) : (idx += 1) {
+        var single = hint_ctx.prepareBestEffortRun(allocator, .{
+            .shaped = shaped,
+            .glyphs = .{ .start = idx, .count = 1 },
+            .ppem = ppem,
+        }) catch {
+            if (bad_count < bad_glyph_buf.len) {
+                const g = shaped.glyphs[idx];
+                bad_glyph_buf[bad_count] = g.glyph_id;
+                bad_face_buf[bad_count] = @intCast(g.face_index);
+                bad_src_buf[bad_count] = g.source_start;
+                bad_count += 1;
+            }
+            continue;
+        };
+        single.deinit();
+    }
+    log.warn(.gpu, "tt hinter exec error", .{
+        .err = @errorName(err),
+        .ppem_x_26_6 = ppem.x_26_6,
+        .ppem_y_26_6 = ppem.y_26_6,
+        .ppem_px = log.fmt("{d:.2}", .{@as(f32, @floatFromInt(ppem.x_26_6)) / 64.0}),
+        .glyphs_in_range = resolved.end - resolved.start,
+        .bad_glyph_count = bad_count,
+        .bad_glyph_ids = bad_glyph_buf[0..bad_count],
+        .bad_face_indices = bad_face_buf[0..bad_count],
+        .bad_source_offsets = bad_src_buf[0..bad_count],
+    });
+}
+
 /// Shape the whole row in one HB call, then walk the shaped glyphs
 /// and emit `builder.append` ranges grouped by fg color. The fg color
 /// for each glyph comes from the cell its `source_start` byte falls in
@@ -122,6 +257,7 @@ fn flushRow(
     metrics: Metrics,
     row_y: f32,
     misses: *glyph_misses.Set,
+    hint_ctx: *snail.TrueTypeHintContext,
 ) !bool {
     if (row.isEmpty()) return false;
     var shaped = try atlas_ref.shape(atlas, allocator, .{}, row.text[0..row.text_len]);
@@ -132,6 +268,7 @@ fn flushRow(
     }
 
     const baseline_y = row_y + metrics.baseline();
+    const ppem = snail.TrueTypeHintPpem.uniform(@intFromFloat(@round(metrics.font_size * 64.0)));
     var had_misses = false;
     var group_start: usize = 0;
     var group_col: u16 = colForGlyph(row, &shaped.glyphs[0]);
@@ -142,19 +279,26 @@ fn flushRow(
         const at_end = i == shaped.glyphs.len;
         const next_fg = if (at_end) group_fg else row.col_fg[colForGlyph(row, &shaped.glyphs[i])];
         if (at_end or !rgbEq(next_fg, group_fg)) {
-            const result = try builder.append(.{
-                .shaped = &shaped,
-                .glyphs = .{ .start = group_start, .count = i - group_start },
-                .placement = .{
-                    .baseline = .{
-                        .x = @as(f32, @floatFromInt(group_col)) * metrics.cell_width,
-                        .y = baseline_y,
-                    },
-                    .em = metrics.font_size,
+            const placement: snail.TextPlacement = .{
+                .baseline = .{
+                    .x = @as(f32, @floatFromInt(group_col)) * metrics.cell_width,
+                    .y = baseline_y,
                 },
-                .fill = .{ .solid = group_fg.toFloat4(1.0) },
-            });
-            if (result.missing) had_misses = true;
+                .em = metrics.font_size,
+            };
+            const fill_color = group_fg.toFloat4(1.0);
+            const glyph_range: snail.Range = .{ .start = group_start, .count = i - group_start };
+            const sub_missing = try appendHintedOrFallback(
+                builder,
+                hint_ctx,
+                allocator,
+                &shaped,
+                glyph_range,
+                ppem,
+                placement,
+                fill_color,
+            );
+            if (sub_missing) had_misses = true;
             if (!at_end) {
                 group_start = i;
                 group_col = colForGlyph(row, &shaped.glyphs[i]);
@@ -196,6 +340,7 @@ pub fn buildRow(
     allocator: std.mem.Allocator,
     metrics: Metrics,
     misses: *glyph_misses.Set,
+    hint_ctx: *snail.TrueTypeHintContext,
 ) !BuildResult {
     var rect_count: usize = 0;
     var had_misses = false;
@@ -285,7 +430,7 @@ pub fn buildRow(
         }
     }
 
-    if (try flushRow(&row, builder, atlas, atlas_ref, allocator, metrics, row_y, misses)) had_misses = true;
+    if (try flushRow(&row, builder, atlas, atlas_ref, allocator, metrics, row_y, misses, hint_ctx)) had_misses = true;
 
     if (bg_span_len > 0) {
         if (bg_span_color) |sc| {
@@ -417,6 +562,7 @@ pub fn buildSnapshot(
     selection_spans_out: []SelectionSpan,
     blob_stash: *EphemeralBlobs,
     misses: *glyph_misses.Set,
+    hint_ctx: *snail.TrueTypeHintContext,
 ) !BuiltSnapshot {
     const header = snapshot.header;
     const default_fg = header.default_fg;
@@ -472,6 +618,7 @@ pub fn buildSnapshot(
             allocator,
             metrics,
             misses,
+            hint_ctx,
         );
         phase_row_shape_ns += shape_t0.elapsedNs();
         const finish_t0 = perf.Timer.now();
@@ -510,6 +657,7 @@ pub fn buildSnapshot(
                         header.cursor_y,
                         blob_stash,
                         misses,
+                        hint_ctx,
                     ) catch null;
                 }
             }
@@ -651,6 +799,7 @@ fn buildInvertedGlyph(
     cursor_y: u16,
     blob_stash: *EphemeralBlobs,
     misses: *glyph_misses.Set,
+    hint_ctx: *snail.TrueTypeHintContext,
 ) !?*const snail.TextBlob {
     var inv_builder = snail.TextBlobBuilder.init(allocator, atlas);
     defer inv_builder.deinit();
@@ -660,14 +809,20 @@ fn buildInvertedGlyph(
     defer shaped.deinit();
     const cx = @as(f32, @floatFromInt(cursor_x)) * metrics.cell_width;
     const cy = @as(f32, @floatFromInt(cursor_y)) * metrics.cell_height;
-    const result = try inv_builder.append(.{
-        .shaped = &shaped,
-        .placement = .{
+    const result_missing = try appendHintedOrFallback(
+        &inv_builder,
+        hint_ctx,
+        allocator,
+        &shaped,
+        .{},
+        snail.TrueTypeHintPpem.uniform(@intFromFloat(@round(metrics.font_size * 64.0))),
+        .{
             .baseline = .{ .x = cx, .y = cy + metrics.baseline() },
             .em = metrics.font_size,
         },
-        .fill = .{ .solid = cell.bg.toFloat4(1.0) },
-    });
+        cell.bg.toFloat4(1.0),
+    );
+    const result = .{ .missing = result_missing };
     if (result.missing) {
         misses.addRun(tmp[0..n]);
         return null;

@@ -45,6 +45,7 @@ const Request = struct {
     font_size: f32 = 0,
     cell_width: f32 = 0,
     cell_height: f32 = 0,
+    baseline_offset: f32 = 0,
     serial: u32 = 0,
 };
 
@@ -176,6 +177,7 @@ pub const Frontend = struct {
         font_size: f32,
         cell_width: f32,
         cell_height: f32,
+        baseline_offset: f32,
         serial: u32,
         selection: ?@import("../selection.zig").Snapshot,
         scrollbar: ?render_snapshot.ScrollbarOverlay,
@@ -202,6 +204,7 @@ pub const Frontend = struct {
             .font_size = font_size,
             .cell_width = cell_width,
             .cell_height = cell_height,
+            .baseline_offset = baseline_offset,
             .serial = serial,
         };
         self.request_pending = true;
@@ -308,6 +311,7 @@ pub const Frontend = struct {
                         request.font_size,
                         request.cell_width,
                         request.cell_height,
+                        request.baseline_offset,
                     ) catch |e| {
                         log.err(.cpu, "render failed", .{ .buffer = buffer_index, .err = e });
                         writeResponse(self.response_fds[1], .{
