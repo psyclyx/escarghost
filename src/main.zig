@@ -342,6 +342,16 @@ pub fn main(init: std.process.Init) !void {
     var draining = false;
     var drain_deadline_ns: u64 = 0;
     const drain_timeout_ns: u64 = 250 * std.time.ns_per_ms;
+    // PTY drain stats coalesced across multiple main-loop iterations.
+    // With the wayland-yield mid-drain (see drain block below), a single
+    // logical burst gets split into many tiny per-iteration drains; per-
+    // iteration logging would dump dozens of lines per ms. Accumulate
+    // here and emit a single debug line at most every 100ms.
+    var pty_drain_bytes_acc: usize = 0;
+    var pty_drain_reads_acc: usize = 0;
+    var pty_drain_rounds_acc: usize = 0;
+    var pty_drain_last_log_ns: u64 = 0;
+    const pty_drain_log_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
     log.info(.main, "loop entry", .{});
 
@@ -682,10 +692,10 @@ pub fn main(init: std.process.Init) !void {
             const wl_fd = wl.displayFd();
             const read_start_ns = monotonicNowNs();
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
-            // Drain stats — one debug line per iteration's drain
-            // instead of one per read(). 60+ reads in a burst was a
-            // wall of "read bytes=4095" lines; the aggregate (total
-            // bytes + read count) is what's actually useful.
+            // This iteration's drain stats — folded into the cross-
+            // iteration accumulator at the end so a single burst that
+            // got chopped into many wayland-yielded chunks still
+            // produces just one debug line per ~100ms.
             var drain_total_bytes: usize = 0;
             var drain_read_count: usize = 0;
             while (true) {
@@ -728,10 +738,21 @@ pub fn main(init: std.process.Init) !void {
                 if (c.poll(@ptrCast(&peek), 1, 0) > 0 and peek.revents & c.POLLIN != 0) break;
             }
             if (drain_read_count > 0) {
-                log.debug(.pty, "drained", .{
-                    .reads = drain_read_count,
-                    .bytes = drain_total_bytes,
-                });
+                pty_drain_bytes_acc += drain_total_bytes;
+                pty_drain_reads_acc += drain_read_count;
+                pty_drain_rounds_acc += 1;
+                const now_ns = monotonicNowNs();
+                if (now_ns - pty_drain_last_log_ns >= pty_drain_log_interval_ns) {
+                    log.debug(.pty, "drained", .{
+                        .reads = pty_drain_reads_acc,
+                        .bytes = pty_drain_bytes_acc,
+                        .rounds = pty_drain_rounds_acc,
+                    });
+                    pty_drain_bytes_acc = 0;
+                    pty_drain_reads_acc = 0;
+                    pty_drain_rounds_acc = 0;
+                    pty_drain_last_log_ns = now_ns;
+                }
             }
         }
 
