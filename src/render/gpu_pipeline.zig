@@ -769,13 +769,22 @@ pub const GpuPipeline = struct {
         // caller's dmabuf, so backdrop is always .clear (snail seeds
         // the output with the default bg) and the resolve region is
         // always the full target.
-        const pass: snail.DrawPass = .{
-            .state = self.drawState(),
-            .resolve = .{ .linear = .{
-                .backdrop = .{ .clear = default_bg.toFloat4(1.0) },
-                .region = .full_target,
-            } },
-        };
+        // .direct = no linear intermediate, no full-screen resolve pass.
+        // Each shader writes encoded sRGB straight to the dmabuf and
+        // fixed-function blending operates on encoded values. Saves the
+        // ~48ms per-frame full-screen resolve at the cost of slightly
+        // inaccurate translucent blending. Toggled via SCRGO_DIRECT_RESOLVE
+        // so we can A/B compare without rebuilding.
+        const pass: snail.DrawPass = if (render_env.directResolveEnabled())
+            .{ .state = self.drawState(), .resolve = .direct }
+        else
+            .{
+                .state = self.drawState(),
+                .resolve = .{ .linear = .{
+                    .backdrop = .{ .clear = default_bg.toFloat4(1.0) },
+                    .region = .full_target,
+                } },
+            };
         // Per-frame scene stats so we can spot "GPU went blank" cases. Counts
         // include the rect-picture shape count, the number of text blobs
         // added to the scene, and the total glyph count across all blobs.
