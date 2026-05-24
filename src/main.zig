@@ -682,6 +682,12 @@ pub fn main(init: std.process.Init) !void {
             const wl_fd = wl.displayFd();
             const read_start_ns = monotonicNowNs();
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
+            // Drain stats — one debug line per iteration's drain
+            // instead of one per read(). 60+ reads in a burst was a
+            // wall of "read bytes=4095" lines; the aggregate (total
+            // bytes + read count) is what's actually useful.
+            var drain_total_bytes: usize = 0;
+            var drain_read_count: usize = 0;
             while (true) {
                 const read_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
                 const n = pty.read(&pty_buf) catch |e| switch (e) {
@@ -697,7 +703,8 @@ pub fn main(init: std.process.Init) !void {
                     child_exited = true;
                     break;
                 }
-                log.debug(.pty, "read", .{ .bytes = n });
+                drain_total_bytes += n;
+                drain_read_count += 1;
                 if (state.diag.trace_commits) {
                     state.diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
                     state.diag.phase_bytes_read += @intCast(n);
@@ -719,6 +726,12 @@ pub fn main(init: std.process.Init) !void {
                 // before more PTY pours in.
                 var peek = c.struct_pollfd{ .fd = wl_fd, .events = c.POLLIN, .revents = 0 };
                 if (c.poll(@ptrCast(&peek), 1, 0) > 0 and peek.revents & c.POLLIN != 0) break;
+            }
+            if (drain_read_count > 0) {
+                log.debug(.pty, "drained", .{
+                    .reads = drain_read_count,
+                    .bytes = drain_total_bytes,
+                });
             }
         }
 
