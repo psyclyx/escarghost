@@ -255,24 +255,39 @@ const DmabufTarget = struct {
         var self: DmabufTarget = .{};
         errdefer self.deinit(egl);
 
+        // Prefer non-LINEAR allocations first. GBM_BO_USE_LINEAR forces
+        // a linear-tiled buffer, which on NVIDIA destroys texture-cache
+        // efficiency when the buffer is sampled by snail's resolve pass
+        // (measured ~600× slower than tiled at 1880×2472 with the
+        // EXT_disjoint_timer_query path). LINEAR stays as a fallback for
+        // compositors that can't import tiled dmabufs.
         const candidates = [_]AllocationCandidate{
-            .{ .format = c.DRM_FORMAT_ABGR8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "ABGR8888 render|linear" },
             .{ .format = c.DRM_FORMAT_ABGR8888, .usage = c.GBM_BO_USE_RENDERING, .name = "ABGR8888 render" },
-            .{ .format = c.DRM_FORMAT_XBGR8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "XBGR8888 render|linear" },
             .{ .format = c.DRM_FORMAT_XBGR8888, .usage = c.GBM_BO_USE_RENDERING, .name = "XBGR8888 render" },
-            .{ .format = c.DRM_FORMAT_ARGB8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "ARGB8888 render|linear" },
             .{ .format = c.DRM_FORMAT_ARGB8888, .usage = c.GBM_BO_USE_RENDERING, .name = "ARGB8888 render" },
-            .{ .format = c.DRM_FORMAT_XRGB8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "XRGB8888 render|linear" },
             .{ .format = c.DRM_FORMAT_XRGB8888, .usage = c.GBM_BO_USE_RENDERING, .name = "XRGB8888 render" },
+            .{ .format = c.DRM_FORMAT_ABGR8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "ABGR8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_XBGR8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "XBGR8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_ARGB8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "ARGB8888 render|linear" },
+            .{ .format = c.DRM_FORMAT_XRGB8888, .usage = c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR, .name = "XRGB8888 render|linear" },
         };
 
+        var picked_name: []const u8 = "(none)";
         for (candidates) |candidate| {
             self.bo = c.gbm_bo_create(gbm, width, height, candidate.format, candidate.usage);
-            if (self.bo != null) break;
+            if (self.bo != null) {
+                picked_name = candidate.name;
+                break;
+            }
         }
         if (self.bo == null) return error.GbmCreateFailed;
 
         const modifier = c.gbm_bo_get_modifier(self.bo);
+        log.info(.gpu, "dmabuf alloc", .{
+            .candidate = picked_name,
+            .modifier = log.fmt("0x{x}", .{modifier}),
+            .stride = c.gbm_bo_get_stride(self.bo),
+        });
         self.desc = .{
             .width = width,
             .height = height,
