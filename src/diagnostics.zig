@@ -4,6 +4,7 @@ const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const cpu_pipeline = @import("render/cpu_pipeline.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
 const row_build_mod = @import("render/row_build.zig");
+const snail = @import("snail");
 const log = @import("log.zig");
 
 const c = @cImport({
@@ -290,6 +291,23 @@ pub const Diagnostics = struct {
                     .prepare_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_prepare_ns)) / ms_f}),
                     .append_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_append_ns)) / ms_f}),
                 });
+                const r = row_build_mod.phase_hint_reject_counts;
+                var any: u64 = 0;
+                for (r) |v| any +%= v;
+                if (any > 0) {
+                    log.info(.diag, "tt hinter rejects", .{
+                        .invalid_face = r[@intFromEnum(snail.TrueTypeHintRejectReason.invalid_face)],
+                        .no_tt_program = r[@intFromEnum(snail.TrueTypeHintRejectReason.no_true_type_program)],
+                        .synthetic_embolden = r[@intFromEnum(snail.TrueTypeHintRejectReason.synthetic_embolden)],
+                        .color_glyph = r[@intFromEnum(snail.TrueTypeHintRejectReason.color_glyph)],
+                        .grid_fit_disabled = r[@intFromEnum(snail.TrueTypeHintRejectReason.grid_fit_disabled)],
+                        .missing_base_glyph = r[@intFromEnum(snail.TrueTypeHintRejectReason.missing_base_glyph)],
+                        .topology_changed = r[@intFromEnum(snail.TrueTypeHintRejectReason.topology_changed)],
+                        .bands_not_reusable = r[@intFromEnum(snail.TrueTypeHintRejectReason.bands_not_reusable)],
+                        .empty_hinted_outline = r[@intFromEnum(snail.TrueTypeHintRejectReason.empty_hinted_outline)],
+                        .exec_failed = r[@intFromEnum(snail.TrueTypeHintRejectReason.exec_failed)],
+                    });
+                }
             }
         }
 

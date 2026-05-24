@@ -869,6 +869,8 @@ pub const GpuWorker = struct {
                     const phase_upload_base = gpu_pipeline.GpuPipeline.phase_upload_ns;
                     const phase_drawlist_base = gpu_pipeline.GpuPipeline.phase_drawlist_ns;
                     const phase_draw_base = gpu_pipeline.GpuPipeline.phase_draw_ns;
+                    const gpu_compute_base = gpu_pipeline.GpuPipeline.phase_gpu_compute_ns;
+                    const gpu_compute_samples_base = gpu_pipeline.GpuPipeline.phase_gpu_compute_samples;
                     const row_rebuild_base = row_build.phase_row_rebuild_ns;
                     const row_count_base = row_build.phase_row_count;
                     const row_shape_base = row_build.phase_row_shape_ns;
@@ -1012,6 +1014,8 @@ pub const GpuWorker = struct {
                             const phase_upload = gpu_pipeline.GpuPipeline.phase_upload_ns - phase_upload_base;
                             const phase_drawlist = gpu_pipeline.GpuPipeline.phase_drawlist_ns - phase_drawlist_base;
                             const phase_draw = gpu_pipeline.GpuPipeline.phase_draw_ns - phase_draw_base;
+                            const gpu_compute = gpu_pipeline.GpuPipeline.phase_gpu_compute_ns - gpu_compute_base;
+                            const gpu_compute_samples = gpu_pipeline.GpuPipeline.phase_gpu_compute_samples - gpu_compute_samples_base;
                             const row_rebuild = row_build.phase_row_rebuild_ns - row_rebuild_base;
                             const row_count = row_build.phase_row_count - row_count_base;
                             const row_shape = row_build.phase_row_shape_ns - row_shape_base;
@@ -1041,7 +1045,27 @@ pub const GpuWorker = struct {
                                 .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_drawlist)) / ms_f}),
                                 .gl_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(phase_draw)) / ms_f}),
                                 .fence_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_wait_elapsed_ns)) / ms_f}),
+                                // GPU-side timestamp-query result lags by ~1
+                                // frame; samples=0 means the previous-frame
+                                // queries weren't ready or got disjointed.
+                                .gpu_compute_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_compute)) / ms_f}),
+                                .gpu_compute_n = gpu_compute_samples,
                             });
+                            if (render_env.hint_diag_enabled) {
+                                const rj = row_build.phase_hint_reject_counts;
+                                log.warn(.gpu, "hint reject histogram (cumulative)", .{
+                                    .invalid_face = rj[@intFromEnum(snail.TrueTypeHintRejectReason.invalid_face)],
+                                    .no_tt_program = rj[@intFromEnum(snail.TrueTypeHintRejectReason.no_true_type_program)],
+                                    .synthetic_embolden = rj[@intFromEnum(snail.TrueTypeHintRejectReason.synthetic_embolden)],
+                                    .color_glyph = rj[@intFromEnum(snail.TrueTypeHintRejectReason.color_glyph)],
+                                    .grid_fit_disabled = rj[@intFromEnum(snail.TrueTypeHintRejectReason.grid_fit_disabled)],
+                                    .missing_base_glyph = rj[@intFromEnum(snail.TrueTypeHintRejectReason.missing_base_glyph)],
+                                    .topology_changed = rj[@intFromEnum(snail.TrueTypeHintRejectReason.topology_changed)],
+                                    .bands_not_reusable = rj[@intFromEnum(snail.TrueTypeHintRejectReason.bands_not_reusable)],
+                                    .empty_hinted_outline = rj[@intFromEnum(snail.TrueTypeHintRejectReason.empty_hinted_outline)],
+                                    .exec_failed = rj[@intFromEnum(snail.TrueTypeHintRejectReason.exec_failed)],
+                                });
+                            }
                         }
                     }
                 },

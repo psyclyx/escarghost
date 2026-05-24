@@ -45,6 +45,41 @@ pub var phase_hint_runs: u64 = 0;
 pub var phase_hint_glyphs_hinted: u64 = 0;
 pub var phase_hint_glyphs_fallback: u64 = 0;
 
+/// Per-reject-reason histogram for fallback glyphs. Populated only
+/// when SCRGO_HINT_DIAG is set (the diagnostic queries `hint_ctx` per
+/// fallback glyph, adding ~50ns × fallback_count per frame). Indices
+/// mirror `snail.TrueTypeHintRejectReason`.
+pub var phase_hint_reject_counts: [reject_reason_count]u64 = .{0} ** reject_reason_count;
+pub const reject_reason_count: usize = @typeInfo(snail.TrueTypeHintRejectReason).@"enum".fields.len;
+
+fn bumpRejectReason(reason: snail.TrueTypeHintRejectReason) void {
+    phase_hint_reject_counts[@intFromEnum(reason)] +%= 1;
+}
+
+fn collectFallbackReasons(
+    hint_ctx: *snail.TrueTypeHintContext,
+    run: *const snail.TrueTypePreparedHintRun,
+    ppem: snail.TrueTypeHintPpem,
+) void {
+    for (run.glyphs) |g| {
+        switch (g.source) {
+            .hint => {},
+            .fallback => {
+                const key = snail.TrueTypeHintGlyphKey{
+                    .face_index = g.face_index,
+                    .ppem_x_26_6 = ppem.x_26_6,
+                    .ppem_y_26_6 = ppem.y_26_6,
+                    .glyph_id = g.glyph_id,
+                };
+                switch (hint_ctx.queryGlyph(key)) {
+                    .unsupported => |reason| bumpRejectReason(reason),
+                    else => {},
+                }
+            },
+        }
+    }
+}
+
 pub const MAX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 3;
 
 pub const ColoredRect = struct {
@@ -198,6 +233,9 @@ fn flushRow(
         phase_hint_runs += 1;
         phase_hint_glyphs_hinted += hint_run.?.stats.hinted_count;
         phase_hint_glyphs_fallback += hint_run.?.stats.fallback_count;
+        if (render_env.hint_diag_enabled and hint_run.?.stats.fallback_count > 0) {
+            collectFallbackReasons(hint_ctx, &hint_run.?, ppem);
+        }
     }
     const run_ptr: ?*const snail.TrueTypePreparedHintRun = if (hint_run) |*r| r else null;
 

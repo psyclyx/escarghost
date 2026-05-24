@@ -15,7 +15,42 @@ const gl = @cImport({
     @cDefine("GL_GLEXT_PROTOTYPES", "1");
     @cInclude("GLES3/gl3.h");
     @cInclude("GLES3/gl3ext.h");
+    // EXT_disjoint_timer_query lives in the GLES2 ext header.
+    @cInclude("GLES2/gl2ext.h");
 });
+
+const egl = @cImport({
+    @cInclude("EGL/egl.h");
+});
+
+/// Function pointers for EXT_disjoint_timer_query, resolved lazily via
+/// eglGetProcAddress. libGLESv2 doesn't statically export these — they
+/// must be queried at runtime through EGL. Null indicates the extension
+/// isn't available; the timestamp diagnostic is then a no-op.
+const TimerQueryFns = struct {
+    gen: ?*const fn (n: gl.GLsizei, ids: [*c]gl.GLuint) callconv(.c) void = null,
+    del: ?*const fn (n: gl.GLsizei, ids: [*c]const gl.GLuint) callconv(.c) void = null,
+    counter: ?*const fn (id: gl.GLuint, target: gl.GLenum) callconv(.c) void = null,
+    get_u32: ?*const fn (id: gl.GLuint, pname: gl.GLenum, params: [*c]gl.GLuint) callconv(.c) void = null,
+    get_u64: ?*const fn (id: gl.GLuint, pname: gl.GLenum, params: [*c]gl.GLuint64) callconv(.c) void = null,
+
+    fn load() TimerQueryFns {
+        return .{
+            .gen = @ptrCast(egl.eglGetProcAddress("glGenQueriesEXT")),
+            .del = @ptrCast(egl.eglGetProcAddress("glDeleteQueriesEXT")),
+            .counter = @ptrCast(egl.eglGetProcAddress("glQueryCounterEXT")),
+            .get_u32 = @ptrCast(egl.eglGetProcAddress("glGetQueryObjectuivEXT")),
+            .get_u64 = @ptrCast(egl.eglGetProcAddress("glGetQueryObjectui64vEXT")),
+        };
+    }
+
+    fn available(self: TimerQueryFns) bool {
+        return self.gen != null and self.del != null and self.counter != null and self.get_u32 != null and self.get_u64 != null;
+    }
+};
+
+var timer_query_fns: TimerQueryFns = .{};
+var timer_query_loaded: bool = false;
 
 const MAX_SNAPSHOT_ROWS: usize = render_snapshot.MaxRows;
 const MAX_OVERRIDES: usize = MAX_SNAPSHOT_ROWS + 4; // rows + cursor blob
@@ -152,6 +187,17 @@ pub const GpuPipeline = struct {
     viewport_h: f32,
     config: render_env.RenderConfig,
 
+    /// GL_TIMESTAMP queries via EXT_disjoint_timer_query, bracketing
+    /// drawPass. Two slots so we can write frame N's queries while
+    /// reading frame N-1's results without stalling on GPU work that's
+    /// already complete by the time the gpu_worker fence is done. Used
+    /// to distinguish actual GPU compute time from driver-side sync
+    /// wait (the dominant component of fence_ms on NVIDIA + dmabuf).
+    gpu_query_ids: [4]gl.GLuint = .{ 0, 0, 0, 0 },
+    gpu_query_slot: u8 = 0,
+    gpu_query_slot_used: [2]bool = .{ false, false },
+    gpu_queries_initialized: bool = false,
+
     scratch_ready: bool = false,
     /// Enables expensive per-frame GL instrumentation: glFinish to wait
     /// for the draw to complete before reading back, glReadPixels to
@@ -171,6 +217,13 @@ pub const GpuPipeline = struct {
     pub var phase_drawlist_ns: u64 = 0;
     pub var phase_draw_ns: u64 = 0;
     pub var phase_frame_count: u64 = 0;
+    /// Actual GPU compute time measured via GL_TIMESTAMP queries
+    /// around drawPass. Updated lazily: frame N's value lands when
+    /// frame N+1 (or later) reads it back, so the gauge runs ~1 frame
+    /// behind. Compare to `phase_draw_ns` to see how much of "draw
+    /// time" is GPU work vs sync wait.
+    pub var phase_gpu_compute_ns: u64 = 0;
+    pub var phase_gpu_compute_samples: u64 = 0;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -218,6 +271,7 @@ pub const GpuPipeline = struct {
     }
 
     pub fn deinit(self: *GpuPipeline) void {
+        self.deinitGpuTimestamps();
         self.ephemeral_blobs.deinit();
         if (self.scratch_ready) self.allocator.free(self.scratch_rects);
         self.draw_buf.deinit(self.allocator);
@@ -426,6 +480,63 @@ pub const GpuPipeline = struct {
             .font_size = self.font_size,
             .baseline_offset = self.baseline_offset,
         };
+    }
+
+    fn ensureGpuTimestamps(self: *GpuPipeline) void {
+        if (self.gpu_queries_initialized) return;
+        if (!timer_query_loaded) {
+            timer_query_fns = TimerQueryFns.load();
+            timer_query_loaded = true;
+        }
+        if (!timer_query_fns.available()) return;
+        timer_query_fns.gen.?(self.gpu_query_ids.len, &self.gpu_query_ids);
+        self.gpu_queries_initialized = true;
+    }
+
+    fn deinitGpuTimestamps(self: *GpuPipeline) void {
+        if (!self.gpu_queries_initialized) return;
+        if (timer_query_fns.del) |del| del(self.gpu_query_ids.len, &self.gpu_query_ids);
+        self.gpu_queries_initialized = false;
+    }
+
+    /// Read the previous slot's TIMESTAMP queries iff they're already
+    /// available — never blocks. The gpu_worker's fence wait at the end
+    /// of the previous frame guarantees the queries are done by the
+    /// time this frame's flushDraw runs, so AVAILABLE almost always
+    /// returns true. On disjoint hardware events (GPU reset etc.) the
+    /// driver may invalidate the query; we just skip the sample.
+    fn harvestPriorGpuTimestamps(self: *GpuPipeline) void {
+        if (!self.gpu_queries_initialized) return;
+        const prev: u8 = 1 - self.gpu_query_slot;
+        if (!self.gpu_query_slot_used[prev]) return;
+        const id_pre = self.gpu_query_ids[@as(usize, prev) * 2];
+        const id_post = self.gpu_query_ids[@as(usize, prev) * 2 + 1];
+        var available: gl.GLuint = 0;
+        timer_query_fns.get_u32.?(id_post, gl.GL_QUERY_RESULT_AVAILABLE_EXT, &available);
+        if (available == 0) return;
+        var t0: gl.GLuint64 = 0;
+        var t1: gl.GLuint64 = 0;
+        timer_query_fns.get_u64.?(id_pre, gl.GL_QUERY_RESULT_EXT, &t0);
+        timer_query_fns.get_u64.?(id_post, gl.GL_QUERY_RESULT_EXT, &t1);
+        self.gpu_query_slot_used[prev] = false;
+        if (t1 < t0) return; // disjoint event
+        phase_gpu_compute_ns += t1 - t0;
+        phase_gpu_compute_samples += 1;
+    }
+
+    fn beginGpuTimestamp(self: *GpuPipeline) void {
+        self.ensureGpuTimestamps();
+        if (!self.gpu_queries_initialized) return;
+        const slot = self.gpu_query_slot;
+        timer_query_fns.counter.?(self.gpu_query_ids[@as(usize, slot) * 2], gl.GL_TIMESTAMP_EXT);
+    }
+
+    fn endGpuTimestamp(self: *GpuPipeline) void {
+        if (!self.gpu_queries_initialized) return;
+        const slot = self.gpu_query_slot;
+        timer_query_fns.counter.?(self.gpu_query_ids[@as(usize, slot) * 2 + 1], gl.GL_TIMESTAMP_EXT);
+        self.gpu_query_slot_used[slot] = true;
+        self.gpu_query_slot = 1 - slot;
     }
 
     /// Emit cursor geometry into the per-frame path picture. Cursor edges
@@ -679,8 +790,11 @@ pub const GpuPipeline = struct {
         const scene_shapes: usize = if (maybe_picture) |*p| p.shapeCount() else 0;
         const scene_text_blobs = self.scene.commandCount();
 
+        self.harvestPriorGpuTimestamps();
         const draw_t0 = perf.Timer.now();
+        self.beginGpuTimestamp();
         try self.gl_renderer.drawPass(&prepared, &draw_list, pass);
+        self.endGpuTimestamp();
 
         // Block on the GPU pipeline before reading back. glFlush alone is
         // fire-and-forget; for a readback we need the FBO to actually have

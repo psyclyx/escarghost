@@ -142,6 +142,21 @@ pub const HintMode = enum(u8) {
 /// at startup; `loadHintMode` does the relaxed read on the hot path.
 pub var hint_mode_atomic: std.atomic.Value(u8) = .{ .raw = @intFromEnum(HintMode.tt) };
 
+/// Set from SCRGO_HINT_DIAG=1 at startup. When true, row_build queries
+/// the hint context per fallback glyph to bucket fallbacks by reject
+/// reason — adds ~50ns per fallback glyph per frame, so off by default.
+pub var hint_diag_enabled: bool = false;
+
+pub fn loadHintDiagFromEnv() void {
+    if (c.getenv("SCRGO_HINT_DIAG")) |value| {
+        const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), " \t\r\n");
+        hint_diag_enabled = !std.mem.eql(u8, trimmed, "") and
+            !std.mem.eql(u8, trimmed, "0") and
+            !std.mem.eql(u8, trimmed, "false") and
+            !std.mem.eql(u8, trimmed, "off");
+    }
+}
+
 pub fn loadHintMode() HintMode {
     return @enumFromInt(hint_mode_atomic.load(.monotonic));
 }
@@ -208,8 +223,8 @@ pub fn parseCoverageExponent(value: ?[]const u8) f32 {
     return @min(parsed, 4.0);
 }
 
-/// Read SCRGO_SUBPIXEL / SCRGO_COVERAGE_EXPONENT from the environment.
-/// Future env knobs (e.g. SCRGO_BG_ALPHA) plug in here.
+/// Read SCRGO_SUBPIXEL / SCRGO_COVERAGE_EXPONENT / SCRGO_HINT_DIAG from
+/// the environment. Future env knobs (e.g. SCRGO_BG_ALPHA) plug in here.
 pub fn loadRenderConfigFromEnv() RenderConfig {
     var config: RenderConfig = .{};
     if (c.getenv("SCRGO_SUBPIXEL")) |value| {
@@ -218,6 +233,7 @@ pub fn loadRenderConfigFromEnv() RenderConfig {
     if (c.getenv("SCRGO_COVERAGE_EXPONENT")) |value| {
         config.coverage_exponent = parseCoverageExponent(std.mem.sliceTo(value, 0));
     }
+    loadHintDiagFromEnv();
     return config;
 }
 
