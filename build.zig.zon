@@ -5,8 +5,8 @@
     .paths = .{""},
     .dependencies = .{
         .snail = .{
-            .url = "https://github.com/psyclyx/snail/archive/4249036d2e54dda38a354747144115b7187ed568.tar.gz",
-            .hash = "snail-0.12.0-vw75SKOHfwA5-cGyQ_hQ6aiFb58BRUnoQDBAScyeucHN",
+            .url = "https://github.com/psyclyx/snail/archive/8891b2ee10cf347cc31f6084a7750420590a3449.tar.gz",
+            .hash = "snail-0.12.1-vw75SJWLfwB169ZTs1-euCPbDPyIwCozWIt-Dj_HpPDF",
         },
     },
 }
