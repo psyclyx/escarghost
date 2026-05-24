@@ -720,10 +720,10 @@ fn expandWordLive(cell: selection_mod.Cell, cols: u16, row_cp_buf: *[render_snap
 fn debugKillActiveRenderer() void {
     if (state.render.active_render_path == .gpu and state.refs.gpu.active) {
         render_loop.noteGpuUnavailable(state);
-        log.info(.input, "debug killed", .{ .target = "gpu" });
+        log.warn(.input, "debug killed", .{ .target = "gpu" });
     } else if (state.refs.cpu.active) {
         state.refs.cpu.stop();
-        log.info(.input, "debug killed", .{ .target = "cpu" });
+        log.warn(.input, "debug killed", .{ .target = "cpu" });
     }
 }
 
@@ -732,11 +732,11 @@ fn debugSwapRenderer() void {
         state.render.target_render_path = .cpu;
         state.render.active_render_path = .cpu;
         state.render.needs_redraw = true;
-        log.info(.input, "debug target", .{ .renderer = "cpu" });
+        log.warn(.input, "debug target", .{ .renderer = "cpu" });
     } else {
         state.render.target_render_path = .gpu;
         state.render.gpu_snapshot_dirty = true;
-        log.info(.input, "debug target", .{ .renderer = "gpu" });
+        log.warn(.input, "debug target", .{ .renderer = "gpu" });
     }
 }
 
@@ -746,7 +746,7 @@ fn debugClearAtlas() void {
     // change by allocating a fresh TextAtlas init from scratch using the
     // current atlas's font config bytes.
     render_loop.markRenderDirty(state);
-    log.info(.input, "debug atlas clear", .{ .status = "noop" });
+    log.warn(.input, "debug atlas clear", .{ .status = "noop" });
 }
 
 fn debugCycleHintMode() void {
@@ -763,7 +763,7 @@ fn debugCycleHintMode() void {
     state.metrics.baseline_offset = cm.baseline_offset;
     state.render.gpu_reconfigure_requested = true;
     render_loop.markRenderDirty(state);
-    log.info(.input, "debug hint mode", .{ .mode = @tagName(next) });
+    log.warn(.input, "debug hint mode", .{ .mode = @tagName(next) });
 }
 
 fn keysymToGhosttyKey(keysym: u32) c_uint {
