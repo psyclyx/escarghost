@@ -74,6 +74,9 @@ const ScopeState = struct {
 };
 
 var process_start_ns: u64 = 0;
+/// Wallclock of the previous log emission, regardless of scope. Used
+/// to compute the "global delta" column shown left of the scope tag.
+var last_global_log_ns: u64 = 0;
 var color_enabled: bool = false;
 var initialized: bool = false;
 var write_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t);
@@ -306,11 +309,16 @@ fn emit(scope: Scope, level: Level, comptime msg: []const u8, data: anytype) voi
     const state = &scope_state[@intFromEnum(scope)];
     const start = if (initialized) process_start_ns else ns;
     const elapsed_ns = ns -% start;
-    const delta_ns: ?u64 = if (state.last_log_ns == 0)
+    const scope_delta_ns: ?u64 = if (state.last_log_ns == 0)
         null
     else
         ns -% state.last_log_ns;
+    const global_delta_ns: ?u64 = if (last_global_log_ns == 0)
+        null
+    else
+        ns -% last_global_log_ns;
     state.last_log_ns = ns;
+    last_global_log_ns = ns;
 
     const ms_div: f64 = @floatFromInt(@as(u64, std.time.ns_per_ms));
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / ms_div;
@@ -322,11 +330,24 @@ fn emit(scope: Scope, level: Level, comptime msg: []const u8, data: anytype) voi
     line.print("+{d:>8.1}ms", .{elapsed_ms});
     line.write("  ");
 
+    // Global delta block: "Δ123.4ms" (9 visual cols). Dimmed so it
+    // sits in the background; the eye-grabbing delta is the
+    // scope-coloured one to the right of the tag.
+    line.sgr("\x1b[2m");
+    if (global_delta_ns) |d| {
+        const delta_ms = @as(f64, @floatFromInt(d)) / ms_div;
+        line.print("Δ{d:>6.1}ms", .{delta_ms});
+    } else {
+        line.write("         ");
+    }
+    line.sgr(sgr_reset);
+    line.write("  ");
+
     // Scope tag + delta share the scope color so they read as one block.
     line.sgr(scopeColor(scope));
     line.write(scopeTagBlockRuntime(scope));
     line.write(" ");
-    if (delta_ns) |d| {
+    if (scope_delta_ns) |d| {
         const delta_ms = @as(f64, @floatFromInt(d)) / ms_div;
         line.print("Δ{d:>6.1}ms", .{delta_ms});
     } else {
