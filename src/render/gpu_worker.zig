@@ -1076,7 +1076,7 @@ pub const GpuWorker = struct {
                     // how much the redraw + fence wait will cost.
                     last_full_frame_ns = monotonicNs() - draw_t0;
 
-                    log.info(.gpu, "render complete", .{
+                    log.debug(.gpu, "render complete", .{
                         .buffer = request.buffer_index,
                         .elapsed_ms = log.fmt("{d:.1}", .{render_timer.elapsedMs()}),
                         .acquire_point = acquire_point,

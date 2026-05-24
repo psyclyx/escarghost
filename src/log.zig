@@ -16,11 +16,16 @@
 //!                 `log.fmt("{d:.1}", .{x})` wraps a value that needs a
 //!                 custom format spec.
 //!
-//! Scope filtering: `SCRGO_LOG=<scope>[,<scope>]*` enables those scopes.
-//! Token names match the `Scope` enum names exactly (`gpu`, `cpu`,
-//! `frame`, ...). `all` / `1` / `on` enables every scope; `0` / `off`
-//! disables all. Only `info`-level messages are gated; `warn` and `err`
-//! always emit.
+//! Two gates, applied in order:
+//!   1. Level: every call has a level (`debug` / `info` / `warn` / `err`).
+//!      Calls below the configured threshold are dropped. Default
+//!      threshold is `warn` (so a quiet binary just shows warnings +
+//!      errors). CLI `-v` raises to `info`; `-vv` raises to `debug`.
+//!   2. Scope filter: `SCRGO_LOG=<scope>[,<scope>]*` narrows output to
+//!      just those scopes. Token names match the `Scope` enum names
+//!      exactly (`gpu`, `cpu`, `frame`, ...). `all` / `1` / `on`
+//!      (or unset) means no scope filter. `0` / `off` filters
+//!      everything out (rare; use to silence sub-libraries).
 //!
 //! `init()` must run once near the top of `main` so process-start is
 //! stamped before anything logs.
@@ -46,7 +51,14 @@ pub const Scope = enum {
     frame,
 };
 
-pub const Level = enum { info, warn, err };
+pub const Level = enum(u8) {
+    debug = 0,
+    info = 1,
+    warn = 2,
+    err = 3,
+};
+
+pub const default_level: Level = .warn;
 
 const tag_width: usize = blk: {
     var w: usize = 0;
@@ -67,8 +79,14 @@ var initialized: bool = false;
 var write_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t);
 var scope_state: [std.meta.fields(Scope).len]ScopeState =
     [_]ScopeState{.{}} ** std.meta.fields(Scope).len;
-var scope_enabled: [std.meta.fields(Scope).len]bool =
-    [_]bool{false} ** std.meta.fields(Scope).len;
+/// Scope filter: true = include in output, false = drop. Default is
+/// all-true so a fresh binary doesn't silently swallow scopes. Only
+/// flipped by `SCRGO_LOG` parsing.
+var scope_allowed: [std.meta.fields(Scope).len]bool =
+    [_]bool{true} ** std.meta.fields(Scope).len;
+/// Minimum level to emit. Calls below this are dropped before any
+/// per-scope filtering. CLI `-v[v]` raises it; default is `warn`.
+var min_level: Level = default_level;
 
 const sgr_reset = "\x1b[0m";
 const sgr_bold = "\x1b[1m";
@@ -128,20 +146,25 @@ pub fn init() void {
 fn parseScopeTokens(value: []const u8) void {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return;
-    if (eqIgnoreAny(trimmed, &.{ "0", "off", "false" })) return;
-    if (eqIgnoreAny(trimmed, &.{ "1", "on", "true", "all" })) {
-        for (&scope_enabled) |*e| e.* = true;
+    if (eqIgnoreAny(trimmed, &.{ "0", "off", "false" })) {
+        for (&scope_allowed) |*e| e.* = false;
         return;
     }
+    if (eqIgnoreAny(trimmed, &.{ "1", "on", "true", "all" })) {
+        for (&scope_allowed) |*e| e.* = true;
+        return;
+    }
+    // Specific list: narrow the filter to only the named scopes.
+    for (&scope_allowed) |*e| e.* = false;
     var it = std.mem.tokenizeAny(u8, trimmed, ", ");
     while (it.next()) |token| {
         if (std.ascii.eqlIgnoreCase(token, "all")) {
-            for (&scope_enabled) |*e| e.* = true;
+            for (&scope_allowed) |*e| e.* = true;
             continue;
         }
         inline for (std.meta.fields(Scope)) |f| {
             if (std.ascii.eqlIgnoreCase(token, f.name)) {
-                scope_enabled[f.value] = true;
+                scope_allowed[f.value] = true;
             }
         }
     }
@@ -155,15 +178,18 @@ fn eqIgnoreAny(needle: []const u8, options: []const []const u8) bool {
 }
 
 pub fn isScopeEnabled(scope: Scope) bool {
-    return scope_enabled[@intFromEnum(scope)];
+    return scope_allowed[@intFromEnum(scope)];
 }
 
-pub fn enableScope(scope: Scope) void {
-    scope_enabled[@intFromEnum(scope)] = true;
+/// Raise (or lower) the minimum level the logger emits. Calls below
+/// this level are dropped before scope filtering. CLI verbosity flags
+/// route through here.
+pub fn setMinLevel(level: Level) void {
+    min_level = level;
 }
 
-pub fn enableAllScopes() void {
-    for (&scope_enabled) |*e| e.* = true;
+pub fn getMinLevel() Level {
+    return min_level;
 }
 
 /// Set the ambient frame number for `scope`. Subsequent log calls in
@@ -198,16 +224,28 @@ pub fn fmt(comptime format: []const u8, args: anytype) Fmt {
     return f;
 }
 
+inline fn shouldEmit(scope: Scope, level: Level) bool {
+    if (@intFromEnum(level) < @intFromEnum(min_level)) return false;
+    return scope_allowed[@intFromEnum(scope)];
+}
+
+pub fn debug(scope: Scope, comptime msg: []const u8, data: anytype) void {
+    if (!shouldEmit(scope, .debug)) return;
+    emit(scope, .debug, msg, data);
+}
+
 pub fn info(scope: Scope, comptime msg: []const u8, data: anytype) void {
-    if (!scope_enabled[@intFromEnum(scope)]) return;
+    if (!shouldEmit(scope, .info)) return;
     emit(scope, .info, msg, data);
 }
 
 pub fn warn(scope: Scope, comptime msg: []const u8, data: anytype) void {
+    if (!shouldEmit(scope, .warn)) return;
     emit(scope, .warn, msg, data);
 }
 
 pub fn err(scope: Scope, comptime msg: []const u8, data: anytype) void {
+    if (!shouldEmit(scope, .err)) return;
     emit(scope, .err, msg, data);
 }
 
@@ -306,8 +344,10 @@ fn emit(scope: Scope, level: Level, comptime msg: []const u8, data: anytype) voi
     line.write("  ");
 
     // Message body. Warn/err overlay colors the body only, so the scope
-    // tag stays identifiable on noisy lines.
+    // tag stays identifiable on noisy lines. Debug is dimmed so it
+    // visually recedes when info+ messages are mixed in.
     switch (level) {
+        .debug => line.sgr("\x1b[2m"), // SGR dim
         .info => {},
         .warn => line.sgr(sgr_yellow ++ sgr_bold),
         .err => line.sgr(sgr_red ++ sgr_bold),
@@ -315,7 +355,7 @@ fn emit(scope: Scope, level: Level, comptime msg: []const u8, data: anytype) voi
     line.write(msg);
     switch (level) {
         .info => {},
-        .warn, .err => line.sgr(sgr_reset),
+        .debug, .warn, .err => line.sgr(sgr_reset),
     }
 
     const fields = @typeInfo(@TypeOf(data)).@"struct".fields;

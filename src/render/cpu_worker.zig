@@ -211,7 +211,7 @@ pub const Frontend = struct {
         self.render_in_flight = true;
         _ = c.pthread_cond_signal(&self.cond);
         log.setFrame(.cpu, serial);
-        log.info(.cpu, "queue frame", .{
+        log.debug(.cpu, "queue frame", .{
             .buffer = buffer_index,
             .snapshot = snapshot_slot,
             .width = width,
@@ -327,7 +327,7 @@ pub const Frontend = struct {
                         if (self.atlas_thread) |thread| thread.requestMany(&misses);
                     }
                     const elapsed_ms = timer.elapsedMs();
-                    log.info(.cpu, "frame complete", .{
+                    log.debug(.cpu, "frame complete", .{
                         .buffer = buffer_index,
                         .snapshot = snapshot_slot,
                         .elapsed_ms = log.fmt("{d:.1}", .{elapsed_ms}),

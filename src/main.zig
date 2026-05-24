@@ -523,7 +523,7 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommit('d');
                         } else {
                             log.setFrame(.frame, resp.serial);
-                            log.info(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
+                            log.debug(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
                                 // Explicit sync: pin the acquire +
                                 // release points before commit so the
@@ -608,7 +608,7 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
                             log.setFrame(.frame, resp.serial);
-                            log.info(.cpu, "frame committed", .{ .buffer = resp.buffer_index });
+                            log.debug(.cpu, "frame committed", .{ .buffer = resp.buffer_index });
                             render_loop.markFirstContentPaint(&state);
                         } else {
                             const reason: []const u8 = if (!buffer_ok)
@@ -693,7 +693,7 @@ pub fn main(init: std.process.Init) !void {
                     child_exited = true;
                     break;
                 }
-                log.info(.pty, "read", .{ .bytes = n });
+                log.debug(.pty, "read", .{ .bytes = n });
                 if (state.diag.trace_commits) {
                     state.diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
                     state.diag.phase_bytes_read += @intCast(n);

@@ -144,7 +144,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
         s.render.buffer_starvation_start_ns = 0;
     }
     log.setFrame(.frame, s.render.render_serial);
-    log.info(.frame, "queued gpu frame", .{});
+    log.debug(.frame, "queued gpu frame", .{});
     s.render.gpu_snapshot_dirty = false;
 }
 
@@ -181,7 +181,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
         };
         s.render.needs_redraw = false;
         log.setFrame(.frame, s.render.render_serial);
-        log.info(.frame, "queued cpu frame", .{ .width = wl.width, .height = wl.height });
+        log.debug(.frame, "queued cpu frame", .{ .width = wl.width, .height = wl.height });
         return;
     }
     s.render.needs_redraw = false;

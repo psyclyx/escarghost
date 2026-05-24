@@ -402,24 +402,18 @@ fn parseRenderer(s: []const u8) ?Renderer {
     return null;
 }
 
-/// Enable the curated set of log scopes implied by `-v[v[v]]`. CLI
-/// verbosity layers *on top of* whatever `SCRGO_LOG` already enabled;
-/// it never disables a scope the env var asked for.
+/// Raise the log threshold based on `-v[v[v]]`. CLI verbosity is
+/// orthogonal to the `SCRGO_LOG` scope filter — verbosity decides
+/// *which levels* emit, the filter (if any) decides *which scopes*.
+///
+///   default → warn (warn + err only)
+///   -v      → info
+///   -vv     → debug
+///   -vvv    → debug (capped)
 pub fn applyVerbosity(verbosity: u2) void {
     if (verbosity == 0) return;
-    log.enableScope(.main);
-    log.enableScope(.pty);
-    log.enableScope(.frame);
-    if (verbosity >= 2) {
-        log.enableScope(.gpu);
-        log.enableScope(.cpu);
-        log.enableScope(.atlas);
-        log.enableScope(.input);
-    }
-    if (verbosity >= 3) {
-        log.enableScope(.wayland);
-        log.enableScope(.diag);
-    }
+    const level: log.Level = if (verbosity >= 2) .debug else .info;
+    log.setMinLevel(level);
 }
 
 // ── Completion-script generators ──

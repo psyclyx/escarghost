@@ -1287,7 +1287,7 @@ pub const Wayland = struct {
         }
         last_frame_done_ns = now_ns;
         frame_done_count += 1;
-        log.info(.wayland, "frame_done", .{
+        log.debug(.wayland, "frame_done", .{
             .seq = frame_done_count,
             .dt_ms = log.fmt("{d:.1}", .{dt_ms}),
         });
