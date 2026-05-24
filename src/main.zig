@@ -493,6 +493,23 @@ pub fn main(init: std.process.Init) !void {
                                 render_loop.noteGpuUnavailable(&state);
                                 continue;
                             };
+                            // Wire up explicit sync if the worker
+                            // created a syncobj timeline and the
+                            // compositor advertises the manager. Both
+                            // are optional; missing either falls back
+                            // to implicit fencing.
+                            if (gpu.drm_syncobj_export_fd >= 0) {
+                                _ = wl.ensureDrmSyncobjSurface();
+                                const fd = gpu.drm_syncobj_export_fd;
+                                gpu.drm_syncobj_export_fd = -1;
+                                if (wl.importDrmSyncobjTimeline(fd)) |_| {
+                                    log.info(.gpu, "explicit sync ready", .{});
+                                } else {
+                                    log.info(.gpu, "explicit sync unavailable", .{
+                                        .reason = "no compositor manager",
+                                    });
+                                }
+                            }
                             state.render.gpu_snapshot_dirty = true;
                             state.render.gpu_restart.clear();
                             log.info(.gpu, "ready", .{});
@@ -508,6 +525,15 @@ pub fn main(init: std.process.Init) !void {
                             log.setFrame(.frame, resp.serial);
                             log.info(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
+                                // Explicit sync: pin the acquire +
+                                // release points before commit so the
+                                // compositor knows to wait for our GPU
+                                // work via the timeline rather than
+                                // sampling whenever it likes. set_*
+                                // requests apply to the next commit.
+                                const acquire: u64 = (@as(u64, resp.acquire_point_hi) << 32) | resp.acquire_point_lo;
+                                const release: u64 = (@as(u64, resp.release_point_hi) << 32) | resp.release_point_lo;
+                                if (acquire != 0) _ = wl.setDrmSyncobjPoints(acquire, release);
                                 // Commit immediately. If the compositor
                                 // still has the prior frame pending,
                                 // this commit replaces it in the

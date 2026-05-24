@@ -17,6 +17,7 @@ const glyph_misses = @import("glyph_misses.zig");
 const gpu_buffer = @import("gpu_buffer.zig");
 const terminal_mod = @import("../terminal.zig");
 const row_build = @import("row_build.zig");
+const drm_sync = @import("drm_sync.zig");
 const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 
@@ -108,6 +109,19 @@ pub const Response = extern struct {
     snapshot_slot: u8 = 0,
     reserved: [1]u8 = [_]u8{0} ** 1,
     serial: u32 = 0,
+    /// For `.frame` responses, the DRM syncobj timeline point that
+    /// will signal when this frame's GPU work completes. Zero means
+    /// "no explicit sync" — the caller falls back to implicit
+    /// (driver-internal) fencing as before. Hi/lo split because
+    /// wayland's `set_acquire_point` takes 32-bit parts.
+    acquire_point_lo: u32 = 0,
+    acquire_point_hi: u32 = 0,
+    /// A distinct timeline point the compositor signals when it's
+    /// done reading the buffer. We don't currently wait on it (we
+    /// gate the next render on `frame_done` instead), but the wayland
+    /// protocol requires release ≠ acquire.
+    release_point_lo: u32 = 0,
+    release_point_hi: u32 = 0,
 };
 
 const RequestTag = enum {
@@ -423,6 +437,13 @@ pub const GpuWorker = struct {
     buffer_descs: [MaxBuffers]gpu_buffer.BufferDesc = [_]gpu_buffer.BufferDesc{.{}} ** MaxBuffers,
     buffer_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
     buffer_count: u8 = 0,
+    /// Explicit-sync timeline syncobj fd, populated by the worker
+    /// during configure (after it opens its DRM render node + creates
+    /// the timeline). The main thread reads this after `.ready` and
+    /// hands it to wayland via `wp_linux_drm_syncobj_manager_v1.import_timeline`.
+    /// Negative = no explicit-sync available (extension absent, or
+    /// init failed) — falls back to implicit fencing.
+    drm_syncobj_export_fd: c_int = -1,
 
     // GpuWorker-side state
     buffers: [MaxBuffers]gpu_buffer.FrontendBuffer = undefined,
@@ -705,6 +726,17 @@ pub const GpuWorker = struct {
         var current_width: u32 = 0;
         var current_height: u32 = 0;
 
+        // Explicit-sync state. Initialised lazily inside the configure
+        // handler once we have a DRM render fd from the dmabuf allocator.
+        // Both pieces are nullable so missing EGL extensions or a closed
+        // wayland manager cleanly fall back to implicit fencing.
+        var drm_timeline: ?drm_sync.Timeline = null;
+        defer if (drm_timeline) |*t| t.deinit();
+        const egl_fence_fns = drm_sync.EglFenceFns.load();
+        if (!egl_fence_fns.available()) {
+            log.warn(.gpu, "egl native fence sync unavailable", .{});
+        }
+
         // Phase 2+3: request loop. We wait on the eventfd outside the
         // mutex — pthread_cond_wait would tangle the wakeup with the
         // mutex's wait queue, adding bookkeeping latency on a code
@@ -828,6 +860,26 @@ pub const GpuWorker = struct {
                         self.buffer_descs[i] = active_allocator.targets[i].desc;
                         self.buffer_export_fds[i] = active_allocator.targets[i].export_fd;
                         active_allocator.targets[i].export_fd = -1; // Transfer ownership to main
+                    }
+
+                    // (Re)create the DRM syncobj timeline now that we
+                    // have a render fd. Tear down any prior timeline —
+                    // its handle is bound to the prior render fd which
+                    // we're about to drop when allocator_state churns.
+                    if (drm_timeline) |*t| {
+                        t.deinit();
+                        drm_timeline = null;
+                    }
+                    self.drm_syncobj_export_fd = -1;
+                    if (egl_fence_fns.available() and active_allocator.render_fd >= 0) {
+                        drm_timeline = drm_sync.Timeline.init(active_allocator.render_fd) catch |e| blk: {
+                            log.warn(.gpu, "drm syncobj init failed", .{ .err = e });
+                            break :blk null;
+                        };
+                        if (drm_timeline) |*t| {
+                            self.drm_syncobj_export_fd = t.takeExportFd();
+                            log.info(.gpu, "drm syncobj ready", .{ .export_fd = self.drm_syncobj_export_fd });
+                        }
                     }
 
                     log.info(.gpu, "configure ready", .{
@@ -975,20 +1027,48 @@ pub const GpuWorker = struct {
                         }
                     }
 
-                    // Block on the GPU until every command issued by
-                    // drawSnapshot has actually written the dmabuf.
-                    // drawSnapshot ends with glFlush, which only queues
-                    // commands; the moment we send the .frame response,
-                    // main calls wl_surface_attach + commit and the
-                    // compositor is free to scan out the dmabuf. Without
-                    // this wait the compositor can sample partially
-                    // written or stale pixels — visible as old frames
-                    // briefly snapping back over the latest content.
+                    // Two sync paths:
+                    //
+                    //  Explicit (drm_timeline available + EGL fence
+                    //  sync supported): allocate the next timeline
+                    //  point, capture an EGL fence on the GL command
+                    //  stream, transfer the fence into the timeline.
+                    //  We do NOT wait on the CPU — the compositor will
+                    //  wait on the timeline point itself before reading
+                    //  our buffer. ~zero CPU stall in this path.
+                    //
+                    //  Implicit (timeline unavailable or signal failed):
+                    //  fall back to glFenceSync + glClientWaitSync.
+                    //  Required so the .frame response→commit→compositor
+                    //  read can't race the GPU writes; without this,
+                    //  the compositor would sample partially written
+                    //  or stale pixels.
+                    var acquire_point: u64 = 0;
+                    var release_point: u64 = 0;
                     const gpu_wait_t0 = monotonicNs();
-                    const fence_sync = c.glFenceSync(c.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    if (fence_sync != null) {
-                        _ = c.glClientWaitSync(fence_sync, c.GL_SYNC_FLUSH_COMMANDS_BIT, std.math.maxInt(u64));
-                        c.glDeleteSync(fence_sync);
+                    if (drm_timeline) |*t| {
+                        const point = t.nextPoint();
+                        // Burn the next point as release. The compositor
+                        // signals it when done; we don't currently wait
+                        // on it (frame_done callback gates the next
+                        // render). Released here so it can't collide
+                        // with subsequent acquire points.
+                        const release = t.nextPoint();
+                        if (t.signalFromEgl(egl.display, egl_fence_fns, point)) {
+                            acquire_point = point;
+                            release_point = release;
+                        } else |signal_err| {
+                            log.warn(.gpu, "drm syncobj signal failed; falling back to fence wait", .{
+                                .err = signal_err,
+                            });
+                        }
+                    }
+                    if (acquire_point == 0) {
+                        const fence_sync = c.glFenceSync(c.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                        if (fence_sync != null) {
+                            _ = c.glClientWaitSync(fence_sync, c.GL_SYNC_FLUSH_COMMANDS_BIT, std.math.maxInt(u64));
+                            c.glDeleteSync(fence_sync);
+                        }
                     }
                     const gpu_wait_elapsed_ns = monotonicNs() - gpu_wait_t0;
                     // Record total wall-time for this iteration so the
@@ -999,12 +1079,17 @@ pub const GpuWorker = struct {
                     log.info(.gpu, "render complete", .{
                         .buffer = request.buffer_index,
                         .elapsed_ms = log.fmt("{d:.1}", .{render_timer.elapsedMs()}),
+                        .acquire_point = acquire_point,
                     });
                     writeResponse(self.response_fds[1], .{
                         .tag = .frame,
                         .buffer_index = request.buffer_index,
                         .snapshot_slot = request.snapshot_slot,
                         .serial = request.serial,
+                        .acquire_point_lo = @truncate(acquire_point),
+                        .acquire_point_hi = @truncate(acquire_point >> 32),
+                        .release_point_lo = @truncate(release_point),
+                        .release_point_hi = @truncate(release_point >> 32),
                     });
 
                     // Periodic state dump: print RSS once per second-ish
