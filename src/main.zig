@@ -49,8 +49,51 @@ fn parseBool(v: ?[]const u8) bool {
 
 const monotonicNowNs = diagnostics.monotonicNowNs;
 
+// ── PTY drain log coalescing ──
+//
+// The wayland-yield mid-drain (commit c879f1b) splits a producer's
+// single burst into many sub-millisecond per-iteration drains. We
+// want the first one to print so the user sees activity start; the
+// rest get rolled up and emitted as a summary when anything *other*
+// than a pty-drain log fires (via the flush hook below).
+var pty_drain_rollup_rounds: usize = 0;
+var pty_drain_rollup_bytes: usize = 0;
+var pty_drain_rollup_reads: usize = 0;
+var pty_drain_prev_was_drain: bool = false;
+
+fn logPtyDrain(bytes: usize, reads: usize) void {
+    if (!pty_drain_prev_was_drain) {
+        // First drain in a new burst — emit fully.
+        log.debug(.pty, "drained", .{ .reads = reads, .bytes = bytes });
+        pty_drain_prev_was_drain = true;
+        pty_drain_rollup_rounds = 0;
+        pty_drain_rollup_bytes = 0;
+        pty_drain_rollup_reads = 0;
+    } else {
+        // Already in a drain burst — accumulate, don't emit.
+        pty_drain_rollup_rounds += 1;
+        pty_drain_rollup_bytes += bytes;
+        pty_drain_rollup_reads += reads;
+    }
+}
+
+fn flushPtyDrainRollup() void {
+    if (pty_drain_rollup_rounds > 0) {
+        log.debug(.pty, "drained (rolled up)", .{
+            .more_rounds = pty_drain_rollup_rounds,
+            .reads = pty_drain_rollup_reads,
+            .bytes = pty_drain_rollup_bytes,
+        });
+    }
+    pty_drain_rollup_rounds = 0;
+    pty_drain_rollup_bytes = 0;
+    pty_drain_rollup_reads = 0;
+    pty_drain_prev_was_drain = false;
+}
+
 pub fn main(init: std.process.Init) !void {
     log.init();
+    log.setFlushHook(flushPtyDrainRollup);
     var state: app_state.AppState = .{};
     state.diag.markStart();
     const allocator = std.heap.smp_allocator;
@@ -342,16 +385,6 @@ pub fn main(init: std.process.Init) !void {
     var draining = false;
     var drain_deadline_ns: u64 = 0;
     const drain_timeout_ns: u64 = 250 * std.time.ns_per_ms;
-    // PTY drain stats coalesced across multiple main-loop iterations.
-    // With the wayland-yield mid-drain (see drain block below), a single
-    // logical burst gets split into many tiny per-iteration drains; per-
-    // iteration logging would dump dozens of lines per ms. Accumulate
-    // here and emit a single debug line at most every 100ms.
-    var pty_drain_bytes_acc: usize = 0;
-    var pty_drain_reads_acc: usize = 0;
-    var pty_drain_rounds_acc: usize = 0;
-    var pty_drain_last_log_ns: u64 = 0;
-    const pty_drain_log_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
     log.info(.main, "loop entry", .{});
 
@@ -738,21 +771,7 @@ pub fn main(init: std.process.Init) !void {
                 if (c.poll(@ptrCast(&peek), 1, 0) > 0 and peek.revents & c.POLLIN != 0) break;
             }
             if (drain_read_count > 0) {
-                pty_drain_bytes_acc += drain_total_bytes;
-                pty_drain_reads_acc += drain_read_count;
-                pty_drain_rounds_acc += 1;
-                const now_ns = monotonicNowNs();
-                if (now_ns - pty_drain_last_log_ns >= pty_drain_log_interval_ns) {
-                    log.debug(.pty, "drained", .{
-                        .reads = pty_drain_reads_acc,
-                        .bytes = pty_drain_bytes_acc,
-                        .rounds = pty_drain_rounds_acc,
-                    });
-                    pty_drain_bytes_acc = 0;
-                    pty_drain_reads_acc = 0;
-                    pty_drain_rounds_acc = 0;
-                    pty_drain_last_log_ns = now_ns;
-                }
+                logPtyDrain(drain_total_bytes, drain_read_count);
             }
         }
 

@@ -77,6 +77,17 @@ var process_start_ns: u64 = 0;
 /// Wallclock of the previous log emission, regardless of scope. Used
 /// to compute the "global delta" column shown left of the scope tag.
 var last_global_log_ns: u64 = 0;
+/// Optional hook fired immediately before any log line is rendered.
+/// Used by callers that coalesce repeated messages (e.g. main.zig's
+/// PTY drain rollup) to flush their summary when an unrelated log
+/// line arrives. The hook may itself call log functions; a thread-
+/// local re-entry guard suppresses infinite recursion.
+var flush_hook: ?*const fn () void = null;
+threadlocal var in_flush_hook: bool = false;
+
+pub fn setFlushHook(hook: ?*const fn () void) void {
+    flush_hook = hook;
+}
 var color_enabled: bool = false;
 var initialized: bool = false;
 var write_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t);
@@ -305,6 +316,17 @@ fn scopeTagBlockRuntime(scope: Scope) []const u8 {
 }
 
 fn emit(scope: Scope, level: Level, comptime msg: []const u8, data: anytype) void {
+    // Give callers that defer/coalesce log output one last chance to
+    // flush before this unrelated line lands. The hook can call back
+    // into log functions — `in_flush_hook` keeps that re-entry from
+    // looping. Skipped during the hook's own execution.
+    if (!in_flush_hook) {
+        if (flush_hook) |hook| {
+            in_flush_hook = true;
+            hook();
+            in_flush_hook = false;
+        }
+    }
     const ns = nowNs();
     const state = &scope_state[@intFromEnum(scope)];
     const start = if (initialized) process_start_ns else ns;
