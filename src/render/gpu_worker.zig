@@ -871,7 +871,7 @@ pub const GpuWorker = struct {
                         drm_timeline = null;
                     }
                     self.drm_syncobj_export_fd = -1;
-                    if (egl_fence_fns.available() and active_allocator.render_fd >= 0) {
+                    if (render_env.explicitSyncEnabled() and egl_fence_fns.available() and active_allocator.render_fd >= 0) {
                         drm_timeline = drm_sync.Timeline.init(active_allocator.render_fd) catch |e| blk: {
                             log.warn(.gpu, "drm syncobj init failed", .{ .err = e });
                             break :blk null;
@@ -880,6 +880,8 @@ pub const GpuWorker = struct {
                             self.drm_syncobj_export_fd = t.takeExportFd();
                             log.info(.gpu, "drm syncobj ready", .{ .export_fd = self.drm_syncobj_export_fd });
                         }
+                    } else if (!render_env.explicitSyncEnabled()) {
+                        log.info(.gpu, "explicit sync disabled (env)", .{});
                     }
 
                     log.info(.gpu, "configure ready", .{

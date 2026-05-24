@@ -147,9 +147,14 @@ pub var hint_mode_atomic: std.atomic.Value(u8) = .{ .raw = @intFromEnum(HintMode
 /// reason — adds ~50ns per fallback glyph per frame, so off by default.
 pub var hint_diag_enabled: bool = false;
 pub var direct_resolve_enabled: bool = false;
+pub var explicit_sync_enabled: bool = true;
 
 pub fn directResolveEnabled() bool {
     return direct_resolve_enabled;
+}
+
+pub fn explicitSyncEnabled() bool {
+    return explicit_sync_enabled;
 }
 
 fn truthy(value: []const u8) bool {
@@ -163,6 +168,18 @@ pub fn loadDirectResolveFromEnv() void {
     if (c.getenv("SCRGO_DIRECT_RESOLVE")) |value| {
         const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), " \t\r\n");
         direct_resolve_enabled = truthy(trimmed);
+    }
+}
+
+/// Kill switch for the wp_linux_drm_syncobj_v1 explicit-sync path.
+/// `SCRGO_EXPLICIT_SYNC=0` (or off/false) forces fall-back to the
+/// implicit glClientWaitSync stall, even if the compositor and EGL
+/// extension are both present. Useful for isolating sync-related
+/// rendering bugs.
+pub fn loadExplicitSyncFromEnv() void {
+    if (c.getenv("SCRGO_EXPLICIT_SYNC")) |value| {
+        const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), " \t\r\n");
+        explicit_sync_enabled = truthy(trimmed);
     }
 }
 
@@ -254,6 +271,7 @@ pub fn loadRenderConfigFromEnv() RenderConfig {
     }
     loadHintDiagFromEnv();
     loadDirectResolveFromEnv();
+    loadExplicitSyncFromEnv();
     return config;
 }
 
