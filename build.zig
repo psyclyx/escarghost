@@ -174,6 +174,10 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml", "linux-dmabuf-unstable-v1-client-protocol.h", "linux-dmabuf-unstable-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/primary-selection/primary-selection-unstable-v1.xml", "primary-selection-unstable-v1-client-protocol.h", "primary-selection-unstable-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/text-input/text-input-unstable-v3.xml", "text-input-unstable-v3-client-protocol.h", "text-input-unstable-v3-protocol.c");
+    // Explicit synchronization via DRM syncobj timelines. Local copy
+    // because wayland-protocols may ship newer versions than the
+    // compositor advertises; we pin a known revision.
+    addLocalProtocol(b, mod, opts.wayland_scanner, "protocol/linux-drm-syncobj-v1.xml", "linux-drm-syncobj-v1-client-protocol.h", "linux-drm-syncobj-v1-protocol.c");
 
     return mod;
 }

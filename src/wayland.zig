@@ -13,6 +13,7 @@ const wl = @cImport({
     @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
     @cInclude("primary-selection-unstable-v1-client-protocol.h");
     @cInclude("text-input-unstable-v3-client-protocol.h");
+    @cInclude("linux-drm-syncobj-v1-client-protocol.h");
 });
 
 const egl = @cImport({
@@ -101,6 +102,13 @@ pub const Wayland = struct {
     primary_selection_device: ?*wl.zwp_primary_selection_device_v1 = null,
     text_input_manager: ?*wl.zwp_text_input_manager_v3 = null,
     text_input: ?*wl.zwp_text_input_v3 = null,
+    /// Explicit-sync manager. Null = compositor doesn't advertise the
+    /// protocol; we fall back to implicit (driver-side) fencing and the
+    /// per-frame glClientWaitSync stall.
+    drm_syncobj_manager: ?*wl.wp_linux_drm_syncobj_manager_v1 = null,
+    /// Per-surface extension object — created lazily after we have a
+    /// surface AND the manager. Lifetime tied to the surface.
+    drm_syncobj_surface: ?*wl.wp_linux_drm_syncobj_surface_v1 = null,
     /// Client-side serial bumped on every text-input `commit` request.
     /// The server's `done` event echoes back the serial that was
     /// current when it processed our state — used by the protocol to
@@ -209,6 +217,8 @@ pub const Wayland = struct {
         self.primary_selection_device = null;
         self.text_input_manager = null;
         self.text_input = null;
+        self.drm_syncobj_manager = null;
+        self.drm_syncobj_surface = null;
         self.ti_serial = 0;
         self.ti_commit_len = 0;
         self.ti_focused = false;
@@ -400,6 +410,8 @@ pub const Wayland = struct {
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
         if (self.text_input) |ti| wl.zwp_text_input_v3_destroy(ti);
         if (self.text_input_manager) |mgr| wl.zwp_text_input_manager_v3_destroy(mgr);
+        if (self.drm_syncobj_surface) |s| wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
+        if (self.drm_syncobj_manager) |mgr| wl.wp_linux_drm_syncobj_manager_v1_destroy(mgr);
         if (self.primary_selection_device) |d| wl.zwp_primary_selection_device_v1_destroy(d);
         if (self.primary_selection_manager) |mgr| wl.zwp_primary_selection_device_manager_v1_destroy(mgr);
         if (self.data_device) |d| wl.wl_data_device_destroy(d);
@@ -601,6 +613,8 @@ pub const Wayland = struct {
             self.primary_selection_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_primary_selection_device_manager_v1_interface, 1));
         } else if (std.mem.eql(u8, iface, "zwp_text_input_manager_v3")) {
             self.text_input_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_text_input_manager_v3_interface, 1));
+        } else if (std.mem.eql(u8, iface, "wp_linux_drm_syncobj_manager_v1")) {
+            self.drm_syncobj_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_linux_drm_syncobj_manager_v1_interface, 1));
         }
     }
 
@@ -633,6 +647,17 @@ pub const Wayland = struct {
         if (self.text_input) |ti| {
             _ = wl.zwp_text_input_v3_add_listener(ti, &text_input_listener, @ptrCast(self));
         }
+    }
+
+    /// Attach the explicit-sync surface extension once we have both a
+    /// wl_surface and the manager global. Idempotent. Returns null when
+    /// either side is missing (we then fall back to implicit fencing).
+    pub fn ensureDrmSyncobjSurface(self: *Wayland) ?*wl.wp_linux_drm_syncobj_surface_v1 {
+        if (self.drm_syncobj_surface) |s| return s;
+        const mgr = self.drm_syncobj_manager orelse return null;
+        const surf = self.surface orelse return null;
+        self.drm_syncobj_surface = wl.wp_linux_drm_syncobj_manager_v1_get_surface(mgr, surf);
+        return self.drm_syncobj_surface;
     }
 
     fn registryGlobalRemove(_: ?*anyopaque, _: ?*wl.wl_registry, _: u32) callconv(.c) void {}
