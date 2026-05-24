@@ -437,13 +437,17 @@ pub const GpuWorker = struct {
     buffer_descs: [MaxBuffers]gpu_buffer.BufferDesc = [_]gpu_buffer.BufferDesc{.{}} ** MaxBuffers,
     buffer_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
     buffer_count: u8 = 0,
-    /// Explicit-sync timeline syncobj fd, populated by the worker
-    /// during configure (after it opens its DRM render node + creates
-    /// the timeline). The main thread reads this after `.ready` and
-    /// hands it to wayland via `wp_linux_drm_syncobj_manager_v1.import_timeline`.
-    /// Negative = no explicit-sync available (extension absent, or
-    /// init failed) — falls back to implicit fencing.
-    drm_syncobj_export_fd: c_int = -1,
+    /// Per-buffer DRM syncobj timeline fds. The wp_linux_drm_syncobj_v1
+    /// protocol explicitly warns against sharing a single timeline
+    /// across multiple buffers' release points (signaling a later point
+    /// retroactively signals earlier ones, which can fire wl_buffer.release
+    /// before the compositor is actually done reading the prior buffer).
+    /// One timeline per buffer sidesteps that entirely — each buffer's
+    /// acquire AND release points live on its own monotonic counter.
+    /// Negative entries = no explicit-sync available for that slot
+    /// (typically because EGL native fence sync is missing or the
+    /// kill-switch is set); falls back to implicit fencing.
+    drm_syncobj_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
 
     // GpuWorker-side state
     buffers: [MaxBuffers]gpu_buffer.FrontendBuffer = undefined,
@@ -726,12 +730,12 @@ pub const GpuWorker = struct {
         var current_width: u32 = 0;
         var current_height: u32 = 0;
 
-        // Explicit-sync state. Initialised lazily inside the configure
-        // handler once we have a DRM render fd from the dmabuf allocator.
-        // Both pieces are nullable so missing EGL extensions or a closed
-        // wayland manager cleanly fall back to implicit fencing.
-        var drm_timeline: ?drm_sync.Timeline = null;
-        defer if (drm_timeline) |*t| t.deinit();
+        // Explicit-sync state. One timeline per buffer so a release-point
+        // signal on one buffer can never retroactively signal a release
+        // on another (see drm_syncobj_v1 protocol note about shared
+        // timelines + out-of-order release).
+        var drm_timelines: [MaxBuffers]?drm_sync.Timeline = [_]?drm_sync.Timeline{null} ** MaxBuffers;
+        defer for (&drm_timelines) |*slot| if (slot.*) |*t| t.deinit();
         const egl_fence_fns = drm_sync.EglFenceFns.load();
         if (!egl_fence_fns.available()) {
             log.warn(.gpu, "egl native fence sync unavailable", .{});
@@ -862,23 +866,30 @@ pub const GpuWorker = struct {
                         active_allocator.targets[i].export_fd = -1; // Transfer ownership to main
                     }
 
-                    // (Re)create the DRM syncobj timeline now that we
-                    // have a render fd. Tear down any prior timeline —
-                    // its handle is bound to the prior render fd which
-                    // we're about to drop when allocator_state churns.
-                    if (drm_timeline) |*t| {
+                    // (Re)create one DRM syncobj timeline per buffer now
+                    // that we have a render fd. Tear down any prior
+                    // timelines — their handles are bound to the prior
+                    // render fd which we're about to drop when
+                    // allocator_state churns.
+                    for (&drm_timelines) |*slot| if (slot.*) |*t| {
                         t.deinit();
-                        drm_timeline = null;
-                    }
-                    self.drm_syncobj_export_fd = -1;
+                        slot.* = null;
+                    };
+                    self.drm_syncobj_export_fds = [_]c_int{-1} ** MaxBuffers;
                     if (render_env.explicitSyncEnabled() and egl_fence_fns.available() and active_allocator.render_fd >= 0) {
-                        drm_timeline = drm_sync.Timeline.init(active_allocator.render_fd) catch |e| blk: {
-                            log.warn(.gpu, "drm syncobj init failed", .{ .err = e });
-                            break :blk null;
-                        };
-                        if (drm_timeline) |*t| {
-                            self.drm_syncobj_export_fd = t.takeExportFd();
-                            log.info(.gpu, "drm syncobj ready", .{ .export_fd = self.drm_syncobj_export_fd });
+                        var ready_count: usize = 0;
+                        for (0..active_allocator.count) |i| {
+                            drm_timelines[i] = drm_sync.Timeline.init(active_allocator.render_fd) catch |e| blk: {
+                                log.warn(.gpu, "drm syncobj init failed", .{ .buffer = i, .err = e });
+                                break :blk null;
+                            };
+                            if (drm_timelines[i]) |*t| {
+                                self.drm_syncobj_export_fds[i] = t.takeExportFd();
+                                ready_count += 1;
+                            }
+                        }
+                        if (ready_count > 0) {
+                            log.info(.gpu, "drm syncobj ready", .{ .timelines = ready_count });
                         }
                     } else if (!render_env.explicitSyncEnabled()) {
                         log.info(.gpu, "explicit sync disabled (env)", .{});
@@ -1048,21 +1059,25 @@ pub const GpuWorker = struct {
                     var acquire_point: u64 = 0;
                     var release_point: u64 = 0;
                     const gpu_wait_t0 = monotonicNs();
-                    if (drm_timeline) |*t| {
-                        const point = t.nextPoint();
-                        // Burn the next point as release. The compositor
-                        // signals it when done; we don't currently wait
-                        // on it (frame_done callback gates the next
-                        // render). Released here so it can't collide
-                        // with subsequent acquire points.
-                        const release = t.nextPoint();
-                        if (t.signalFromEgl(egl.display, egl_fence_fns, point)) {
-                            acquire_point = point;
-                            release_point = release;
-                        } else |signal_err| {
-                            log.warn(.gpu, "drm syncobj signal failed; falling back to fence wait", .{
-                                .err = signal_err,
-                            });
+                    if (request.buffer_index < MaxBuffers) {
+                        if (drm_timelines[request.buffer_index]) |*t| {
+                            const point = t.nextPoint();
+                            // Burn the next point as release. The
+                            // compositor signals it when done; we don't
+                            // currently wait on it (frame_done callback
+                            // gates the next render). One timeline per
+                            // buffer means this release point can never
+                            // accidentally signal an earlier buffer's
+                            // release.
+                            const release = t.nextPoint();
+                            if (t.signalFromEgl(egl.display, egl_fence_fns, point)) {
+                                acquire_point = point;
+                                release_point = release;
+                            } else |signal_err| {
+                                log.warn(.gpu, "drm syncobj signal failed; falling back to fence wait", .{
+                                    .err = signal_err,
+                                });
+                            }
                         }
                     }
                     if (acquire_point == 0) {

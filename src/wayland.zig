@@ -109,9 +109,13 @@ pub const Wayland = struct {
     /// Per-surface extension object — created lazily after we have a
     /// surface AND the manager. Lifetime tied to the surface.
     drm_syncobj_surface: ?*wl.wp_linux_drm_syncobj_surface_v1 = null,
-    /// Timeline proxy backed by the GPU worker's DRM syncobj. Set by
-    /// `importDrmSyncobjTimeline` once after configure completes.
-    drm_syncobj_timeline: ?*wl.wp_linux_drm_syncobj_timeline_v1 = null,
+    /// Per-buffer timeline proxies, indexed by buffer slot. One per
+    /// dmabuf so each buffer's release point lives on its own
+    /// monotonic counter (see the protocol's note about shared
+    /// timelines + out-of-order release signaling). Populated by
+    /// `importDrmSyncobjTimelines` once after configure. Cap of 4
+    /// covers MaxBuffers=3 with room to spare; extra slots stay null.
+    drm_syncobj_timelines: [4]?*wl.wp_linux_drm_syncobj_timeline_v1 = [_]?*wl.wp_linux_drm_syncobj_timeline_v1{null} ** 4,
     /// Client-side serial bumped on every text-input `commit` request.
     /// The server's `done` event echoes back the serial that was
     /// current when it processed our state — used by the protocol to
@@ -222,7 +226,7 @@ pub const Wayland = struct {
         self.text_input = null;
         self.drm_syncobj_manager = null;
         self.drm_syncobj_surface = null;
-        self.drm_syncobj_timeline = null;
+        self.drm_syncobj_timelines = [_]?*wl.wp_linux_drm_syncobj_timeline_v1{null} ** 4;
         self.ti_serial = 0;
         self.ti_commit_len = 0;
         self.ti_focused = false;
@@ -414,7 +418,12 @@ pub const Wayland = struct {
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
         if (self.text_input) |ti| wl.zwp_text_input_v3_destroy(ti);
         if (self.text_input_manager) |mgr| wl.zwp_text_input_manager_v3_destroy(mgr);
-        if (self.drm_syncobj_timeline) |t| wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
+        for (&self.drm_syncobj_timelines) |*slot| {
+            if (slot.*) |t| {
+                wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
+                slot.* = null;
+            }
+        }
         if (self.drm_syncobj_surface) |s| wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
         if (self.drm_syncobj_manager) |mgr| wl.wp_linux_drm_syncobj_manager_v1_destroy(mgr);
         if (self.primary_selection_device) |d| wl.zwp_primary_selection_device_v1_destroy(d);
@@ -678,39 +687,52 @@ pub const Wayland = struct {
         }
     }
 
-    /// Import a DRM syncobj fd as a wayland timeline proxy. The fd is
-    /// consumed (closed by us after the import call — the compositor
-    /// dups internally). Idempotent: returns the existing timeline if
-    /// already imported, closing the provided fd. Returns null if the
-    /// manager isn't available.
-    pub fn importDrmSyncobjTimeline(self: *Wayland, syncobj_fd: c_int) ?*wl.wp_linux_drm_syncobj_timeline_v1 {
-        if (self.drm_syncobj_timeline) |t| {
+    /// Import a per-buffer DRM syncobj fd as a wayland timeline proxy
+    /// at `buffer_index`. The fd is consumed (closed by us after the
+    /// import call — the compositor dups internally). No-ops when the
+    /// slot is already populated, the buffer index is out of range,
+    /// or the manager isn't available. The provided fd is closed in
+    /// every case.
+    pub fn importDrmSyncobjTimeline(self: *Wayland, buffer_index: usize, syncobj_fd: c_int) void {
+        if (buffer_index >= self.drm_syncobj_timelines.len) {
             _ = std.c.close(syncobj_fd);
-            return t;
+            return;
+        }
+        if (self.drm_syncobj_timelines[buffer_index] != null) {
+            _ = std.c.close(syncobj_fd);
+            return;
         }
         const mgr = self.drm_syncobj_manager orelse {
             _ = std.c.close(syncobj_fd);
-            return null;
+            return;
         };
         const timeline = wl.wp_linux_drm_syncobj_manager_v1_import_timeline(mgr, syncobj_fd);
         _ = std.c.close(syncobj_fd);
-        self.drm_syncobj_timeline = timeline;
-        return timeline;
+        self.drm_syncobj_timelines[buffer_index] = timeline;
     }
 
-    /// Set the explicit-sync acquire + release points on the surface
-    /// for the next commit. Caller must ensure both
-    /// `drm_syncobj_surface` and `drm_syncobj_timeline` are available
-    /// (typically by checking the return of `ensureDrmSyncobjSurface`
-    /// and `importDrmSyncobjTimeline`). Returns true when the call
-    /// was made, false if any prerequisite was missing.
+    /// True iff the buffer at `buffer_index` has an imported timeline
+    /// (i.e. is wired for explicit sync). Callers use this to decide
+    /// whether to take the explicit-sync commit path or fall through.
+    pub fn drmSyncobjTimelineAvailable(self: *const Wayland, buffer_index: usize) bool {
+        if (buffer_index >= self.drm_syncobj_timelines.len) return false;
+        return self.drm_syncobj_timelines[buffer_index] != null;
+    }
+
+    /// Set explicit-sync acquire + release points on the surface for
+    /// the next commit, using the per-buffer timeline corresponding to
+    /// `buffer_index`. Returns true when the call was made, false if
+    /// any prerequisite was missing (no surface ext, no timeline,
+    /// buffer_index out of range).
     pub fn setDrmSyncobjPoints(
         self: *Wayland,
+        buffer_index: usize,
         acquire_point: u64,
         release_point: u64,
     ) bool {
         const surf = self.drm_syncobj_surface orelse return false;
-        const timeline = self.drm_syncobj_timeline orelse return false;
+        if (buffer_index >= self.drm_syncobj_timelines.len) return false;
+        const timeline = self.drm_syncobj_timelines[buffer_index] orelse return false;
         wl.wp_linux_drm_syncobj_surface_v1_set_acquire_point(
             surf,
             timeline,

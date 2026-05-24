@@ -493,22 +493,26 @@ pub fn main(init: std.process.Init) !void {
                                 render_loop.noteGpuUnavailable(&state);
                                 continue;
                             };
-                            // Wire up explicit sync if the worker
-                            // created a syncobj timeline and the
-                            // compositor advertises the manager. Both
-                            // are optional; missing either falls back
-                            // to implicit fencing.
-                            if (gpu.drm_syncobj_export_fd >= 0) {
+                            // Wire up per-buffer explicit-sync timelines.
+                            // Each buffer slot has its own monotonic
+                            // counter; sharing one timeline across
+                            // buffers can fire release retroactively
+                            // (see drm_syncobj_v1 protocol note).
+                            var imported: usize = 0;
+                            for (gpu.drm_syncobj_export_fds[0..], 0..) |*fd_slot, i| {
+                                if (fd_slot.* < 0) continue;
+                                const fd = fd_slot.*;
+                                fd_slot.* = -1;
+                                wl.importDrmSyncobjTimeline(i, fd);
+                                if (wl.drmSyncobjTimelineAvailable(i)) imported += 1;
+                            }
+                            if (imported > 0) {
                                 _ = wl.ensureDrmSyncobjSurface();
-                                const fd = gpu.drm_syncobj_export_fd;
-                                gpu.drm_syncobj_export_fd = -1;
-                                if (wl.importDrmSyncobjTimeline(fd)) |_| {
-                                    log.info(.gpu, "explicit sync ready", .{});
-                                } else {
-                                    log.info(.gpu, "explicit sync unavailable", .{
-                                        .reason = "no compositor manager",
-                                    });
-                                }
+                                log.info(.gpu, "explicit sync ready", .{ .timelines = imported });
+                            } else if (gpu.drm_syncobj_export_fds[0] >= 0) {
+                                log.info(.gpu, "explicit sync unavailable", .{
+                                    .reason = "no compositor manager",
+                                });
                             }
                             state.render.gpu_snapshot_dirty = true;
                             state.render.gpu_restart.clear();
@@ -538,7 +542,7 @@ pub fn main(init: std.process.Init) !void {
                                 const release: u64 = (@as(u64, resp.release_point_hi) << 32) | resp.release_point_lo;
                                 if (acquire != 0) {
                                     _ = wl.ensureDrmSyncobjSurface();
-                                    _ = wl.setDrmSyncobjPoints(acquire, release);
+                                    _ = wl.setDrmSyncobjPoints(resp.buffer_index, acquire, release);
                                 }
                                 // Commit immediately. If the compositor
                                 // still has the prior frame pending,
