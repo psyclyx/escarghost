@@ -531,9 +531,15 @@ pub fn main(init: std.process.Init) !void {
                                 // work via the timeline rather than
                                 // sampling whenever it likes. set_*
                                 // requests apply to the next commit.
+                                // We may have cleared the extension on
+                                // a recent switch to CPU — re-attach
+                                // before setting points.
                                 const acquire: u64 = (@as(u64, resp.acquire_point_hi) << 32) | resp.acquire_point_lo;
                                 const release: u64 = (@as(u64, resp.release_point_hi) << 32) | resp.release_point_lo;
-                                if (acquire != 0) _ = wl.setDrmSyncobjPoints(acquire, release);
+                                if (acquire != 0) {
+                                    _ = wl.ensureDrmSyncobjSurface();
+                                    _ = wl.setDrmSyncobjPoints(acquire, release);
+                                }
                                 // Commit immediately. If the compositor
                                 // still has the prior frame pending,
                                 // this commit replaces it in the
@@ -589,6 +595,14 @@ pub fn main(init: std.process.Init) !void {
                         const path_ok = state.render.active_render_path == .cpu;
                         const size_ok = cpu.width == wl.width and cpu.height == wl.height;
                         if (buffer_ok and path_ok and size_ok) {
+                            // CPU buffers don't carry explicit-sync
+                            // points. If the syncobj surface extension
+                            // is still attached from a prior GPU
+                            // commit, the compositor will raise
+                            // no_acquire_point on this commit; tear it
+                            // down first. The GPU `.frame` path
+                            // re-attaches lazily before each commit.
+                            wl.clearDrmSyncobjSurface();
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                             state.diag.recordCommit('c');
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);

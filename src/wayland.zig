@@ -665,6 +665,19 @@ pub const Wayland = struct {
         return self.drm_syncobj_surface;
     }
 
+    /// Tear down the per-surface extension so subsequent commits don't
+    /// need acquire/release points. Required before any commit that
+    /// won't carry sync points (e.g. a CPU-rendered SHM buffer) —
+    /// otherwise the compositor raises wp_linux_drm_syncobj_surface_v1
+    /// error 4 (`no_acquire_point`) and tears down the surface.
+    /// Idempotent.
+    pub fn clearDrmSyncobjSurface(self: *Wayland) void {
+        if (self.drm_syncobj_surface) |s| {
+            wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
+            self.drm_syncobj_surface = null;
+        }
+    }
+
     /// Import a DRM syncobj fd as a wayland timeline proxy. The fd is
     /// consumed (closed by us after the import call — the compositor
     /// dups internally). Idempotent: returns the existing timeline if
