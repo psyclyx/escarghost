@@ -629,6 +629,13 @@ pub fn main(init: std.process.Init) !void {
             // user sees the output scroll by. 4 ms is roughly a
             // quarter vblank — enough headroom that a slow feedData
             // call (atlas miss, etc.) won't push past one full frame.
+            //
+            // We also yield as soon as new wayland events arrive
+            // (typically frame_done): otherwise the next commit waits
+            // until the drain completes — up to budget_ns of latency on
+            // the frame callback path. PTY POLLIN is level-triggered,
+            // so a partial drain just continues on the next iteration.
+            const wl_fd = wl.displayFd();
             const read_start_ns = monotonicNowNs();
             const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
             while (true) {
@@ -663,6 +670,11 @@ pub fn main(init: std.process.Init) !void {
                 state.lifecycle.first_pty_data_seen = true;
                 render_loop.markRenderDirty(&state);
                 if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
+                // Wayland events queued during the drain? Yield so the
+                // next iteration's prepare_read/poll picks them up
+                // before more PTY pours in.
+                var peek = c.struct_pollfd{ .fd = wl_fd, .events = c.POLLIN, .revents = 0 };
+                if (c.poll(@ptrCast(&peek), 1, 0) > 0 and peek.revents & c.POLLIN != 0) break;
             }
         }
 
