@@ -11,12 +11,18 @@ const config_mod = @import("config_mod");
 
 const c = @cImport({
     @cInclude("pty.h");
-    @cInclude("unistd.h");
     @cInclude("fcntl.h");
     @cInclude("poll.h");
 });
 
 const ghostty_c = @cImport(@cInclude("ghostty/vt.h"));
+
+/// Build a thread-safe `Io` instance for tests. The caller must keep
+/// `t` alive for as long as `io` is used.
+fn testIo(t: *std.Io.Threaded) std.Io {
+    t.* = std.Io.Threaded.init(testing.allocator, .{});
+    return t.io();
+}
 
 const PtyPair = struct {
     master: c_int,
@@ -33,22 +39,18 @@ fn openPair() !PtyPair {
 }
 
 fn closePair(p: PtyPair) void {
-    _ = c.close(p.master);
-    _ = c.close(p.slave);
+    std.c.close(p.master);
+    std.c.close(p.slave);
 }
 
-fn writeAll(fd: c_int, data: []const u8) !void {
-    var off: usize = 0;
-    while (off < data.len) {
-        const n = c.write(fd, data.ptr + off, data.len - off);
-        if (n < 0) return error.WriteFailed;
-        off += @intCast(n);
-    }
+fn writeAll(io: std.Io, fd: c_int, data: []const u8) !void {
+    const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    file.writeStreamingAll(io, data) catch return error.WriteFailed;
 }
 
 /// Poll-wait for `master` to become readable, then drain everything
 /// currently buffered. Caller picks a deadline. Returns total bytes read.
-fn waitAndDrain(fd: c_int, out: []u8, timeout_ms: c_int) !usize {
+fn waitAndDrain(io: std.Io, fd: c_int, out: []u8, timeout_ms: c_int) !usize {
     var total: usize = 0;
     var poll_timeout = timeout_ms;
     while (total < out.len) {
@@ -57,10 +59,15 @@ fn waitAndDrain(fd: c_int, out: []u8, timeout_ms: c_int) !usize {
         if (rc < 0) return error.PollFailed;
         if (rc == 0) break;
         if (pfd.revents & c.POLLIN == 0) break;
+        const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = true } };
         while (total < out.len) {
-            const n = c.read(fd, out.ptr + total, out.len - total);
-            if (n <= 0) break;
-            total += @intCast(n);
+            const n = file.readStreaming(io, &.{out[total..]}) catch |err| switch (err) {
+                error.WouldBlock => break,
+                error.EndOfStream => break,
+                else => break,
+            };
+            if (n == 0) break;
+            total += n;
         }
         // Kernel may deliver echo in pieces — give it one short follow-up
         // poll before giving up.
@@ -113,20 +120,20 @@ const cases = [_]Case{
     .{ .name = "newline row1", .send = "ab\ncd", .row = 1, .expect = "cd" },
 };
 
-fn runRoundTripCase(cfg: *const config_mod.Config, case: Case) !void {
+fn runRoundTripCase(io: std.Io, cfg: *const config_mod.Config, case: Case) !void {
     const cols: u16 = 40;
     const rows: u16 = 4;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(cols, rows, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, cols, rows, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     const pair = try openPair();
     defer closePair(pair);
 
-    try writeAll(pair.master, case.send);
+    try writeAll(io, pair.master, case.send);
 
     var rbuf: [256]u8 = undefined;
-    const n = try waitAndDrain(pair.master, &rbuf, 200);
+    const n = try waitAndDrain(io, pair.master, &rbuf, 200);
     if (n == 0) {
         std.debug.print("case [{s}]: PTY produced no echo (line-discipline state?)\n", .{case.name});
         return error.NoEcho;
@@ -146,19 +153,23 @@ fn runRoundTripCase(cfg: *const config_mod.Config, case: Case) !void {
 
 test "PTY echo round-trip lands in the expected cells" {
     const allocator = testing.allocator;
-    var cfg = try config_mod.load(allocator, null);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try config_mod.load(allocator, io, null);
     defer cfg.deinit(allocator);
 
-    for (cases) |case| try runRoundTripCase(&cfg, case);
+    for (cases) |case| try runRoundTripCase(io, &cfg, case);
 }
 
 test "encodeKey returns non-empty bytes for the common special keys" {
     const allocator = testing.allocator;
-    var cfg = try config_mod.load(allocator, null);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try config_mod.load(allocator, io, null);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     const specials = [_]struct { key: c_uint, label: []const u8 }{

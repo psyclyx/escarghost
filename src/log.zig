@@ -39,6 +39,11 @@ const c = @cImport({
     @cInclude("pthread.h");
 });
 
+/// Process-wide `Io` instance, stored once in `init()` so the logger
+/// can write through `std.Io.File` without threading `io` through every
+/// call site. Thread-safe (Threaded implementation).
+var log_io: std.Io = undefined;
+
 pub const Scope = enum {
     main,
     gpu,
@@ -137,7 +142,8 @@ fn nowNs() u64 {
         @as(u64, @intCast(ts.tv_nsec));
 }
 
-pub fn init() void {
+pub fn init(io: std.Io) void {
+    log_io = io;
     process_start_ns = nowNs();
     _ = c.pthread_mutex_init(&write_mutex, null);
     initialized = true;
@@ -495,5 +501,5 @@ fn writeValue(line: *Line, value: anytype) void {
 fn flush(bytes: []const u8) void {
     _ = c.pthread_mutex_lock(&write_mutex);
     defer _ = c.pthread_mutex_unlock(&write_mutex);
-    _ = c.write(2, bytes.ptr, bytes.len);
+    std.Io.File.stderr().writeStreamingAll(log_io, bytes) catch {};
 }

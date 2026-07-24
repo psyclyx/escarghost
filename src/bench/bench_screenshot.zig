@@ -11,11 +11,6 @@ const h = @import("wlr_harness");
 const posix = h.posix;
 const spec_mod = @import("bench_spec.zig");
 
-const c = @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-});
-
 pub const Options = struct {
     sh_bin: []const u8,
     /// Fixed payload echo'd into each terminal so we're comparing
@@ -27,7 +22,7 @@ pub const Options = struct {
     out_dir: []const u8 = "/tmp",
 };
 
-pub fn captureOne(harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !void {
+pub fn captureOne(io: std.Io, harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !void {
     // We use `printf` rather than `echo -e` because the latter's
     // behavior across shells/builtins varies.
     var script_buf: [4096]u8 = undefined;
@@ -63,18 +58,20 @@ pub fn captureOne(harness: *h.Harness, spec: spec_mod.TerminalSpec, bin: []const
 
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&path_buf, "{s}/bench-{s}.ppm", .{ opts.out_dir, spec.label });
-    try writePpm(path, frame, width, height, stride, fmt);
+    try writePpm(io, path, frame, width, height, stride, fmt);
     std.debug.print("{s:<10}  {s}\n", .{ spec.label, path });
 }
 
-fn writePpm(path: [:0]const u8, frame: []const u8, width: u32, height: u32, stride: u32, fmt: h.PixelFmt) !void {
-    const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = c.close(fd);
+fn writePpm(io: std.Io, path: [:0]const u8, frame: []const u8, width: u32, height: u32, stride: u32, fmt: h.PixelFmt) !void {
+    const file = std.Io.Dir.cwd.createFile(io, path, .{ .read = false, .truncate = true }) catch return error.OpenFailed;
+    defer file.close(io);
+
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
 
     var hdr_buf: [64]u8 = undefined;
     const hdr = try std.fmt.bufPrint(&hdr_buf, "P6\n{} {}\n255\n", .{ width, height });
-    if (c.write(fd, hdr.ptr, hdr.len) != @as(isize, @intCast(hdr.len))) return error.WriteFailed;
+    try writer.interface.writeAll(hdr);
 
     // Stream rows. PPM expects tightly-packed RGB, no padding; the
     // input has `stride` bytes per row which may include alpha/padding.
@@ -92,6 +89,7 @@ fn writePpm(path: [:0]const u8, frame: []const u8, width: u32, height: u32, stri
             row_buf[out_off + 2] = frame[in_off + fmt.b_off];
         }
         const row_len: usize = @intCast(width * 3);
-        if (c.write(fd, &row_buf, row_len) != @as(isize, @intCast(row_len))) return error.WriteFailed;
+        try writer.interface.writeAll(row_buf[0..row_len]);
     }
+    try writer.interface.flush();
 }

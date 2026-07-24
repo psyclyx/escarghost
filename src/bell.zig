@@ -23,7 +23,6 @@ const std = @import("std");
 
 const c = @cImport({
     @cInclude("stdlib.h");
-    @cInclude("unistd.h");
     @cInclude("fcntl.h");
     @cInclude("string.h");
     @cInclude("errno.h");
@@ -78,6 +77,7 @@ const sample_count: usize = (@as(usize, sample_rate) * 260) / 1000; // ~260 ms t
 
 pub const Manager = struct {
     cfg: Config = .{},
+    io: std.Io = undefined,
 
     /// Set to monotonic-ns deadline when a visual bell is in progress.
     /// Zero when no visual is active. Updated on every ring() so back-
@@ -100,8 +100,8 @@ pub const Manager = struct {
     allocator: std.mem.Allocator = undefined,
     stop_requested: std.atomic.Value(bool) = .init(false),
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) !Manager {
-        var self: Manager = .{ .cfg = cfg, .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !Manager {
+        var self: Manager = .{ .cfg = cfg, .allocator = allocator, .io = io };
         if (cfg.mode == .audible or cfg.mode == .both) {
             try self.startAudio();
         }
@@ -114,13 +114,14 @@ pub const Manager = struct {
             // Wake the worker if it's blocked on read().
             if (self.pipe_fds[1] >= 0) {
                 const byte: u8 = 0;
-                _ = c.write(self.pipe_fds[1], &byte, 1);
+                const file = std.Io.File{ .handle = self.pipe_fds[1], .flags = .{ .nonblocking = false } };
+                file.writeStreamingAll(self.io, &.{byte}) catch {};
             }
             self.audio_thread.?.join();
             self.audio_thread = null;
         }
-        if (self.pipe_fds[0] >= 0) _ = c.close(self.pipe_fds[0]);
-        if (self.pipe_fds[1] >= 0) _ = c.close(self.pipe_fds[1]);
+        if (self.pipe_fds[0] >= 0) std.c.close(self.pipe_fds[0]);
+        if (self.pipe_fds[1] >= 0) std.c.close(self.pipe_fds[1]);
         self.pipe_fds = .{ -1, -1 };
         if (self.pcm.len != 0) {
             self.allocator.free(self.pcm);
@@ -143,7 +144,9 @@ pub const Manager = struct {
                 const token: u8 = 1;
                 // EAGAIN on a full pipe → drop this beep (already
                 // queued plenty). Otherwise count it as fired.
-                if (c.write(self.pipe_fds[1], &token, 1) == 1) {
+                const file = std.Io.File{ .handle = self.pipe_fds[1], .flags = .{ .nonblocking = true } };
+                const n = file.writeStreaming(self.io, &.{}, &.{&.{token}}, 1) catch 0;
+                if (n >= 1) {
                     self.next_audible_allowed_ns = now + @as(u64, self.cfg.audible_debounce_ms) * std.time.ns_per_ms;
                 }
             }
@@ -195,8 +198,7 @@ pub const Manager = struct {
     }
 
     fn startAudio(self: *Manager) !void {
-        var fds: [2]c_int = undefined;
-        if (c.pipe(&fds) != 0) return error.PipeFailed;
+        const fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return error.PipeFailed;
         // Non-blocking write so `ring()` can never stall on a full pipe.
         const flags = c.fcntl(fds[1], c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(fds[1], c.F_SETFL, flags | c.O_NONBLOCK);
@@ -219,8 +221,12 @@ pub const Manager = struct {
 
         while (!self.stop_requested.load(.acquire)) {
             var byte: u8 = 0;
-            const n = c.read(self.pipe_fds[0], &byte, 1);
-            if (n <= 0) {
+            const file = std.Io.File{ .handle = self.pipe_fds[0], .flags = .{ .nonblocking = false } };
+            const n = file.readStreaming(self.io, &.{&.{byte}}) catch {
+                if (self.stop_requested.load(.acquire)) return;
+                continue;
+            };
+            if (n == 0) {
                 if (self.stop_requested.load(.acquire)) return;
                 continue;
             }

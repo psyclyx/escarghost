@@ -30,7 +30,7 @@ pub const SharedBuffer = struct {
 
         const fd = c.memfd_create("scrgo-cpu-shm", @as(c_uint, 0));
         if (fd < 0) return error.MemfdCreateFailed;
-        errdefer _ = c.close(fd);
+        errdefer std.c.close(fd);
 
         if (c.ftruncate(fd, @intCast(size)) < 0) return error.TruncateFailed;
 
@@ -73,7 +73,7 @@ pub const SharedBuffer = struct {
         if (self.wl_buffer) |buffer| wl.wl_buffer_destroy(buffer);
         if (self.wl_pool) |pool| wl.wl_shm_pool_destroy(pool);
         if (self.map_ptr) |map_ptr| _ = c.munmap(map_ptr, self.desc.size);
-        if (self.desc.fd >= 0) _ = c.close(self.desc.fd);
+        if (self.desc.fd >= 0) std.c.close(self.desc.fd);
     }
 
     pub fn fillBackground(self: *SharedBuffer, r: u8, g: u8, b: u8) void {

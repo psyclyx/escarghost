@@ -12,12 +12,13 @@ const c = @cImport({
 pub const Pty = struct {
     master_fd: std.posix.fd_t,
     child_pid: c.pid_t,
+    io: std.Io = undefined,
 
-    pub fn spawn(shell: []const u8, cols: u16, rows: u16) !Pty {
-        return spawnCommand(&[_][]const u8{shell}, cols, rows);
+    pub fn spawn(io: std.Io, shell: []const u8, cols: u16, rows: u16) !Pty {
+        return spawnCommand(io, &[_][]const u8{shell}, cols, rows);
     }
 
-    pub fn spawnCommand(argv: []const []const u8, cols: u16, rows: u16) !Pty {
+    pub fn spawnCommand(io: std.Io, argv: []const []const u8, cols: u16, rows: u16) !Pty {
         if (argv.len == 0) return error.EmptyArgv;
         var master: c_int = undefined;
         var slave: c_int = undefined;
@@ -25,7 +26,7 @@ pub const Pty = struct {
         if (c.openpty(&master, &slave, null, null, null) != 0) {
             return error.OpenPtyFailed;
         }
-        errdefer _ = c.close(master);
+        errdefer std.c.close(master);
 
         // Set initial terminal size on the slave
         var ws: c.winsize = .{
@@ -41,14 +42,14 @@ pub const Pty = struct {
 
         if (pid == 0) {
             // ── Child process ──
-            _ = c.close(master);
+            std.c.close(master);
             _ = c.setsid();
             _ = c.ioctl(slave, c.TIOCSCTTY, @as(c_int, 0));
 
             _ = c.dup2(slave, c.STDIN_FILENO);
             _ = c.dup2(slave, c.STDOUT_FILENO);
             _ = c.dup2(slave, c.STDERR_FILENO);
-            if (slave > c.STDERR_FILENO) _ = c.close(slave);
+            if (slave > c.STDERR_FILENO) std.c.close(slave);
 
             // Build null-terminated argv for exec
             var c_argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
@@ -68,7 +69,7 @@ pub const Pty = struct {
         }
 
         // ── Parent process ──
-        _ = c.close(slave);
+        std.c.close(slave);
 
         // Set master to non-blocking
         const flags = c.fcntl(master, c.F_GETFL, @as(c_int, 0));
@@ -77,6 +78,7 @@ pub const Pty = struct {
         return .{
             .master_fd = master,
             .child_pid = pid,
+            .io = io,
         };
     }
 
@@ -91,37 +93,31 @@ pub const Pty = struct {
     }
 
     pub fn read(self: *Pty, buf: []u8) !usize {
-        const n = c.read(self.master_fd, buf.ptr, buf.len);
-        if (n < 0) {
-            const errno = std.c._errno().*;
-            if (errno == @intFromEnum(std.posix.E.AGAIN) or
-                errno == @intFromEnum(std.posix.E.AGAIN))
-                return error.WouldBlock;
-            if (errno == @intFromEnum(std.posix.E.IO))
-                return 0; // EIO on PTY means child exited
-            return error.ReadFailed;
-        }
-        return @intCast(n);
+        const file = std.Io.File{ .handle = self.master_fd, .flags = .{ .nonblocking = true } };
+        const n = file.readStreaming(self.io, &.{buf}) catch |err| switch (err) {
+            error.WouldBlock => return error.WouldBlock,
+            error.EndOfStream => return 0, // EIO on PTY means child exited
+            else => return error.ReadFailed,
+        };
+        return n;
     }
 
     pub fn write(self: *Pty, data: []const u8) !void {
+        const file = std.Io.File{ .handle = self.master_fd, .flags = .{ .nonblocking = true } };
         var written: usize = 0;
         while (written < data.len) {
-            const n = c.write(self.master_fd, data.ptr + written, data.len - written);
-            if (n < 0) {
-                const errno = std.c._errno().*;
-                if (errno == @intFromEnum(std.posix.E.AGAIN) or
-                    errno == @intFromEnum(std.posix.E.AGAIN))
-                    continue;
-                return error.WriteFailed;
-            }
-            written += @intCast(n);
+            const n = file.writeStreaming(self.io, &.{}, &.{data[written..]}, 1) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return error.WriteFailed,
+            };
+            if (n == 0) continue;
+            written += n;
         }
     }
 
     pub fn close(self: *Pty) void {
         if (self.master_fd >= 0) {
-            _ = c.close(self.master_fd);
+            std.c.close(self.master_fd);
             self.master_fd = -1;
         }
         if (self.child_pid > 0) {

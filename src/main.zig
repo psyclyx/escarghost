@@ -21,7 +21,6 @@ const bell_mod = @import("bell.zig");
 const c = @cImport({
     @cInclude("poll.h");
     @cInclude("stdlib.h");
-    @cInclude("stdio.h");
     @cInclude("unistd.h");
 });
 
@@ -92,10 +91,12 @@ fn flushPtyDrainRollup() void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    log.init();
+    const io = init.io;
+    log.init(io);
     log.setFlushHook(flushPtyDrainRollup);
     var state: app_state.AppState = .{};
-    state.diag.markStart();
+    state.io = io;
+    state.diag.markStart(io);
     const allocator = std.heap.smp_allocator;
     _ = init.gpa;
 
@@ -107,27 +108,34 @@ pub fn main(init: std.process.Init) !void {
         while (it.next()) |arg| try argv_list.append(allocator, arg);
     }
     const cli_args = cli.parse(argv_list.items) catch |err| {
-        var stdout = cli.fdWriter(1);
-        var stderr = cli.fdWriter(2);
+        var stdout_buf: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+        var stderr_buf: [4096]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
         switch (err) {
             error.HelpRequested => {
-                cli.printUsage(&stdout.writer) catch {};
+                cli.printUsage(&stdout.interface) catch {};
+                stdout.interface.flush() catch {};
                 c._exit(0);
             },
             error.VersionRequested => {
-                stdout.writer.writeAll(cli.version_string ++ "\n") catch {};
+                stdout.interface.writeAll(cli.version_string ++ "\n") catch {};
+                stdout.interface.flush() catch {};
                 c._exit(0);
             },
             error.BadArgs => {
-                stderr.writer.writeAll("scrgo: invalid arguments\n") catch {};
-                cli.printUsage(&stderr.writer) catch {};
+                stderr.interface.writeAll("scrgo: invalid arguments\n") catch {};
+                cli.printUsage(&stderr.interface) catch {};
+                stderr.interface.flush() catch {};
                 c._exit(2);
             },
         }
     };
     if (cli_args.generate_completion) |shell| {
-        var stdout = cli.fdWriter(1);
-        cli.writeCompletion(&stdout.writer, shell) catch {};
+        var stdout_buf: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+        cli.writeCompletion(&stdout.interface, shell) catch {};
+        stdout.interface.flush() catch {};
         c._exit(0);
     }
     cli.applyVerbosity(cli_args.verbosity);
@@ -139,12 +147,11 @@ pub fn main(init: std.process.Init) !void {
     // Auto-detect mesa driver via sysfs (no libdrm dependency).
     {
         var driver_buf: [256]u8 = undefined;
-        const fp = c.fopen("/sys/class/drm/renderD128/device/driver/module/drivers", "r");
-        if (fp) |f| {
-            defer _ = c.fclose(f);
-            const n = c.fread(&driver_buf, 1, driver_buf.len - 1, f);
+        const driver_file = std.Io.Dir.cwd.openFile(io, "/sys/class/drm/renderD128/device/driver/module/drivers", .{}) catch null;
+        if (driver_file) |f| {
+            defer f.close(io);
+            const n = f.readStreaming(io, &.{&driver_buf}) catch 0;
             if (n > 0) {
-                driver_buf[n] = 0;
                 const s = driver_buf[0..n];
                 if (std.mem.indexOf(u8, s, "i915") != null or std.mem.indexOf(u8, s, "xe") != null)
                     _ = c.setenv("MESA_LOADER_DRIVER_OVERRIDE", "iris", 0)
@@ -167,7 +174,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── Phase 0: config + spawn GPU thread ──
-    var cfg = try config_mod.load(allocator, cli_args.config_path);
+    var cfg = try config_mod.load(allocator, io, cli_args.config_path);
     defer cfg.deinit(allocator);
     state.debug.warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
     state.diag.trace_commits = render_env.parseTraceCommits(getenv("SCRGO_TRACE"));
@@ -204,14 +211,14 @@ pub fn main(init: std.process.Init) !void {
     // ~6 ms. The thread parks in cond_wait until start() assigns it work.
     var cpu: cpu_renderer_worker.Frontend = .{};
     defer cpu.stop();
-    cpu.spawnThread() catch |e| {
+    cpu.spawnThread(io) catch |e| {
         log.err(.cpu, "thread spawn failed", .{ .err = e });
     };
     log.info(.cpu, "thread spawned", .{});
 
     // Start GPU thread early — it begins EGL init immediately, no deps needed
     if (gpu_allowed) {
-        gpu.start() catch |e| {
+        gpu.start(io) catch |e| {
             log.err(.gpu, "thread start failed", .{ .err = e });
             state.render.gpu_restart.scheduleRetry();
         };
@@ -220,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Start atlas thread with font+atlas bootstrap — overlaps with Wayland init
     var atlas_thread: atlas_worker.AtlasWorker = .{};
-    try atlas_thread.startWithBootstrap(.{
+    try atlas_thread.startWithBootstrap(io, .{
         .allocator = allocator,
         .font_path_cfg = cfg.font_path,
         .fallback_fonts = cfg.fallback_fonts,
@@ -253,8 +260,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── Phase 2: wait for font (overlapped with Wayland init) ──
-    const font_resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
+    const font_resp = (try atlas_thread.readResponse()) orelse {
+        log.err(.atlas, "bootstrap response pipe closed before font_ready", .{});
+        return error.BootstrapFailed;
+    };
     if (font_resp.tag == .failed) {
+        log.err(.atlas, "font bootstrap failed; cannot start without a usable font", .{
+            .err = atlas_thread.bootstrap_err,
+            .config_font = cfg.font_path,
+        });
         if (atlas_thread.bootstrap_err) |err| return err;
         return error.BootstrapFailed;
     }
@@ -277,19 +291,19 @@ pub fn main(init: std.process.Init) !void {
 
     // ── Phase 3: fork PTY (while atlas init continues in background) ──
     var pty = if (exec_argv.items.len > 0)
-        try pty_mod.Pty.spawnCommand(exec_argv.items, grid.cols, grid.rows)
+        try pty_mod.Pty.spawnCommand(io, exec_argv.items, grid.cols, grid.rows)
     else
-        try pty_mod.Pty.spawn(cfg.shell, grid.cols, grid.rows);
+        try pty_mod.Pty.spawn(io, cfg.shell, grid.cols, grid.rows);
     defer pty.close();
 
     log.info(.pty, "forked", .{ .cols = grid.cols, .rows = grid.rows });
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     // Bell handler — installed before any PTY data can flow.
-    var bell = try bell_mod.Manager.init(allocator, cfg.bell);
+    var bell = try bell_mod.Manager.init(allocator, io, cfg.bell);
     defer bell.deinit();
     bell_mod.g_manager = &bell;
     defer bell_mod.g_manager = null;
@@ -305,14 +319,14 @@ pub fn main(init: std.process.Init) !void {
     log.info(.atlas, "ready", .{});
 
     if (wl.shm) |shm| {
-        cpu.start(@ptrCast(shm), atlas_ref_ptr, &atlas_thread, wl.width, wl.height) catch |e| {
+        cpu.start(io, @ptrCast(shm), atlas_ref_ptr, wl.width, wl.height) catch |e| {
             log.err(.cpu, "start failed", .{ .err = e });
         };
     }
     log.info(.cpu, "started", .{});
 
     if (gpu.active and gpu.context_ready) {
-        gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
+        gpu.setSharedState(atlas_ref_ptr);
         gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height, state.metrics.baseline_offset) catch |e| {
             log.err(.gpu, "initial configure failed", .{ .err = e });
             gpu.stop();
@@ -320,7 +334,7 @@ pub fn main(init: std.process.Init) !void {
         };
         log.info(.gpu, "configured", .{});
     } else if (gpu.active) {
-        gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
+        gpu.setSharedState(atlas_ref_ptr);
     }
 
     term.pty_fd = pty.master_fd;
@@ -335,6 +349,7 @@ pub fn main(init: std.process.Init) !void {
     // every event for the program's lifetime.
     var clipboard = clipboard_mod.Manager.init(
         allocator,
+        io,
         @ptrCast(wl.display),
         if (wl.data_device) |d| @ptrCast(d) else null,
         if (wl.primary_selection_device) |d| @ptrCast(d) else null,
@@ -422,12 +437,12 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (!gpu.active and state.render.target_render_path == .gpu and gpu_allowed and wl.linux_dmabuf != null and state.render.gpu_restart.due()) {
-            gpu.start() catch |err| {
+            gpu.start(io) catch |err| {
                 log.err(.gpu, "restart failed", .{ .err = err });
                 state.render.gpu_restart.scheduleRetry();
                 continue;
             };
-            gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
+            gpu.setSharedState(atlas_ref_ptr);
             log.info(.gpu, "restarting", .{});
             state.render.gpu_restart.deadline_ns = null;
         }
@@ -521,7 +536,7 @@ pub fn main(init: std.process.Init) !void {
                     .context_ready => {
                         log.info(.gpu, "context ready", .{});
                         if (gpu.atlas_ref == null) {
-                            gpu.setSharedState(atlas_ref_ptr, &atlas_thread);
+                            gpu.setSharedState(atlas_ref_ptr);
                         }
                         gpu.requestConfigure(state.metrics.viewport_w, state.metrics.viewport_h, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height, state.metrics.baseline_offset) catch |e| {
                             log.err(.gpu, "configure after context_ready failed", .{ .err = e });
@@ -536,27 +551,6 @@ pub fn main(init: std.process.Init) !void {
                                 render_loop.noteGpuUnavailable(&state);
                                 continue;
                             };
-                            // Wire up per-buffer explicit-sync timelines.
-                            // Each buffer slot has its own monotonic
-                            // counter; sharing one timeline across
-                            // buffers can fire release retroactively
-                            // (see drm_syncobj_v1 protocol note).
-                            var imported: usize = 0;
-                            for (gpu.drm_syncobj_export_fds[0..], 0..) |*fd_slot, i| {
-                                if (fd_slot.* < 0) continue;
-                                const fd = fd_slot.*;
-                                fd_slot.* = -1;
-                                wl.importDrmSyncobjTimeline(i, fd);
-                                if (wl.drmSyncobjTimelineAvailable(i)) imported += 1;
-                            }
-                            if (imported > 0) {
-                                _ = wl.ensureDrmSyncobjSurface();
-                                log.info(.gpu, "explicit sync ready", .{ .timelines = imported });
-                            } else if (gpu.drm_syncobj_export_fds[0] >= 0) {
-                                log.info(.gpu, "explicit sync unavailable", .{
-                                    .reason = "no compositor manager",
-                                });
-                            }
                             state.render.gpu_snapshot_dirty = true;
                             state.render.gpu_restart.clear();
                             log.info(.gpu, "ready", .{});
@@ -572,21 +566,6 @@ pub fn main(init: std.process.Init) !void {
                             log.setFrame(.frame, resp.serial);
                             log.debug(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
-                                // Explicit sync: pin the acquire +
-                                // release points before commit so the
-                                // compositor knows to wait for our GPU
-                                // work via the timeline rather than
-                                // sampling whenever it likes. set_*
-                                // requests apply to the next commit.
-                                // We may have cleared the extension on
-                                // a recent switch to CPU — re-attach
-                                // before setting points.
-                                const acquire: u64 = (@as(u64, resp.acquire_point_hi) << 32) | resp.acquire_point_lo;
-                                const release: u64 = (@as(u64, resp.release_point_hi) << 32) | resp.release_point_lo;
-                                if (acquire != 0) {
-                                    _ = wl.ensureDrmSyncobjSurface();
-                                    _ = wl.setDrmSyncobjPoints(resp.buffer_index, acquire, release);
-                                }
                                 // Commit immediately. If the compositor
                                 // still has the prior frame pending,
                                 // this commit replaces it in the
@@ -642,14 +621,6 @@ pub fn main(init: std.process.Init) !void {
                         const path_ok = state.render.active_render_path == .cpu;
                         const size_ok = cpu.width == wl.width and cpu.height == wl.height;
                         if (buffer_ok and path_ok and size_ok) {
-                            // CPU buffers don't carry explicit-sync
-                            // points. If the syncobj surface extension
-                            // is still attached from a prior GPU
-                            // commit, the compositor will raise
-                            // no_acquire_point on this commit; tear it
-                            // down first. The GPU `.frame` path
-                            // re-attaches lazily before each commit.
-                            wl.clearDrmSyncobjSurface();
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                             state.diag.recordCommit('c');
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
@@ -686,16 +657,7 @@ pub fn main(init: std.process.Init) !void {
             const resp_opt = atlas_thread.readResponse() catch null;
             if (resp_opt) |resp| {
                 switch (resp.tag) {
-                    .updated => {
-                        log.info(.atlas, "applied", .{
-                            .codepoints = resp.requested_count,
-                            .added_pages = resp.added_pages,
-                        });
-                        render_loop.markRenderDirty(&state);
-                    },
-                    .failed => {
-                        log.err(.atlas, "update failed", .{ .codepoints = resp.requested_count });
-                    },
+                    .failed => log.err(.atlas, "bootstrap failed", .{}),
                     .font_ready, .bootstrap_ready => {},
                 }
             }
@@ -795,7 +757,7 @@ pub fn main(init: std.process.Init) !void {
         state.diag.t_main_loop_exit_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
     }
     log.info(.main, "loop exit", .{});
-    state.diag.dumpExitReport(.{
+    state.diag.dumpExitReport(io, .{
         .wl_closed = wl.closed,
         .child_exited = child_exited,
         .render_serial = state.render.render_serial,

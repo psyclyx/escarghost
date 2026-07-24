@@ -31,10 +31,8 @@ const wl = @cImport({
 });
 
 const c = @cImport({
-    @cInclude("unistd.h");
     @cInclude("fcntl.h");
     @cInclude("poll.h");
-    @cInclude("errno.h");
 });
 
 pub const Kind = enum { clipboard, primary };
@@ -50,6 +48,7 @@ const MIME_TYPES = [_][:0]const u8{
 
 pub const Manager = struct {
     allocator: std.mem.Allocator,
+    io: std.Io = undefined,
     data_device: ?*wl.wl_data_device,
     primary_device: ?*wl.zwp_primary_selection_device_v1,
     data_device_manager: ?*wl.wl_data_device_manager,
@@ -76,6 +75,7 @@ pub const Manager = struct {
     /// here on.
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         display: ?*anyopaque,
         data_device: ?*anyopaque,
         primary_device: ?*anyopaque,
@@ -86,6 +86,7 @@ pub const Manager = struct {
         // its permanent address (Wayland holds a raw data ptr).
         return .{
             .allocator = allocator,
+            .io = io,
             .display = @ptrCast(display.?),
             .data_device = if (data_device) |p| @ptrCast(p) else null,
             .primary_device = if (primary_device) |p| @ptrCast(p) else null,
@@ -168,14 +169,12 @@ pub const Manager = struct {
             },
         }
 
-        var fds: [2]c_int = undefined;
-        if (c.pipe(&fds) != 0) return error.PipeFailed;
+        const fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return error.PipeFailed;
         const read_fd = fds[0];
         const write_fd = fds[1];
 
-        // Set O_CLOEXEC + non-blocking on the read side so a slow
+        // Set non-blocking on the read side so a slow
         // source can't lock us up forever.
-        _ = c.fcntl(read_fd, c.F_SETFD, c.FD_CLOEXEC);
         const flags = c.fcntl(read_fd, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(read_fd, c.F_SETFL, flags | c.O_NONBLOCK);
 
@@ -184,16 +183,16 @@ pub const Manager = struct {
         switch (kind) {
             .clipboard => {
                 const offer = self.clipboard_offer orelse {
-                    _ = c.close(read_fd);
-                    _ = c.close(write_fd);
+                    std.c.close(read_fd);
+                    std.c.close(write_fd);
                     return null;
                 };
                 wl.wl_data_offer_receive(offer, mime.ptr, write_fd);
             },
             .primary => {
                 const offer = self.primary_offer orelse {
-                    _ = c.close(read_fd);
-                    _ = c.close(write_fd);
+                    std.c.close(read_fd);
+                    std.c.close(write_fd);
                     return null;
                 };
                 wl.zwp_primary_selection_offer_v1_receive(offer, mime.ptr, write_fd);
@@ -203,7 +202,7 @@ pub const Manager = struct {
         // Close our copy of the write side — the source app already
         // received a duplicate via the Wayland socket. Once it
         // closes its end too, read_fd hits EOF.
-        _ = c.close(write_fd);
+        std.c.close(write_fd);
         _ = wl.wl_display_flush(self.display);
 
         var out: std.ArrayList(u8) = .empty;
@@ -216,19 +215,19 @@ pub const Manager = struct {
             const rc = c.poll(&pfd, 1, @intCast(deadline_remaining));
             if (rc <= 0) break; // timeout or error
             if (pfd.revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0 and pfd.revents & c.POLLIN == 0) break;
-            const n = c.read(read_fd, &chunk, chunk.len);
-            if (n == 0) break; // EOF
-            if (n < 0) {
-                const eno = std.c._errno().*;
-                if (eno == c.EAGAIN or eno == c.EWOULDBLOCK or eno == c.EINTR) continue;
-                break;
-            }
-            try out.appendSlice(allocator, chunk[0..@intCast(n)]);
+            const rfile = std.Io.File{ .handle = read_fd, .flags = .{ .nonblocking = true } };
+            const n = rfile.readStreaming(self.io, &.{&chunk}) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.EndOfStream => break,
+                else => break,
+            };
+            if (n == 0) break;
+            try out.appendSlice(allocator, chunk[0..n]);
             // Short subsequent polls — the source usually delivers
             // everything in a single burst.
             deadline_remaining = 20;
         }
-        _ = c.close(read_fd);
+        std.c.close(read_fd);
 
         if (out.items.len == 0) return null;
         return try out.toOwnedSlice(allocator);
@@ -282,7 +281,7 @@ pub const Manager = struct {
 
     fn clipboardSourceSend(data: ?*anyopaque, _: ?*wl.wl_data_source, _: [*c]const u8, fd: i32) callconv(.c) void {
         const self: *Manager = @ptrCast(@alignCast(data));
-        writeAllAndClose(fd, self.clipboard_text);
+        writeAllAndClose(fd, self.io, self.clipboard_text);
     }
 
     fn clipboardSourceCancelled(data: ?*anyopaque, _: ?*wl.wl_data_source) callconv(.c) void {
@@ -303,7 +302,7 @@ pub const Manager = struct {
 
     fn primarySourceSend(data: ?*anyopaque, _: ?*wl.zwp_primary_selection_source_v1, _: [*c]const u8, fd: i32) callconv(.c) void {
         const self: *Manager = @ptrCast(@alignCast(data));
-        writeAllAndClose(fd, self.primary_text);
+        writeAllAndClose(fd, self.io, self.primary_text);
     }
     fn primarySourceCancelled(data: ?*anyopaque, _: ?*wl.zwp_primary_selection_source_v1) callconv(.c) void {
         const self: *Manager = @ptrCast(@alignCast(data));
@@ -375,13 +374,9 @@ pub const Manager = struct {
 /// always closed (even on partial-write failure), matching what
 /// other Wayland clients do — clients ignore EPIPE here because the
 /// destination may have closed early.
-fn writeAllAndClose(fd: c_int, data: ?[]const u8) void {
-    defer _ = c.close(fd);
+fn writeAllAndClose(fd: c_int, io: std.Io, data: ?[]const u8) void {
+    defer std.c.close(fd);
     const bytes = data orelse return;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
+    const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    file.writeStreamingAll(io, bytes) catch {};
 }

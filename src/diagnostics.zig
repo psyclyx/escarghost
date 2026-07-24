@@ -10,7 +10,6 @@ const log = @import("log.zig");
 const c = @cImport({
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("time.h");
-    @cInclude("fcntl.h");
     @cInclude("unistd.h");
 });
 
@@ -25,15 +24,13 @@ pub fn monotonicNowNs() u64 {
 /// `_start`. Reads /proc/self/stat field 22 (process start time in
 /// jiffies since boot) and /proc/uptime (current uptime in seconds);
 /// returns the delta in ns, or null if anything failed.
-pub fn premainAgeNs() ?u64 {
+pub fn premainAgeNs(io: std.Io) ?u64 {
     var stat_buf: [4096]u8 = undefined;
-    const stat_fd = c.open("/proc/self/stat", c.O_RDONLY);
-    if (stat_fd < 0) return null;
-    const stat_n = c.read(stat_fd, &stat_buf, stat_buf.len - 1);
-    _ = c.close(stat_fd);
-    if (stat_n <= 0) return null;
-    stat_buf[@intCast(stat_n)] = 0;
-    const stat_str = stat_buf[0..@intCast(stat_n)];
+    const stat_file = std.Io.Dir.cwd.openFile(io, "/proc/self/stat", .{}) catch return null;
+    const stat_n = stat_file.readStreaming(io, &.{&stat_buf}) catch return null;
+    stat_file.close(io);
+    if (stat_n == 0) return null;
+    const stat_str = stat_buf[0..stat_n];
 
     const close_paren = std.mem.lastIndexOfScalar(u8, stat_str, ')') orelse return null;
     var it = std.mem.tokenizeAny(u8, stat_str[close_paren + 1 ..], " \t\n");
@@ -45,13 +42,11 @@ pub fn premainAgeNs() ?u64 {
     const starttime_jiffies = std.fmt.parseInt(u64, starttime_jiffies_str, 10) catch return null;
 
     var uptime_buf: [128]u8 = undefined;
-    const uptime_fd = c.open("/proc/uptime", c.O_RDONLY);
-    if (uptime_fd < 0) return null;
-    const uptime_n = c.read(uptime_fd, &uptime_buf, uptime_buf.len - 1);
-    _ = c.close(uptime_fd);
-    if (uptime_n <= 0) return null;
-    uptime_buf[@intCast(uptime_n)] = 0;
-    const uptime_str = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&uptime_buf)), 0);
+    const uptime_file = std.Io.Dir.cwd.openFile(io, "/proc/uptime", .{}) catch return null;
+    const uptime_n = uptime_file.readStreaming(io, &.{&uptime_buf}) catch return null;
+    uptime_file.close(io);
+    if (uptime_n == 0) return null;
+    const uptime_str = uptime_buf[0..uptime_n];
     const space = std.mem.indexOfScalar(u8, uptime_str, ' ') orelse uptime_str.len;
     const uptime_secs = std.fmt.parseFloat(f64, uptime_str[0..space]) catch return null;
 
@@ -63,14 +58,13 @@ pub fn premainAgeNs() ?u64 {
     return @intFromFloat(age_secs * @as(f64, std.time.ns_per_s));
 }
 
-pub fn readProcStatus(key: []const u8) u64 {
-    const fd = c.open("/proc/self/status", c.O_RDONLY | c.O_CLOEXEC);
-    if (fd < 0) return 0;
-    defer _ = c.close(fd);
+pub fn readProcStatus(io: std.Io, key: []const u8) u64 {
+    const file = std.Io.Dir.cwd.openFile(io, "/proc/self/status", .{}) catch return 0;
+    defer file.close(io);
     var buf: [16384]u8 = undefined;
-    const n = c.read(fd, &buf, buf.len);
-    if (n <= 0) return 0;
-    var it = std.mem.tokenizeScalar(u8, buf[0..@intCast(n)], '\n');
+    const n = file.readStreaming(io, &.{&buf}) catch return 0;
+    if (n == 0) return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
     while (it.next()) |line| {
         if (!std.mem.startsWith(u8, line, key)) continue;
         var tok = std.mem.tokenizeAny(u8, line[key.len..], " \t");
@@ -131,6 +125,7 @@ pub const Diagnostics = struct {
     peak_vmrss_kib: u64 = 0,
     peak_rss_anon_kib: u64 = 0,
     mem_poll_stop: std.atomic.Value(bool) = .init(false),
+    io: std.Io = undefined,
 
     // Stale-frame stats. Per-commit we log whether the snapshot we just
     // committed was already behind the latest markRenderDirty serial; at
@@ -142,9 +137,10 @@ pub const Diagnostics = struct {
     total_throttled_skips: u64 = 0,
 
     /// Stamp start-of-process timestamps. Call once near the top of main.
-    pub fn markStart(self: *Diagnostics) void {
+    pub fn markStart(self: *Diagnostics, io: std.Io) void {
+        self.io = io;
         self.commit_trace_start_ns = monotonicNowNs();
-        if (premainAgeNs()) |age| self.t_premain_ns = age;
+        if (premainAgeNs(io)) |age| self.t_premain_ns = age;
     }
 
     pub fn elapsedMs(self: *const Diagnostics) f64 {
@@ -206,7 +202,7 @@ pub const Diagnostics = struct {
         if (t) |th| th.join();
     }
 
-    pub fn dumpExitReport(self: *Diagnostics, ctx: ExitContext) void {
+    pub fn dumpExitReport(self: *Diagnostics, io: std.Io, ctx: ExitContext) void {
         const ms_f: f64 = @floatFromInt(@as(u64, std.time.ns_per_ms));
 
         // Stale-last-frame diagnostic. If the final committed frame's
@@ -260,8 +256,8 @@ pub const Diagnostics = struct {
             log.info(.diag, "memory", .{
                 .peak_rss_mib = self.peak_vmrss_kib / 1024,
                 .peak_anon_mib = self.peak_rss_anon_kib / 1024,
-                .final_rss_mib = readProcStatus("VmRSS:") / 1024,
-                .final_anon_mib = readProcStatus("RssAnon:") / 1024,
+                .final_rss_mib = readProcStatus(io, "VmRSS:") / 1024,
+                .final_anon_mib = readProcStatus(io, "RssAnon:") / 1024,
             });
             if (gpu_pipeline.GpuPipeline.phase_frame_count > 0) {
                 log.info(.diag, "gpu pipeline", .{
@@ -357,8 +353,8 @@ pub const Diagnostics = struct {
 
 fn memPollLoop(self: *Diagnostics) void {
     while (!self.mem_poll_stop.load(.acquire)) {
-        const rss = readProcStatus("VmRSS:");
-        const anon = readProcStatus("RssAnon:");
+        const rss = readProcStatus(self.io, "VmRSS:");
+        const anon = readProcStatus(self.io, "RssAnon:");
         if (rss > self.peak_vmrss_kib) self.peak_vmrss_kib = rss;
         if (anon > self.peak_rss_anon_kib) self.peak_rss_anon_kib = anon;
         var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 5 * std.time.ns_per_ms };

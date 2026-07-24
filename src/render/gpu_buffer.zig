@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const log = @import("../log.zig");
+
 const c = @cImport({
     @cInclude("unistd.h");
 });
@@ -55,7 +57,7 @@ pub const FrontendBuffer = struct {
             desc.format,
             0,
         ) orelse return error.WlBufferCreateFailed;
-        _ = c.close(fd);
+        std.c.close(fd);
 
         return .{
             .desc = desc,
@@ -91,8 +93,9 @@ pub const FrontendBuffer = struct {
         .release = bufferRelease,
     };
 
-    fn bufferRelease(data: ?*anyopaque, _: ?*wl.wl_buffer) callconv(.c) void {
+    fn bufferRelease(data: ?*anyopaque, buffer: ?*wl.wl_buffer) callconv(.c) void {
         const self: *FrontendBuffer = @ptrCast(@alignCast(data));
+        log.debug(.wayland, "wl_buffer.release", .{ .ptr = @intFromPtr(buffer) });
         self.released = true;
     }
 };

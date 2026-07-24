@@ -5,16 +5,13 @@
 //! from those declarations — no hand-written duplicate to drift.
 //!
 //! Long options accept `--name value` and `--name=value`; short options
-//! accept `-x value` and `-xvalue`. Everything after `--` is treated as
-//! positional arguments for whatever `-e` selected. Unknown args trigger
-//! `printUsage(2)` + exit(2), matching getopt-style tools.
+//! accept `-x value` and `-xvalue`. Everything after a bare `--` is the
+//! command to exec instead of $SHELL — first token is the program, the
+//! rest are its argv. Unknown args trigger `printUsage(2)` + exit(2),
+//! matching getopt-style tools.
 
 const std = @import("std");
 const log = @import("log.zig");
-
-const c = @cImport({
-    @cInclude("unistd.h");
-});
 
 pub const version_string = "scrgo 0.0.1";
 
@@ -29,10 +26,12 @@ pub const Args = struct {
     /// (XDG_CONFIG_HOME / HOME)".
     config_path: ?[]const u8 = null,
     /// argv[0] of the command launched into the PTY. `null` means
-    /// "use the configured / $SHELL shell".
+    /// "use the configured / $SHELL shell". Set from the first token
+    /// after `--`.
     exec_program: ?[]const u8 = null,
-    /// argv tail for the exec'd command. Empty when no `--` was passed.
-    /// Pointed-into argv strings: do not free.
+    /// argv tail for the exec'd command. Empty when no `--` was passed
+    /// or only the program name followed it. Pointed-into argv strings:
+    /// do not free.
     exec_args: []const []const u8 = &.{},
     /// Renderer preference. `null` means "leave to env / auto".
     renderer: ?Renderer = null,
@@ -97,13 +96,6 @@ pub const option_specs = [_]Option{
         .completion = .file,
     },
     .{
-        .long = "exec",
-        .short = 'e',
-        .arg = "COMMAND",
-        .help = "Run COMMAND instead of $SHELL. Pass extra args after `--`, e.g. scrgo -e echo -- hello world",
-        .completion = .command,
-    },
-    .{
         .long = "renderer",
         .arg = "BACKEND",
         .help = "Renderer backend (default: auto)",
@@ -135,77 +127,12 @@ fn findShort(ch: u8) ?*const Option {
     return null;
 }
 
-// ── fd-backed writer ──
-//
-// std.Io.Writer is the canonical 0.16 sink. We pair it with a tiny vtable
-// that drains by writing directly to a file descriptor — no allocator, no
-// buffering quirks, just the kernel call. Used for `--help`, error messages,
-// and the completion generators (they all want a *Writer).
-
-const FdWriter = struct {
-    writer: std.Io.Writer,
-    fd: c_int,
-
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *FdWriter = @fieldParentPtr("writer", w);
-        // Drain `buffer[0..end]` first, exactly like the contract says.
-        if (w.end > 0) {
-            const written = writeAll(self.fd, w.buffer[0..w.end]) catch return error.WriteFailed;
-            // Compact any unwritten remainder back to the buffer start.
-            if (written < w.end) {
-                std.mem.copyForwards(u8, w.buffer[0 .. w.end - written], w.buffer[written..w.end]);
-            }
-            w.end -= written;
-            if (w.end > 0) return 0; // partial: caller retries
-        }
-
-        if (data.len == 0) return 0;
-
-        var total: usize = 0;
-        for (data[0 .. data.len - 1]) |slice| {
-            const n = writeAll(self.fd, slice) catch return error.WriteFailed;
-            total += n;
-            if (n < slice.len) return total;
-        }
-        const last = data[data.len - 1];
-        var i: usize = 0;
-        while (i < splat) : (i += 1) {
-            const n = writeAll(self.fd, last) catch return error.WriteFailed;
-            total += n;
-            if (n < last.len) return total;
-        }
-        return total;
-    }
-
-    fn writeAll(fd: c_int, bytes: []const u8) !usize {
-        var written: usize = 0;
-        while (written < bytes.len) {
-            const n = c.write(fd, bytes.ptr + written, bytes.len - written);
-            if (n < 0) return error.WriteFailed;
-            if (n == 0) break;
-            written += @intCast(n);
-        }
-        return written;
-    }
-};
-
-const fd_writer_vtable: std.Io.Writer.VTable = .{ .drain = FdWriter.drain };
-
-/// Build an unbuffered writer that drains directly to `fd`. The returned
-/// FdWriter owns no resources — drop it when you're done.
-pub fn fdWriter(fd: c_int) FdWriter {
-    return .{
-        .writer = .{ .vtable = &fd_writer_vtable, .buffer = &.{} },
-        .fd = fd,
-    };
-}
-
 // ── Public entrypoints ──
 
 /// Write usage to `writer`. Generated from `option_specs`.
 pub fn printUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: scrgo [OPTIONS] [-e COMMAND] [-- ARGS...]
+        \\Usage: scrgo [OPTIONS] [-- COMMAND [ARGS...]]
         \\
         \\A Wayland-native terminal emulator.
         \\
@@ -221,8 +148,9 @@ pub fn printUsage(writer: *std.Io.Writer) !void {
 
     try writer.writeAll(
         \\
-        \\Anything after `--` is forwarded to the command from `-e`.
-        \\When `-e` is omitted, $SHELL is launched.
+        \\Everything after `--` is the command to run instead of $SHELL.
+        \\The first token is the program; the rest are its args.
+        \\When `--` is omitted, $SHELL is launched.
         \\
     );
 }
@@ -269,7 +197,13 @@ pub fn parse(argv: []const []const u8) ParseError!Args {
         const a = argv[i];
 
         if (std.mem.eql(u8, a, "--")) {
-            args.exec_args = argv[i + 1 ..];
+            // Everything after `--` is the command to exec. First token
+            // is the program; remaining tokens are its args.
+            const rest = argv[i + 1 ..];
+            if (rest.len > 0) {
+                args.exec_program = rest[0];
+                args.exec_args = rest[1..];
+            }
             break;
         }
 
@@ -355,10 +289,6 @@ fn setFlag(args: *Args, opt: *const Option) ParseError!void {
 fn setOption(args: *Args, opt: *const Option, value: []const u8) ParseError!void {
     if (std.mem.eql(u8, opt.long, "config")) {
         args.config_path = value;
-        return;
-    }
-    if (std.mem.eql(u8, opt.long, "exec")) {
-        args.exec_program = value;
         return;
     }
     if (std.mem.eql(u8, opt.long, "renderer")) {
@@ -554,13 +484,27 @@ test "parse: no args" {
     try std.testing.expectEqual(@as(u2, 0), a.verbosity);
 }
 
-test "parse: -e plus -- args" {
-    const argv: []const []const u8 = &.{ "scrgo", "-e", "echo", "--", "foo", "bar" };
+test "parse: -- command and args" {
+    const argv: []const []const u8 = &.{ "scrgo", "--", "echo", "foo", "bar" };
     const a = try parse(argv);
     try std.testing.expectEqualStrings("echo", a.exec_program.?);
     try std.testing.expectEqual(@as(usize, 2), a.exec_args.len);
     try std.testing.expectEqualStrings("foo", a.exec_args[0]);
     try std.testing.expectEqualStrings("bar", a.exec_args[1]);
+}
+
+test "parse: -- command only" {
+    const argv: []const []const u8 = &.{ "scrgo", "--", "cat" };
+    const a = try parse(argv);
+    try std.testing.expectEqualStrings("cat", a.exec_program.?);
+    try std.testing.expectEqual(@as(usize, 0), a.exec_args.len);
+}
+
+test "parse: bare -- with no command" {
+    const argv: []const []const u8 = &.{ "scrgo", "--" };
+    const a = try parse(argv);
+    try std.testing.expect(a.exec_program == null);
+    try std.testing.expectEqual(@as(usize, 0), a.exec_args.len);
 }
 
 test "parse: --config=path" {

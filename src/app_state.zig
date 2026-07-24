@@ -205,4 +205,8 @@ pub const AppState = struct {
     lifecycle: Lifecycle = .{},
     diag: diagnostics.Diagnostics = .{},
     debug: DebugFlags = .{},
+    /// Process-wide `Io` instance, set once in `main()`. Thread-safe
+    /// (Threaded implementation); used by input dispatch and other
+    /// subsystems that need to do IO through `state`.
+    io: std.Io = undefined,
 };

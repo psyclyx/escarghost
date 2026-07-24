@@ -160,7 +160,7 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
         // triggers a wasted render of pre-keystroke state, costing one
         // vsync — measured as ~17ms of extra input latency.
         state.refs.term.scrollToBottom();
-        state.refs.pty.write(text) catch {};
+        state.refs.pty.write(state.io, text) catch {};
         return;
     }
 
@@ -174,7 +174,7 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
             null,
         );
         if (encoded) |data| {
-            state.refs.pty.write(data) catch {};
+            state.refs.pty.write(state.io, data) catch {};
         }
     }
 }
@@ -484,7 +484,7 @@ pub fn onFocus(focused: bool) void {
 pub fn onTextCommit(text: []const u8) void {
     if (text.len == 0) return;
     state.refs.term.scrollToBottom();
-    state.refs.pty.write(text) catch {};
+    state.refs.pty.write(state.io, text) catch {};
 }
 
 fn nowMs() i64 {
@@ -591,7 +591,7 @@ fn writePasteToPty(text: []const u8) void {
     const allocator = std.heap.smp_allocator;
     const encoded = state.refs.term.encodePaste(allocator, text) catch return orelse return;
     defer allocator.free(encoded);
-    state.refs.pty.write(encoded) catch {};
+    state.refs.pty.write(state.io, encoded) catch {};
     state.refs.term.scrollToBottom();
     render_loop.markRenderDirty(state);
 }

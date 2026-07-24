@@ -5,7 +5,6 @@ const Rgb = color.Rgb;
 
 const c = @cImport({
     @cInclude("stdlib.h");
-    @cInclude("stdio.h");
 });
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
@@ -135,7 +134,7 @@ const base16_keys = [16][]const u8{
     "base0C", "base0D", "base0E", "base0F",
 };
 
-pub fn load(allocator: std.mem.Allocator, override_path: ?[]const u8) !Config {
+pub fn load(allocator: std.mem.Allocator, io: std.Io, override_path: ?[]const u8) !Config {
     var cfg = defaults;
     cfg.shell = getenv("SHELL") orelse fallback_shell;
 
@@ -143,7 +142,7 @@ pub fn load(allocator: std.mem.Allocator, override_path: ?[]const u8) !Config {
     // we *don't* silently fall through on FileNotFound — the user
     // explicitly asked for that path, so a missing file is an error.
     if (override_path) |path| {
-        const data = try readFile(allocator, path);
+        const data = try readFile(allocator, io, path);
         defer allocator.free(data);
         try parseJson(allocator, data, &cfg);
         finalizePalette(&cfg);
@@ -154,7 +153,7 @@ pub fn load(allocator: std.mem.Allocator, override_path: ?[]const u8) !Config {
     defer if (config_path) |p| allocator.free(p);
 
     if (config_path) |path| {
-        const data = readFile(allocator, path) catch |err| switch (err) {
+        const data = readFile(allocator, io, path) catch |err| switch (err) {
             error.FileNotFound => {
                 finalizePalette(&cfg);
                 return cfg;
@@ -224,29 +223,35 @@ fn fillStandardExtended(palette: *[256]Rgb) void {
     }
 }
 
-fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    const fp = c.fopen(path_z.ptr, "rb") orelse {
-        // Check errno for ENOENT
-        const errno = std.c._errno().*;
-        if (errno == @intFromEnum(std.posix.E.NOENT)) return error.FileNotFound;
-        return error.OpenFailed;
+    const file = std.Io.Dir.cwd.openFile(io, path_z, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return error.OpenFailed,
     };
-    defer _ = c.fclose(fp);
+    defer file.close(io);
 
-    _ = c.fseek(fp, 0, c.SEEK_END);
-    const size_raw = c.ftell(fp);
-    if (size_raw < 0) return error.ReadFailed;
-    const size: usize = @intCast(size_raw);
-    _ = c.fseek(fp, 0, c.SEEK_SET);
+    const stat = try file.stat(io);
+    const size: usize = @intCast(stat.size);
 
     const buf = try allocator.alloc(u8, size);
     errdefer allocator.free(buf);
 
-    const read = c.fread(buf.ptr, 1, size, fp);
-    if (read != size) return error.ReadFailed;
+    // Read the entire file in one streaming read. readStreaming returns
+    // fewer bytes than the buffer on partial reads, so we loop.
+    var read_total: usize = 0;
+    while (read_total < size) {
+        const dest = buf[read_total..];
+        const n = file.readStreaming(io, &.{dest}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) break;
+        read_total += n;
+    }
+    if (read_total != size) return error.ReadFailed;
 
     return buf;
 }

@@ -21,8 +21,6 @@ const c = @cImport({
     @cInclude("sys/resource.h");
     @cInclude("sys/wait.h");
     @cInclude("time.h");
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
 });
 
 fn sleepMs(ms: u64) void {
@@ -72,18 +70,20 @@ const Poller = struct {
     /// these as the steady-state values.
     last_anon_kib: std.atomic.Value(u64),
     last_rss_kib: std.atomic.Value(u64),
+    io: std.Io = undefined,
 
     fn pollLoop(self: *Poller) void {
         while (!self.stop.load(.acquire)) {
             // Per-iteration delay (~5 ms). We don't care about high
             // precision — we just need to catch the peak window.
             sleepMs(5);
-            samplePid(self.pid, &self.peak_anon_kib, &self.last_anon_kib, &self.last_rss_kib);
+            samplePid(self.io, self.pid, &self.peak_anon_kib, &self.last_anon_kib, &self.last_rss_kib);
         }
     }
 };
 
 fn samplePid(
+    io: std.Io,
     pid: posix.pid_t,
     peak_anon: *std.atomic.Value(u64),
     last_anon: *std.atomic.Value(u64),
@@ -91,11 +91,11 @@ fn samplePid(
 ) void {
     var path_buf: [64]u8 = undefined;
     const status_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/status", .{pid}) catch return;
-    if (readKey(status_path, "RssAnon:")) |kib| {
+    if (readKey(io, status_path, "RssAnon:")) |kib| {
         bumpMax(peak_anon, kib);
         last_anon.store(kib, .release);
     }
-    if (readKey(status_path, "VmRSS:")) |kib| {
+    if (readKey(io, status_path, "VmRSS:")) |kib| {
         last_rss.store(kib, .release);
     }
 }
@@ -108,24 +108,23 @@ fn bumpMax(slot: *std.atomic.Value(u64), v: u64) void {
     }
 }
 
-fn readWhole(path: [:0]const u8, buf: []u8) ?[]const u8 {
-    const fd = c.open(path.ptr, c.O_RDONLY);
-    if (fd < 0) return null;
-    defer _ = c.close(fd);
+fn readWhole(io: std.Io, path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const file = std.Io.Dir.cwd.openFile(io, path, .{}) catch return null;
+    defer file.close(io);
     var total: usize = 0;
     while (total < buf.len) {
-        const n = c.read(fd, buf.ptr + total, buf.len - total);
-        if (n <= 0) break;
-        total += @intCast(n);
+        const n = file.readStreaming(io, &.{buf[total..]}) catch break;
+        if (n == 0) break;
+        total += n;
     }
     return buf[0..total];
 }
 
 /// Read a sysfs-style line `<key>\s+<num>\s+kB` from `/proc/<pid>/...`.
 /// Returns the number in KiB, or null if the file or key wasn't found.
-fn readKey(path: [:0]const u8, key: []const u8) ?u64 {
+fn readKey(io: std.Io, path: [:0]const u8, key: []const u8) ?u64 {
     var buf: [8192]u8 = undefined;
-    const data = readWhole(path, &buf) orelse return null;
+    const data = readWhole(io, path, &buf) orelse return null;
     var line_it = std.mem.tokenizeScalar(u8, data, '\n');
     while (line_it.next()) |line| {
         if (!std.mem.startsWith(u8, line, key)) continue;
@@ -137,7 +136,7 @@ fn readKey(path: [:0]const u8, key: []const u8) ?u64 {
     return null;
 }
 
-fn runOnce(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Sample {
+fn runOnce(io: std.Io, spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Sample {
     var argv_buf: [16][]const u8 = undefined;
     const extras = [_][]const u8{ opts.sh_bin, "-c", opts.script };
     const argv = spec_mod.buildArgv(&argv_buf, bin, spec, &extras);
@@ -150,6 +149,7 @@ fn runOnce(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Sample 
         .peak_anon_kib = .init(0),
         .last_anon_kib = .init(0),
         .last_rss_kib = .init(0),
+        .io = io,
     };
     const thread = std.Thread.spawn(.{}, Poller.pollLoop, .{&poller}) catch null;
 
@@ -173,7 +173,7 @@ fn runOnce(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Sample 
     };
 }
 
-pub fn measureTerminal(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Aggregate {
+pub fn measureTerminal(io: std.Io, spec: spec_mod.TerminalSpec, bin: []const u8, opts: Options) !Aggregate {
     const alloc = std.heap.smp_allocator;
     var rss_buf: std.ArrayList(f64) = .empty;
     defer rss_buf.deinit(alloc);
@@ -186,7 +186,7 @@ pub fn measureTerminal(spec: spec_mod.TerminalSpec, bin: []const u8, opts: Optio
     var dropped: usize = 0;
     var r: u32 = 0;
     while (r < opts.runs) : (r += 1) {
-        const s = runOnce(spec, bin, opts) catch {
+        const s = runOnce(io, spec, bin, opts) catch {
             dropped += 1;
             continue;
         };

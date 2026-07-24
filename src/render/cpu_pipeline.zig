@@ -65,19 +65,19 @@ pub const ShmFrame = struct {
         if (fd < 0) return null;
 
         if (c.ftruncate(fd, @intCast(size)) < 0) {
-            _ = c.close(fd);
+            std.c.close(fd);
             return null;
         }
 
         const map = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, 0);
         if (map == c.MAP_FAILED) {
-            _ = c.close(fd);
+            std.c.close(fd);
             return null;
         }
 
         const pool = wl.wl_shm_create_pool(shm, fd, @intCast(size)) orelse {
             _ = c.munmap(map, size);
-            _ = c.close(fd);
+            std.c.close(fd);
             return null;
         };
 
@@ -91,7 +91,7 @@ pub const ShmFrame = struct {
         ) orelse {
             wl.wl_shm_pool_destroy(pool);
             _ = c.munmap(map, size);
-            _ = c.close(fd);
+            std.c.close(fd);
             return null;
         };
 
@@ -128,7 +128,7 @@ pub const ShmFrame = struct {
         if (self.wl_buffer) |b| wl.wl_buffer_destroy(b);
         if (self.wl_pool) |p| wl.wl_shm_pool_destroy(p);
         if (self.map_ptr) |m| _ = c.munmap(m, self.map_size);
-        if (self.fd >= 0) _ = c.close(self.fd);
+        if (self.fd >= 0) std.c.close(self.fd);
     }
 
     pub fn commit(self: *ShmFrame, surface_opaque: *anyopaque, display_opaque: *anyopaque) void {
@@ -344,7 +344,7 @@ pub const CpuPipeline = struct {
         cell_width: f32,
         cell_height: f32,
         baseline_offset: f32,
-    ) !glyph_misses.Set {
+    ) !void {
         var misses: glyph_misses.Set = .{};
         const default_bg = snapshot.header.default_bg;
 
@@ -415,7 +415,6 @@ pub const CpuPipeline = struct {
 
         try self.flushDraw(built, default_bg, snapshot.header.default_fg, width, height, cell_width, cell_height);
         self.ephemeral_blobs.releaseAll();
-        return misses;
     }
 
     fn extendAtlas(

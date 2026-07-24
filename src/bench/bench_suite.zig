@@ -236,7 +236,7 @@ fn runLatency(harness: *h.Harness, args: Args) !void {
     }
 }
 
-fn runMemory(args: Args) !void {
+fn runMemory(io: std.Io, args: Args) !void {
     const sh = requireEnv("BENCH_SH");
     const cat = requireEnv("BENCH_CAT");
     const payload = requireEnv("BENCH_PAYLOAD");
@@ -259,7 +259,7 @@ fn runMemory(args: Args) !void {
             std.debug.print("{s:<10} skipped (${s} not set)\n", .{ spec.label, spec.env_var });
             continue;
         };
-        const a = memory_mod.measureTerminal(spec, bin, opts) catch |err| {
+        const a = memory_mod.measureTerminal(io, spec, bin, opts) catch |err| {
             std.debug.print("{s:<10} error: {}\n", .{ spec.label, err });
             continue;
         };
@@ -280,7 +280,7 @@ fn runMemory(args: Args) !void {
     }
 }
 
-fn runScreenshots(harness: *h.Harness, args: Args) !void {
+fn runScreenshots(io: std.Io, harness: *h.Harness, args: Args) !void {
     const sh = requireEnv("BENCH_SH");
     const opts: screenshot_mod.Options = .{
         .sh_bin = sh,
@@ -295,7 +295,7 @@ fn runScreenshots(harness: *h.Harness, args: Args) !void {
             std.debug.print("{s:<10} skipped (${s} not set)\n", .{ spec.label, spec.env_var });
             continue;
         };
-        screenshot_mod.captureOne(harness, spec, bin, opts) catch |err| {
+        screenshot_mod.captureOne(io, harness, spec, bin, opts) catch |err| {
             std.debug.print("{s:<10} error: {}\n", .{ spec.label, err });
         };
     }
@@ -303,6 +303,7 @@ fn runScreenshots(harness: *h.Harness, args: Args) !void {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
+    const io = init.io;
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
     var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(allocator);
@@ -316,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
     for (args.scenarios) |scenario| {
         switch (scenario) {
             .startup => try runStartup(args),
-            .memory => try runMemory(args),
+            .memory => try runMemory(io, args),
             .stream, .@"input-latency", .screenshots => {
                 if (!harness_inited) {
                     try harness.init();
@@ -325,7 +326,7 @@ pub fn main(init: std.process.Init) !void {
                 switch (scenario) {
                     .stream => try runStream(&harness, args),
                     .@"input-latency" => try runLatency(&harness, args),
-                    .screenshots => try runScreenshots(&harness, args),
+                    .screenshots => try runScreenshots(io, &harness, args),
                     else => unreachable,
                 }
             },

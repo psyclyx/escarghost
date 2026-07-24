@@ -51,6 +51,7 @@ pub const Terminal = struct {
     // Callbacks
     on_bell: ?*const fn () void = null,
     on_title_changed: ?*const fn ([]const u8) void = null,
+    io: std.Io = undefined,
 
     /// Approximate bytes-per-row used to translate the caller's
     /// line-oriented scrollback budget into ghostty's byte-oriented
@@ -64,6 +65,7 @@ pub const Terminal = struct {
 
     pub fn init(
         self: *Terminal,
+        io: std.Io,
         cols: u16,
         rows: u16,
         max_scrollback_lines: usize,
@@ -71,6 +73,7 @@ pub const Terminal = struct {
         fg: Rgb,
         bg: Rgb,
     ) !void {
+        self.io = io;
 
         // Create terminal. Ghostty's `max_scrollback` is documented in
         // its C header as "lines" but is actually bytes (its own
@@ -486,7 +489,8 @@ pub const Terminal = struct {
     fn writePtyCallback(_: c.GhosttyTerminal, userdata: ?*anyopaque, data: [*c]const u8, len: usize) callconv(.c) void {
         const self: *Terminal = @ptrCast(@alignCast(userdata));
         if (self.pty_fd >= 0 and data != null) {
-            _ = std.c.write(self.pty_fd, data, len);
+            const file = std.Io.File{ .handle = self.pty_fd, .flags = .{ .nonblocking = false } };
+            file.writeStreamingAll(self.io, data[0..len]) catch {};
         }
     }
 

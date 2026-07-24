@@ -1,7 +1,6 @@
 const std = @import("std");
 const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
-const atlas_worker = @import("atlas_worker.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const cpu_buffer = @import("cpu_buffer.zig");
@@ -11,7 +10,6 @@ const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
-    @cInclude("unistd.h");
     @cInclude("stdlib.h");
 });
 
@@ -51,7 +49,6 @@ const Request = struct {
 
 pub const Frontend = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
-    atlas_thread: ?*atlas_worker.AtlasWorker = null,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     mutex: c.pthread_mutex_t = undefined,
@@ -61,6 +58,7 @@ pub const Frontend = struct {
     render_in_flight: bool = false,
     stop_requested: bool = false,
     active: bool = false,
+    io: std.Io = undefined,
     snapshots: [SnapshotSlotCount]render_snapshot.SharedSnapshot = [_]render_snapshot.SharedSnapshot{.{}} ** SnapshotSlotCount,
     snapshot_busy: [SnapshotSlotCount]bool = [_]bool{false} ** SnapshotSlotCount,
     buffers: [BufferCount]cpu_buffer.SharedBuffer = undefined,
@@ -76,19 +74,19 @@ pub const Frontend = struct {
     // pthread_create wrappers (the NVIDIA EGL stack hooks libpthread when
     // it loads, costing every later spawn ~6 ms). The thread parks in
     // cond_wait until start() assigns it real work.
-    pub fn spawnThread(self: *Frontend) !void {
+    pub fn spawnThread(self: *Frontend, io: std.Io) !void {
         if (self.thread != null) return;
+        self.io = io;
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
         errdefer _ = c.pthread_cond_destroy(&self.cond);
 
-        var pipe_fds: [2]c_int = undefined;
-        if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+        const pipe_fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return error.PipeFailed;
         self.response_fds = pipe_fds;
         errdefer {
-            _ = c.close(self.response_fds[0]);
-            _ = c.close(self.response_fds[1]);
+            std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(io);
+            std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(io);
             self.response_fds = [_]c_int{-1} ** 2;
         }
         self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
@@ -97,16 +95,15 @@ pub const Frontend = struct {
 
     pub fn start(
         self: *Frontend,
+        io: std.Io,
         shm_opaque: *anyopaque,
         atlas_ref: *atlas_ref_mod.AtlasRef,
-        atlas_thread: *atlas_worker.AtlasWorker,
         width: u32,
         height: u32,
     ) !void {
         if (self.active) return;
-        try self.spawnThread();
+        try self.spawnThread(io);
         self.atlas_ref = atlas_ref;
-        self.atlas_thread = atlas_thread;
         try self.ensureBuffers(shm_opaque, width, height);
         self.active = true;
         log.info(.cpu, "started", .{ .width = width, .height = height });
@@ -122,8 +119,8 @@ pub const Frontend = struct {
         }
         if (self.thread) |thread| thread.join();
         self.thread = null;
-        if (self.response_fds[0] >= 0) _ = c.close(self.response_fds[0]);
-        if (self.response_fds[1] >= 0) _ = c.close(self.response_fds[1]);
+        if (self.response_fds[0] >= 0) std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(self.io);
+        if (self.response_fds[1] >= 0) std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(self.io);
         self.response_fds = [_]c_int{-1} ** 2;
         _ = c.pthread_cond_destroy(&self.cond);
         _ = c.pthread_mutex_destroy(&self.mutex);
@@ -221,10 +218,12 @@ pub const Frontend = struct {
 
     pub fn readResponse(self: *Frontend) !?Response {
         var response: Response = undefined;
-        const rc = c.read(self.response_fds[0], &response, @sizeOf(Response));
-        if (rc == 0) return null;
-        if (rc < 0) return error.ReadFailed;
-        if (@as(usize, @intCast(rc)) < @sizeOf(Response)) return error.ShortRead;
+        const file = std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } };
+        const n = file.readStreaming(self.io, &.{std.mem.asBytes(&response)}) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return error.ReadFailed,
+        };
+        if (n < @sizeOf(Response)) return error.ShortRead;
 
         if (response.snapshot_slot < SnapshotSlotCount) {
             self.snapshot_busy[response.snapshot_slot] = false;
@@ -277,7 +276,7 @@ pub const Frontend = struct {
                             .buffer = buffer_index,
                             .snapshot = snapshot_slot,
                         });
-                        writeResponse(self.response_fds[1], .{
+                        writeResponse(self.response_fds[1], self.io, .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
                             .snapshot_slot = snapshot_slot,
@@ -289,7 +288,7 @@ pub const Frontend = struct {
                     const buffer = &self.buffers[buffer_index];
                     const map_ptr = buffer.map_ptr orelse {
                         log.warn(.cpu, "missing shm map", .{ .buffer = buffer_index });
-                        writeResponse(self.response_fds[1], .{
+                        writeResponse(self.response_fds[1], self.io, .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
                             .snapshot_slot = snapshot_slot,
@@ -301,7 +300,7 @@ pub const Frontend = struct {
                     var atlas_lease = self.atlas_ref.acquire();
                     defer atlas_lease.release();
 
-                    const misses = ctx.renderToMemory(
+                    ctx.renderToMemory(
                         map_ptr,
                         buffer.desc.width,
                         buffer.desc.height,
@@ -314,7 +313,7 @@ pub const Frontend = struct {
                         request.baseline_offset,
                     ) catch |e| {
                         log.err(.cpu, "render failed", .{ .buffer = buffer_index, .err = e });
-                        writeResponse(self.response_fds[1], .{
+                        writeResponse(self.response_fds[1], self.io, .{
                             .tag = .failed,
                             .buffer_index = buffer_index,
                             .snapshot_slot = snapshot_slot,
@@ -323,16 +322,13 @@ pub const Frontend = struct {
                         continue;
                     };
 
-                    if (!misses.isEmpty()) {
-                        if (self.atlas_thread) |thread| thread.requestMany(&misses);
-                    }
                     const elapsed_ms = timer.elapsedMs();
                     log.debug(.cpu, "frame complete", .{
                         .buffer = buffer_index,
                         .snapshot = snapshot_slot,
                         .elapsed_ms = log.fmt("{d:.1}", .{elapsed_ms}),
                     });
-                    writeResponse(self.response_fds[1], .{
+                    writeResponse(self.response_fds[1], self.io, .{
                         .tag = .frame,
                         .buffer_index = buffer_index,
                         .snapshot_slot = snapshot_slot,
@@ -352,6 +348,7 @@ pub const Frontend = struct {
     }
 };
 
-fn writeResponse(fd: c_int, response: Response) void {
-    _ = c.write(fd, &response, @sizeOf(Response));
+fn writeResponse(fd: c_int, io: std.Io, response: Response) void {
+    const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    file.writeStreamingAll(io, std.mem.asBytes(&response)) catch {};
 }

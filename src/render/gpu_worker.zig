@@ -10,20 +10,17 @@ const std = @import("std");
 const snail = @import("snail");
 const gpu_pipeline = @import("gpu_pipeline.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
-const atlas_worker = @import("atlas_worker.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const gpu_buffer = @import("gpu_buffer.zig");
 const terminal_mod = @import("../terminal.zig");
 const row_build = @import("row_build.zig");
-const drm_sync = @import("drm_sync.zig");
 const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
-    @cInclude("unistd.h");
     @cInclude("stdlib.h");
     @cInclude("fcntl.h");
     @cInclude("sys/eventfd.h");
@@ -81,15 +78,14 @@ fn monotonicNs() u64 {
     return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
 }
 
-fn readRssKb() u64 {
+fn readRssKb(io: std.Io) u64 {
     var buf: [256]u8 = undefined;
-    const fd = c.open("/proc/self/statm", c.O_RDONLY);
-    if (fd < 0) return 0;
-    defer _ = c.close(fd);
-    const n = c.read(fd, &buf, buf.len);
-    if (n <= 0) return 0;
+    const file = std.Io.Dir.cwd.openFile(io, "/proc/self/statm", .{}) catch return 0;
+    defer file.close(io);
+    const n = file.readStreaming(io, &.{&buf}) catch return 0;
+    if (n == 0) return 0;
     // /proc/self/statm: size resident shared text lib data dt (in pages)
-    var it = std.mem.tokenizeAny(u8, buf[0..@intCast(n)], " \n");
+    var it = std.mem.tokenizeAny(u8, buf[0..n], " \n");
     _ = it.next() orelse return 0;
     const resident_pages = std.fmt.parseInt(u64, it.next() orelse return 0, 10) catch return 0;
     return resident_pages * 4; // 4 KiB pages → KiB
@@ -109,19 +105,6 @@ pub const Response = extern struct {
     snapshot_slot: u8 = 0,
     reserved: [1]u8 = [_]u8{0} ** 1,
     serial: u32 = 0,
-    /// For `.frame` responses, the DRM syncobj timeline point that
-    /// will signal when this frame's GPU work completes. Zero means
-    /// "no explicit sync" — the caller falls back to implicit
-    /// (driver-internal) fencing as before. Hi/lo split because
-    /// wayland's `set_acquire_point` takes 32-bit parts.
-    acquire_point_lo: u32 = 0,
-    acquire_point_hi: u32 = 0,
-    /// A distinct timeline point the compositor signals when it's
-    /// done reading the buffer. We don't currently wait on it (we
-    /// gate the next render on `frame_done` instead), but the wayland
-    /// protocol requires release ≠ acquire.
-    release_point_lo: u32 = 0,
-    release_point_hi: u32 = 0,
 };
 
 const RequestTag = enum {
@@ -372,8 +355,8 @@ const DmabufTarget = struct {
         if (self.texture != 0) c.glDeleteTextures(1, &self.texture);
         if (self.image != c.EGL_NO_IMAGE and egl.destroy_image != null)
             _ = egl.destroy_image.?(egl.display, self.image);
-        if (self.import_fd >= 0) _ = c.close(self.import_fd);
-        if (self.export_fd >= 0) _ = c.close(self.export_fd);
+        if (self.import_fd >= 0) std.c.close(self.import_fd);
+        if (self.export_fd >= 0) std.c.close(self.export_fd);
         if (self.bo) |bo| c.gbm_bo_destroy(bo);
     }
 };
@@ -384,11 +367,11 @@ const DmabufAllocator = struct {
     targets: [MaxBuffers]DmabufTarget = [_]DmabufTarget{.{}} ** MaxBuffers,
     count: usize = 0,
 
-    fn init(egl: *const OffscreenEgl, width: u32, height: u32, buffer_count: usize) !DmabufAllocator {
+    fn init(io: std.Io, egl: *const OffscreenEgl, width: u32, height: u32, buffer_count: usize) !DmabufAllocator {
         var self: DmabufAllocator = .{};
         errdefer self.deinit(egl);
 
-        self.render_fd = try openRenderNodeForEgl(egl);
+        self.render_fd = try openRenderNodeForEgl(io, egl);
         self.gbm = c.gbm_create_device(self.render_fd) orelse return error.GbmDeviceFailed;
 
         const clamped_count = @min(buffer_count, MaxBuffers);
@@ -402,7 +385,7 @@ const DmabufAllocator = struct {
     fn deinit(self: *DmabufAllocator, egl: *const OffscreenEgl) void {
         for (self.targets[0..self.count]) |*target| target.deinit(egl);
         if (self.gbm) |gbm| c.gbm_device_destroy(gbm);
-        if (self.render_fd >= 0) _ = c.close(self.render_fd);
+        if (self.render_fd >= 0) std.c.close(self.render_fd);
     }
 };
 
@@ -419,10 +402,10 @@ pub const GpuWorker = struct {
     /// edge of one vsync, so jitter in the wakeup matters).
     request_event_fd: c_int = -1,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
+    io: std.Io = undefined,
 
     // Set by main before spawning thread
     atlas_ref: ?*atlas_ref_mod.AtlasRef = null,
-    atlas_thread: ?*atlas_worker.AtlasWorker = null,
 
     // Request state (protected by mutex)
     request_pending: bool = false,
@@ -437,17 +420,6 @@ pub const GpuWorker = struct {
     buffer_descs: [MaxBuffers]gpu_buffer.BufferDesc = [_]gpu_buffer.BufferDesc{.{}} ** MaxBuffers,
     buffer_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
     buffer_count: u8 = 0,
-    /// Per-buffer DRM syncobj timeline fds. The wp_linux_drm_syncobj_v1
-    /// protocol explicitly warns against sharing a single timeline
-    /// across multiple buffers' release points (signaling a later point
-    /// retroactively signals earlier ones, which can fire wl_buffer.release
-    /// before the compositor is actually done reading the prior buffer).
-    /// One timeline per buffer sidesteps that entirely — each buffer's
-    /// acquire AND release points live on its own monotonic counter.
-    /// Negative entries = no explicit-sync available for that slot
-    /// (typically because EGL native fence sync is missing or the
-    /// kill-switch is set); falls back to implicit fencing.
-    drm_syncobj_export_fds: [MaxBuffers]c_int = [_]c_int{-1} ** MaxBuffers,
 
     // GpuWorker-side state
     buffers: [MaxBuffers]gpu_buffer.FrontendBuffer = undefined,
@@ -468,28 +440,29 @@ pub const GpuWorker = struct {
     /// even if we write twice between worker iterations.
     fn signalWorker(self: *GpuWorker) void {
         var v: u64 = 1;
-        _ = c.write(self.request_event_fd, &v, @sizeOf(u64));
+        const file = std.Io.File{ .handle = self.request_event_fd, .flags = .{ .nonblocking = false } };
+        file.writeStreamingAll(self.io, std.mem.asBytes(&v)) catch {};
     }
 
     /// Start the GPU renderer thread. It immediately begins EGL init (no deps).
-    pub fn start(self: *GpuWorker) !void {
+    pub fn start(self: *GpuWorker, io: std.Io) !void {
         if (self.active) return;
         self.* = .{};
+        self.io = io;
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         self.request_event_fd = c.eventfd(0, c.EFD_CLOEXEC);
         if (self.request_event_fd < 0) return error.EventfdFailed;
         errdefer {
-            _ = c.close(self.request_event_fd);
+            std.c.close(self.request_event_fd);
             self.request_event_fd = -1;
         }
 
-        var pipe_fds: [2]c_int = undefined;
-        if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+        const pipe_fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return error.PipeFailed;
         self.response_fds = pipe_fds;
         errdefer {
-            _ = c.close(self.response_fds[0]);
-            _ = c.close(self.response_fds[1]);
+            std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(io);
+            std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(io);
             self.response_fds = [_]c_int{-1} ** 2;
         }
 
@@ -502,10 +475,8 @@ pub const GpuWorker = struct {
     pub fn setSharedState(
         self: *GpuWorker,
         atlas_ref: *atlas_ref_mod.AtlasRef,
-        atlas_thread: *atlas_worker.AtlasWorker,
     ) void {
         self.atlas_ref = atlas_ref;
-        self.atlas_thread = atlas_thread;
     }
 
     pub fn requestConfigure(self: *GpuWorker, w: u32, h: u32, font_size: f32, cell_width: f32, cell_height: f32, baseline_offset: f32) !void {
@@ -593,10 +564,12 @@ pub const GpuWorker = struct {
 
     pub fn readResponse(self: *GpuWorker) !?Response {
         var response: Response = undefined;
-        const rc = c.read(self.response_fds[0], &response, @sizeOf(Response));
-        if (rc == 0) return null;
-        if (rc < 0) return error.ReadFailed;
-        if (@as(usize, @intCast(rc)) < @sizeOf(Response)) return error.ShortRead;
+        const file = std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } };
+        const n = file.readStreaming(self.io, &.{std.mem.asBytes(&response)}) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return error.ReadFailed,
+        };
+        if (n < @sizeOf(Response)) return error.ShortRead;
 
         switch (response.tag) {
             .context_ready => {
@@ -673,15 +646,15 @@ pub const GpuWorker = struct {
         // Close any unclaimed export fds
         for (&self.buffer_export_fds) |*fd| {
             if (fd.* >= 0) {
-                _ = c.close(fd.*);
+                std.c.close(fd.*);
                 fd.* = -1;
             }
         }
-        if (self.response_fds[0] >= 0) _ = c.close(self.response_fds[0]);
-        if (self.response_fds[1] >= 0) _ = c.close(self.response_fds[1]);
+        if (self.response_fds[0] >= 0) std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(self.io);
+        if (self.response_fds[1] >= 0) std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(self.io);
         self.response_fds = [_]c_int{-1} ** 2;
         if (self.request_event_fd >= 0) {
-            _ = c.close(self.request_event_fd);
+            std.c.close(self.request_event_fd);
             self.request_event_fd = -1;
         }
         _ = c.pthread_mutex_destroy(&self.mutex);
@@ -700,28 +673,19 @@ pub const GpuWorker = struct {
         const warn_slow_budget_ms = render_env.parseWarnSlowMs(
             if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
         );
-        const sync_extend_cfg = render_env.parseSyncExtend(
-            if (c.getenv("SCRGO_SYNC_EXTEND")) |v| std.mem.sliceTo(v, 0) else null,
-        );
-        // Previous iteration's full frame cost (draw_t0 → end of fence
-        // wait), used to predict how much wall time the second draw +
-        // fence will need when sizing the sync-extend deadline. Zero
-        // until the first frame completes, which gates the sync retry
-        // (no data → don't risk it).
-        var last_full_frame_ns: u64 = 0;
         var diag_frame_counter: u64 = 0;
 
         // Phase 1: EGL + snail.Renderer init (no deps needed)
         var egl = OffscreenEgl.init() catch |e| {
             log.err(.gpu, "egl init failed", .{ .err = e });
-            writeResponse(self.response_fds[1], .{ .tag = .failed });
+            writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
             return;
         };
         defer egl.deinit();
         log.info(.gpu, "offscreen egl ready", .{});
 
         // Signal context ready — main can now send configure
-        writeResponse(self.response_fds[1], .{ .tag = .context_ready });
+        writeResponse(self.response_fds[1], self.io, .{ .tag = .context_ready });
 
         var allocator_state: ?DmabufAllocator = null;
         defer if (allocator_state) |*existing| existing.deinit(&egl);
@@ -729,17 +693,6 @@ pub const GpuWorker = struct {
         defer if (renderer) |*r| r.deinit();
         var current_width: u32 = 0;
         var current_height: u32 = 0;
-
-        // Explicit-sync state. One timeline per buffer so a release-point
-        // signal on one buffer can never retroactively signal a release
-        // on another (see drm_syncobj_v1 protocol note about shared
-        // timelines + out-of-order release).
-        var drm_timelines: [MaxBuffers]?drm_sync.Timeline = [_]?drm_sync.Timeline{null} ** MaxBuffers;
-        defer for (&drm_timelines) |*slot| if (slot.*) |*t| t.deinit();
-        const egl_fence_fns = drm_sync.EglFenceFns.load();
-        if (!egl_fence_fns.available()) {
-            log.warn(.gpu, "egl native fence sync unavailable", .{});
-        }
 
         // Phase 2+3: request loop. We wait on the eventfd outside the
         // mutex — pthread_cond_wait would tangle the wakeup with the
@@ -759,7 +712,8 @@ pub const GpuWorker = struct {
             if (need_wait) {
                 const wait_t0 = monotonicNs();
                 var v: u64 = 0;
-                _ = c.read(self.request_event_fd, &v, @sizeOf(u64));
+                const evfile = std.Io.File{ .handle = self.request_event_fd, .flags = .{ .nonblocking = false } };
+                _ = evfile.readStreaming(self.io, &.{std.mem.asBytes(&v)}) catch {};
                 workerWaitAccumNs += monotonicNs() - wait_t0;
                 workerWaitCount += 1;
             }
@@ -788,14 +742,14 @@ pub const GpuWorker = struct {
 
                     const atlas_ref = self.atlas_ref orelse {
                         log.err(.gpu, "configure failed", .{ .reason = "missing_atlas_ref" });
-                        writeResponse(self.response_fds[1], .{ .tag = .failed });
+                        writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                         continue;
                     };
 
                     // Allocate dmabufs
-                    const next_allocator = DmabufAllocator.init(&egl, request.width, request.height, MaxBuffers) catch |e| {
+                    const next_allocator = DmabufAllocator.init(self.io, &egl, request.width, request.height, MaxBuffers) catch |e| {
                         log.err(.gpu, "dmabuf alloc failed", .{ .err = e });
-                        writeResponse(self.response_fds[1], .{ .tag = .failed });
+                        writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                         continue;
                     };
                     if (allocator_state) |*existing| existing.deinit(&egl);
@@ -817,7 +771,7 @@ pub const GpuWorker = struct {
                             request.baseline_offset,
                         ) catch |e| {
                             log.err(.gpu, "renderer init failed", .{ .err = e });
-                            writeResponse(self.response_fds[1], .{ .tag = .failed });
+                            writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                             continue;
                         };
                         renderer.?.setTraceFrames(parseTraceFromEnv());
@@ -866,39 +820,10 @@ pub const GpuWorker = struct {
                         active_allocator.targets[i].export_fd = -1; // Transfer ownership to main
                     }
 
-                    // (Re)create one DRM syncobj timeline per buffer now
-                    // that we have a render fd. Tear down any prior
-                    // timelines — their handles are bound to the prior
-                    // render fd which we're about to drop when
-                    // allocator_state churns.
-                    for (&drm_timelines) |*slot| if (slot.*) |*t| {
-                        t.deinit();
-                        slot.* = null;
-                    };
-                    self.drm_syncobj_export_fds = [_]c_int{-1} ** MaxBuffers;
-                    if (render_env.explicitSyncEnabled() and egl_fence_fns.available() and active_allocator.render_fd >= 0) {
-                        var ready_count: usize = 0;
-                        for (0..active_allocator.count) |i| {
-                            drm_timelines[i] = drm_sync.Timeline.init(active_allocator.render_fd) catch |e| blk: {
-                                log.warn(.gpu, "drm syncobj init failed", .{ .buffer = i, .err = e });
-                                break :blk null;
-                            };
-                            if (drm_timelines[i]) |*t| {
-                                self.drm_syncobj_export_fds[i] = t.takeExportFd();
-                                ready_count += 1;
-                            }
-                        }
-                        if (ready_count > 0) {
-                            log.info(.gpu, "drm syncobj ready", .{ .timelines = ready_count });
-                        }
-                    } else if (!render_env.explicitSyncEnabled()) {
-                        log.info(.gpu, "explicit sync disabled (env)", .{});
-                    }
-
                     log.info(.gpu, "configure ready", .{
                         .elapsed_ms = log.fmt("{d:.1}", .{reconfigure_timer.elapsedMs()}),
                     });
-                    writeResponse(self.response_fds[1], .{ .tag = .ready });
+                    writeResponse(self.response_fds[1], self.io, .{ .tag = .ready });
                 },
                 .render => {
                     if (allocator_state == null or renderer == null) continue;
@@ -921,7 +846,7 @@ pub const GpuWorker = struct {
                             term,
                             atlas_lease.get(),
                         ) catch {
-                            writeResponse(self.response_fds[1], .{
+                            writeResponse(self.response_fds[1], self.io, .{
                                 .tag = .failed,
                                 .buffer_index = request.buffer_index,
                                 .snapshot_slot = request.snapshot_slot,
@@ -976,7 +901,7 @@ pub const GpuWorker = struct {
 
                     var misses: glyph_misses.Set = .{};
                     r.drawSnapshot(&self.snapshots[request.snapshot_slot], &misses) catch {
-                        writeResponse(self.response_fds[1], .{
+                        writeResponse(self.response_fds[1], self.io, .{
                             .tag = .failed,
                             .buffer_index = request.buffer_index,
                             .snapshot_slot = request.snapshot_slot,
@@ -985,60 +910,10 @@ pub const GpuWorker = struct {
                         continue;
                     };
 
-                    if (!misses.isEmpty()) {
-                        // Bounded sync retry (controlled by
-                        // SCRGO_SYNC_EXTEND): give the atlas thread a
-                        // deadline to publish a snapshot covering this
-                        // frame's misses, then redraw with the extended
-                        // atlas. The redraw paints over the first one
-                        // in the same dmabuf FBO — every frame is a
-                        // full repaint (see gpu_pipeline.zig:171), so
-                        // the second paint cleanly wins. On timeout we
-                        // ship the partial frame and rely on the async
-                        // requestMany below to dirty the next vsync via
-                        // the atlas worker's response pipe.
-                        //
-                        // The deadline is derived from data, not a
-                        // fixed env knob: vsync period - elapsed -
-                        // predicted-second-frame - safety. We require
-                        // historical frame data (last_full_frame_ns) to
-                        // size the prediction, so the first frame after
-                        // startup always bails to async.
-                        if (self.atlas_thread) |at| sync_retry: {
-                            if (!sync_extend_cfg.enabled) break :sync_retry;
-                            if (last_full_frame_ns == 0) break :sync_retry;
-                            const vsync_ns = perf.vsync_period_ns.load(.acquire);
-                            if (vsync_ns == 0) break :sync_retry;
-                            const now_ns = monotonicNs();
-                            const elapsed_ns = now_ns - draw_t0;
-                            const safety_ns: u64 = std.time.ns_per_ms;
-                            const reserved = elapsed_ns + last_full_frame_ns + safety_ns;
-                            if (reserved >= vsync_ns) break :sync_retry;
-                            var budget_ns = vsync_ns - reserved;
-                            if (sync_extend_cfg.cap_ms) |cap_ms| {
-                                const cap_ns = @as(u64, cap_ms) * std.time.ns_per_ms;
-                                budget_ns = @min(budget_ns, cap_ns);
-                            }
-                            // Don't bother if the headroom is so small
-                            // the round-trip + ensureText would chew
-                            // most of it.
-                            if (budget_ns < 500 * std.time.ns_per_us) break :sync_retry;
-                            const deadline_ns = now_ns + budget_ns;
-                            switch (at.extendBefore(&misses, deadline_ns)) {
-                                .extended => {
-                                    misses = .{};
-                                    r.drawSnapshot(&self.snapshots[request.snapshot_slot], &misses) catch {
-                                        // Original draw is still in the FBO; fall through.
-                                        misses = .{};
-                                    };
-                                },
-                                .timed_out, .unavailable => {},
-                            }
-                        }
-                        if (self.atlas_thread) |at| {
-                            if (!misses.isEmpty()) at.requestMany(&misses);
-                        }
-                    }
+                    // Misses left over after drawSnapshot's inline
+                    // extend attempt are glyphs the font genuinely
+                    // lacks (atlas_ref.extend returned .missing). We
+                    // shipped the partial frame; nothing more to do.
 
                     // Two sync paths:
                     //
@@ -1056,57 +931,22 @@ pub const GpuWorker = struct {
                     //  read can't race the GPU writes; without this,
                     //  the compositor would sample partially written
                     //  or stale pixels.
-                    var acquire_point: u64 = 0;
-                    var release_point: u64 = 0;
                     const gpu_wait_t0 = monotonicNs();
-                    if (request.buffer_index < MaxBuffers) {
-                        if (drm_timelines[request.buffer_index]) |*t| {
-                            const point = t.nextPoint();
-                            // Burn the next point as release. The
-                            // compositor signals it when done; we don't
-                            // currently wait on it (frame_done callback
-                            // gates the next render). One timeline per
-                            // buffer means this release point can never
-                            // accidentally signal an earlier buffer's
-                            // release.
-                            const release = t.nextPoint();
-                            if (t.signalFromEgl(egl.display, egl_fence_fns, point)) {
-                                acquire_point = point;
-                                release_point = release;
-                            } else |signal_err| {
-                                log.warn(.gpu, "drm syncobj signal failed; falling back to fence wait", .{
-                                    .err = signal_err,
-                                });
-                            }
-                        }
-                    }
-                    if (acquire_point == 0) {
-                        const fence_sync = c.glFenceSync(c.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                        if (fence_sync != null) {
-                            _ = c.glClientWaitSync(fence_sync, c.GL_SYNC_FLUSH_COMMANDS_BIT, std.math.maxInt(u64));
-                            c.glDeleteSync(fence_sync);
-                        }
+                    const fence_sync = c.glFenceSync(c.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                    if (fence_sync != null) {
+                        _ = c.glClientWaitSync(fence_sync, c.GL_SYNC_FLUSH_COMMANDS_BIT, std.math.maxInt(u64));
+                        c.glDeleteSync(fence_sync);
                     }
                     const gpu_wait_elapsed_ns = monotonicNs() - gpu_wait_t0;
-                    // Record total wall-time for this iteration so the
-                    // next miss-frame's sync-extend budget can predict
-                    // how much the redraw + fence wait will cost.
-                    last_full_frame_ns = monotonicNs() - draw_t0;
-
                     log.debug(.gpu, "render complete", .{
                         .buffer = request.buffer_index,
                         .elapsed_ms = log.fmt("{d:.1}", .{render_timer.elapsedMs()}),
-                        .acquire_point = acquire_point,
                     });
-                    writeResponse(self.response_fds[1], .{
+                    writeResponse(self.response_fds[1], self.io, .{
                         .tag = .frame,
                         .buffer_index = request.buffer_index,
                         .snapshot_slot = request.snapshot_slot,
                         .serial = request.serial,
-                        .acquire_point_lo = @truncate(acquire_point),
-                        .acquire_point_hi = @truncate(acquire_point >> 32),
-                        .release_point_lo = @truncate(release_point),
-                        .release_point_hi = @truncate(release_point >> 32),
                     });
 
                     // Periodic state dump: print RSS once per second-ish
@@ -1116,7 +956,7 @@ pub const GpuWorker = struct {
                     if (diag_frame_counter % 60 == 0) {
                         log.info(.diag, "rss sample", .{
                             .frame = diag_frame_counter,
-                            .rss_kib = readRssKb(),
+                            .rss_kib = readRssKb(self.io),
                         });
                     }
 
@@ -1191,24 +1031,25 @@ pub const GpuWorker = struct {
     }
 };
 
-fn writeResponse(fd: c_int, response: Response) void {
-    _ = c.write(fd, &response, @sizeOf(Response));
+fn writeResponse(fd: c_int, io: std.Io, response: Response) void {
+    const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    file.writeStreamingAll(io, std.mem.asBytes(&response)) catch {};
 }
 
 // ── Render node discovery ──
 
-fn openRenderNode() !c_int {
+fn openRenderNode(io: std.Io) !c_int {
     var path_buf: [32]u8 = undefined;
     var node: u32 = 128;
     while (node < 192) : (node += 1) {
         const path = std.fmt.bufPrintZ(&path_buf, "/dev/dri/renderD{}", .{node}) catch continue;
-        const fd = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
-        if (fd >= 0) return fd;
+        const file = std.Io.Dir.cwd.openFile(io, path, .{ .mode = .read_write }) catch continue;
+        return file.handle;
     }
     return error.NoRenderNode;
 }
 
-fn openRenderNodeForEgl(egl: *const OffscreenEgl) !c_int {
+fn openRenderNodeForEgl(io: std.Io, egl: *const OffscreenEgl) !c_int {
     const query_display_attrib = @as(
         ?*const fn (c.EGLDisplay, c.EGLint, *c.EGLAttrib) callconv(.c) c.EGLBoolean,
         @ptrCast(c.eglGetProcAddress("eglQueryDisplayAttribEXT")),
@@ -1225,11 +1066,12 @@ fn openRenderNodeForEgl(egl: *const OffscreenEgl) !c_int {
                 const device: c.EGLDeviceEXT = @ptrFromInt(@as(usize, @intCast(device_attr)));
                 const render_node = query_string(device, c.EGL_DRM_RENDER_NODE_FILE_EXT);
                 if (render_node != null) {
-                    const fd = c.open(render_node, c.O_RDWR | c.O_CLOEXEC);
-                    if (fd >= 0) return fd;
+                    const node_path = std.mem.sliceTo(render_node, 0);
+                    const file = std.Io.Dir.cwd.openFile(io, node_path, .{ .mode = .read_write }) catch continue;
+                    return file.handle;
                 }
             }
         }
     }
-    return openRenderNode();
+    return openRenderNode(io);
 }

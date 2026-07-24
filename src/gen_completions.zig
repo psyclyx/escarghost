@@ -16,6 +16,7 @@ const shells = [_]struct { shell: cli.CompletionShell, name: []const u8 }{
 };
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv_list.deinit(init.gpa);
     var it = std.process.Args.Iterator.init(init.minimal.args);
@@ -23,27 +24,23 @@ pub fn main(init: std.process.Init) !void {
 
     if (argv_list.items.len < 2) {
         const msg = "usage: gen-completions <output-dir>\n";
-        _ = std.c.write(2, msg, msg.len);
+        std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
         std.process.exit(2);
     }
     const out_dir = argv_list.items[1];
 
     // Make sure the directory exists. EEXIST is fine.
-    const dir_z = try init.gpa.dupeZ(u8, out_dir);
-    defer init.gpa.free(dir_z);
-    _ = std.c.mkdir(dir_z.ptr, @as(std.c.mode_t, 0o755));
+    std.Io.Dir.cwd.createDir(io, out_dir, .default_dir) catch {};
 
     for (shells) |s| {
         const path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ out_dir, s.name });
         defer init.gpa.free(path);
 
-        const path_z = try init.gpa.dupeZ(u8, path);
-        defer init.gpa.free(path_z);
-        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-        if (fd < 0) std.process.exit(1);
-        defer _ = std.c.close(fd);
+        const file = std.Io.Dir.cwd.createFile(io, path, .{ .read = false, .truncate = true }) catch std.process.exit(1);
+        defer file.close(io);
 
-        var writer = cli.fdWriter(fd);
-        try cli.writeCompletion(&writer.writer, s.shell);
+        var buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try cli.writeCompletion(&writer.interface, s.shell);
     }
 }

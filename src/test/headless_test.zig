@@ -15,6 +15,13 @@ comptime {
     _ = @import("selection_mod");
 }
 
+/// Build a thread-safe `Io` instance for tests. The caller must keep
+/// `t` alive for as long as `io` is used.
+fn testIo(t: *std.Io.Threaded) std.Io {
+    t.* = std.Io.Threaded.init(testing.allocator, .{});
+    return t.io();
+}
+
 const default_sequences = [_][]const u8{
     "Hello, World!\r\n",
     "\x1b[1;32mgreen bold\x1b[0m normal\r\n",
@@ -32,8 +39,8 @@ const default_sequences = [_][]const u8{
     "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()_+-=\r\n",
 };
 
-fn loadConfig(allocator: std.mem.Allocator) !config_mod.Config {
-    return try config_mod.load(allocator, null);
+fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !config_mod.Config {
+    return try config_mod.load(allocator, io, null);
 }
 
 const GridStats = struct {
@@ -73,13 +80,15 @@ fn iterateGrid(term: *terminal_mod.Terminal) GridStats {
 
 test "render state iteration over a populated 80x24 grid" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     const cols: u16 = 80;
     const rows: u16 = 24;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(cols, rows, 1000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,cols, rows, 1000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     for (default_sequences) |seq| term.feedData(seq);
@@ -94,11 +103,13 @@ test "render state iteration over a populated 80x24 grid" {
 
 test "cursor style switch preserves grid contents" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     for (default_sequences) |seq| term.feedData(seq);
@@ -117,11 +128,13 @@ test "cursor style switch preserves grid contents" {
 
 test "resize narrows the grid" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     term.feedData("seed line\r\n");
@@ -135,11 +148,13 @@ test "resize narrows the grid" {
 
 test "inverse / bold / italic style flags propagate through render state" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     term.feedData("\x1b[7minverse\x1b[0m \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m");
@@ -170,11 +185,13 @@ test "inverse / bold / italic style flags propagate through render state" {
 
 test "encodePaste round-trips ascii unchanged when bracketed-paste is off" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     try testing.expect(!term.isBracketedPaste());
@@ -185,11 +202,13 @@ test "encodePaste round-trips ascii unchanged when bracketed-paste is off" {
 
 test "encodePaste wraps bracketed paste markers when 2004h is set" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     term.feedData("\x1b[?2004h");
@@ -207,13 +226,15 @@ test "encodePaste wraps bracketed paste markers when 2004h is set" {
 
 test "scrollbar getter reports total/offset/len once content overflows" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     const cols: u16 = 40;
     const rows: u16 = 5;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(cols, rows, 200, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,cols, rows, 200, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     // Empty terminal: total == len, no scrollback to show.
@@ -238,13 +259,15 @@ test "fillRowFromScreen reads rows that have scrolled into scrollback" {
     // the rows now sitting in scrollback are still reachable via the
     // grid_ref walker (the visible viewport only shows the last 5).
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     const cols: u16 = 40;
     const rows: u16 = 5;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(cols, rows, 5000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,cols, rows, 5000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     var i: usize = 0;
@@ -283,14 +306,16 @@ test "max_scrollback config in lines actually yields ~that many lines" {
     // line budget to bytes via BYTES_PER_SCROLLBACK_LINE; pre-fix,
     // requesting 5000 lines gave us the 2-page floor (~430 rows).
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     const cols: u16 = 40;
     const rows: u16 = 5;
     const requested_lines: usize = 5000;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(cols, rows, requested_lines, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,cols, rows, requested_lines, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     // Feed more lines than we ask the floor would give us. The post-
@@ -306,11 +331,13 @@ test "max_scrollback config in lines actually yields ~that many lines" {
 
 test "colCount / rowCount mirror the configured grid" {
     const allocator = testing.allocator;
-    var cfg = try loadConfig(allocator);
+    var threaded: std.Io.Threaded = undefined;
+    const io = testIo(&threaded);
+    var cfg = try loadConfig(allocator, io);
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io,80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     try testing.expectEqual(@as(u16, 80), term.colCount());
