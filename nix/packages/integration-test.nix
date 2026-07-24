@@ -1,8 +1,9 @@
-{ writeShellApplication
-, coreutils
-, sway
-, scrgo
-, scrgo-integration-test
+{
+  writeShellApplication,
+  coreutils,
+  sway,
+  scrgo,
+  scrgo-integration-test,
 }:
 
 writeShellApplication {

@@ -1,12 +1,13 @@
-{ stdenv
-, lib
-, zigpkgs
-, pkg-config
-, wayland-scanner
-, autoPatchelfHook
-, wayland
-, libxkbcommon
-, snail-src
+{
+  stdenv,
+  lib,
+  zigpkgs,
+  pkg-config,
+  wayland-scanner,
+  autoPatchelfHook,
+  wayland,
+  libxkbcommon,
+  snail-src,
 }:
 
 # Standalone build of the scrgo-integration-test binary. Same closure
@@ -17,12 +18,12 @@ stdenv.mkDerivation {
   version = "0.0.1";
 
   src = lib.fileset.toSource {
-    root = ../.;
+    root = ../../.;
     fileset = lib.fileset.unions [
-      ../src
-      ../protocol
-      ../build.zig
-      ../build.zig.zon
+      ../../src
+      ../../protocol
+      ../../build.zig
+      ../../build.zig.zon
     ];
   };
 

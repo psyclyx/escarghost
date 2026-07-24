@@ -17,9 +17,10 @@
 # ~60 % the cell width of the other terminals (which on closer
 # inspection turn out to bundle DejaVu internally rather than calling
 # fontconfig). Pinning the family by name makes the comparison fair.
-{ fontSize ? 11
-, scrollbackLines ? 10000
-, fontFamily ? "DejaVu Sans Mono"
+{
+  fontSize ? 11,
+  scrollbackLines ? 10000,
+  fontFamily ? "DejaVu Sans Mono",
 }:
 {
   setup = ''

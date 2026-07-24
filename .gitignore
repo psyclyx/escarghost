@@ -5,3 +5,4 @@ zig-pkg/
 .direnv/
 /build.err
 /result
+result-*

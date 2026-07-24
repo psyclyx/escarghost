@@ -9,22 +9,23 @@
 # WAYLAND_DISPLAY, the bench payload, and the per-terminal binary paths
 # via env vars; the driver handles compositor coordination, settling,
 # per-scenario instrumentation, and reporting.
-{ writeShellApplication
-, coreutils
-, util-linux
-, procps
-, fontconfig # fc-match for the bench-term-config setup
-, sway
-, foot
-, alacritty
-, kitty
-, wezterm
-, scrgo
-, scrgo-bench-suite
+{
+  writeShellApplication,
+  coreutils,
+  util-linux,
+  procps,
+  fontconfig, # fc-match for the bench-term-config setup
+  sway,
+  foot,
+  alacritty,
+  kitty,
+  wezterm,
+  scrgo,
+  scrgo-bench-suite,
 }:
 
 let
-  termCfg = import ./bench-term-config.nix { };
+  termCfg = import ../../bench-term-config.nix { };
 in
 writeShellApplication {
   name = "bench";
@@ -82,7 +83,12 @@ writeShellApplication {
     export WLR_BACKENDS=wayland
     export WLR_WL_OUTPUTS=1
     export WLR_LIBINPUT_NO_DEVICES=1
-    export WLR_RENDERER_ALLOW_SOFTWARE=1
+    # Intentionally no WLR_RENDERER_ALLOW_SOFTWARE: nested sway shares the
+    # host GPU via wl_drm/dmabuf, so software fallback shouldn't be
+    # needed. Letting it fall back silently masks GPU-init problems and
+    # produces tile-pattern artifacts when reading NVIDIA-modifier dmabufs
+    # as linear. If GPU init really fails, the bench should error out
+    # loudly rather than measure a broken software path.
 
     # setsid so sway + its swaybg helper share a process group we can
     # signal as a unit. Killing the group is what catches swaybg

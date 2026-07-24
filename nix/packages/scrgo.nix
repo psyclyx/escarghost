@@ -1,22 +1,24 @@
-{ stdenv
-, lib
-, zigpkgs
-, pkg-config
-, wayland-protocols
-, wayland-scanner
-, autoPatchelfHook
-, libGL
-, libglvnd
-, mesa
-, libgbm
-, libdrm
-, wayland
-, libxkbcommon
-, fontconfig
-, harfbuzz
-, libpulseaudio
-, libghostty-vt
-, snail-src
+{
+  stdenv,
+  lib,
+  zigpkgs,
+  pkg-config,
+  wayland-protocols,
+  wayland-scanner,
+  autoPatchelfHook,
+  libGL,
+  libglvnd,
+  mesa,
+  libgbm,
+  libdrm,
+  wayland,
+  libxkbcommon,
+  fontconfig,
+  harfbuzz,
+  libpulseaudio,
+  libghostty-vt,
+  snail-src,
+  scrgo-completions,
 }:
 
 stdenv.mkDerivation {
@@ -24,13 +26,13 @@ stdenv.mkDerivation {
   version = "0.0.1";
 
   src = lib.fileset.toSource {
-    root = ../.;
+    root = ../../.;
     fileset = lib.fileset.unions [
-      ../src
-      ../protocol
-      ../dist
-      ../build.zig
-      ../build.zig.zon
+      ../../src
+      ../../protocol
+      ../../dist
+      ../../build.zig
+      ../../build.zig.zon
     ];
   };
 
@@ -64,14 +66,25 @@ stdenv.mkDerivation {
     export WAYLAND_PROTOCOLS_DIR="$(pkg-config --variable=pkgdatadir wayland-protocols)"
     export WAYLAND_SCANNER="$(pkg-config --variable=wayland_scanner wayland-scanner)"
 
+    # `-Dgen-completions=false` skips the in-build codegen run; we
+    # install the shell-completion files from the separate
+    # scrgo-completions derivation in installPhase below.
     zig build \
       --fork=${snail-src} \
-      -Doptimize=ReleaseFast
+      -Doptimize=ReleaseFast \
+      -Dgen-completions=false
   '';
 
   installPhase = ''
     mkdir -p $out/bin $out/share
     cp zig-out/bin/scrgo $out/bin/
     cp -r zig-out/share/. $out/share/
+
+    install -Dm644 ${scrgo-completions}/scrgo.bash \
+      $out/share/bash-completion/completions/scrgo
+    install -Dm644 ${scrgo-completions}/_scrgo \
+      $out/share/zsh/site-functions/_scrgo
+    install -Dm644 ${scrgo-completions}/scrgo.fish \
+      $out/share/fish/vendor_completions.d/scrgo.fish
   '';
 }
