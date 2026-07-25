@@ -167,7 +167,11 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     mod.addImport("snail", snail_mod);
     mod.addImport("snail-raster", createSnailRasterModule(b, deps, snail_mod));
     const snail_dep = b.dependency("snail", .{});
-    mod.addImport("snail-shaders", snail_dep.module("snail-shaders"));
+    // We render Vulkan-only, so import snail's SPIR-V-only shader scope: it
+    // exposes the same `snail-shaders` accessor API (the *Spv fns + reflection)
+    // but depends only on SPIR-V generation, keeping naga WGSL validation and
+    // the HLSL/MSL/GL toolchains out of our build.
+    mod.addImport("snail-shaders", snail_dep.module("snail-shaders-vk"));
     mod.addImport("color", createColorModule(b, deps));
 
     mod.linkSystemLibrary("wayland-client", .{});
