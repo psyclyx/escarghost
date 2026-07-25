@@ -8,10 +8,7 @@
   alacritty,
   kitty,
   wezterm,
-  libGL,
-  libglvnd,
   mesa,
-  libgbm,
   libdrm,
   stdenv,
   wayland,
@@ -21,6 +18,11 @@
   harfbuzz,
   fontconfig,
   libpulseaudio,
+  vulkan-headers,
+  vulkan-loader,
+  vulkan-validation-layers,
+  shader-slang,
+  wgpu-utils,
   libghostty-vt,
   # dev tooling
   treefmt,
@@ -40,10 +42,7 @@ mkShell {
     alacritty
     kitty
     wezterm
-    libGL
-    libglvnd
     mesa
-    libgbm
     libdrm
     stdenv.cc.cc.lib
     wayland
@@ -53,6 +52,11 @@ mkShell {
     harfbuzz
     fontconfig
     libpulseaudio
+    vulkan-headers
+    vulkan-loader
+    vulkan-validation-layers
+    shader-slang
+    wgpu-utils
     # dev tooling
     treefmt
     nixfmt
@@ -68,10 +72,7 @@ mkShell {
   ];
 
   LD_LIBRARY_PATH = lib.makeLibraryPath [
-    libGL
-    libglvnd
     mesa
-    libgbm
     libdrm
     stdenv.cc.cc.lib
     wayland
@@ -79,6 +80,7 @@ mkShell {
     harfbuzz
     libghostty-vt
     libpulseaudio
+    vulkan-loader
   ];
 
   PKG_CONFIG_PATH = "${libghostty-vt.dev}/share/pkgconfig";

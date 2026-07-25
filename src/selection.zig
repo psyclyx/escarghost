@@ -184,7 +184,6 @@ pub const Snapshot = struct {
     }
 };
 
-
 /// Classify a codepoint as a "word" character for word selection. Mirrors
 /// xterm's `charClass` philosophy: alphanumerics plus a few common
 /// path/code chars are part of a word, whitespace and most punctuation

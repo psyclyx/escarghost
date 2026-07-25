@@ -105,6 +105,7 @@ pub const Metrics = struct {
     cell_width: f32 = 0,
     cell_height: f32 = 0,
     baseline_offset: f32 = 0,
+    descent: f32 = 0,
     viewport_w: u32 = 0,
     viewport_h: u32 = 0,
     scroll_lines: u32 = 3,

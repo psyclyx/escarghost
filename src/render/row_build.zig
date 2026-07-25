@@ -1,11 +1,15 @@
-//! Shared row-building primitives used by both the GPU (renderer.zig) and
-//! CPU (cpu_pipeline.zig) paths. Iterates a row's cells, accumulates same-fg
-//! text into HarfBuzz-shaped runs, coalesces background spans, and emits
-//! underline / strikethrough decoration rects.
+//! Shared row-building primitives used by both the GPU (Vulkan) and
+//! CPU (snail-raster) render paths. Iterates a row's cells, accumulates
+//! same-fg text into HarfBuzz-shaped runs via snail 0.13's shape/place
+//! pipeline, coalesces background spans, and emits underline / strike
+//! decoration rects.
 //!
-//! Coordinates are produced relative to a caller-supplied `row_y` offset:
-//! pass `0` for a row-local cache entry, or the row's absolute Y to bake
-//! it in. Backends decide.
+//! In snail 0.13, the flow is:
+//!   cells → snail.shape → snail.recordUnhintedRun → snail.placeCellRunAlloc
+//!   → snail.Shape[] → (caller) snail.emit.emit → Instance[] + DrawBatch[]
+//!
+//! Background/decoration rects are produced as ColoredRect values; the
+//! caller turns them into snail.Path shapes or rasterizer rects.
 
 const std = @import("std");
 const snail = @import("snail");
@@ -20,65 +24,22 @@ const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 const Rgb = color.Rgb;
 
-/// Sub-phase counters for `buildSnapshot`. Single writer (the GPU
-/// worker thread, sole caller of buildSnapshot); diagnostic-only readers
-/// are benign. `phase_row_rebuild_ns` is the total per-row work across
-/// the frame; `phase_row_shape_ns` and `phase_row_finish_ns` further
-/// split that into the HB shape walk and the blob finalize + rect dupe.
-/// `phase_row_count` is the number of rows built in the frame.
+// ── Phase counters (diagnostic) ──
+
 pub var phase_row_rebuild_ns: u64 = 0;
 pub var phase_row_shape_ns: u64 = 0;
 pub var phase_row_finish_ns: u64 = 0;
 pub var phase_row_count: u64 = 0;
 
-/// Hint-path counters. `phase_hint_prepare_ns` covers
-/// `TrueTypeHintContext.prepareBestEffortRun` (per-glyph hint compute
-/// on first sight, cache hit otherwise). `phase_hint_append_ns` covers
-/// `TextBlobBuilder.appendPreparedBestEffortHintRun` (writes the hinted
-/// or fallback glyphs into the blob). `phase_hint_runs` is the count
-/// of prepared runs (one per same-fg sub-range). `phase_hint_glyphs_*`
-/// split each run's per-glyph fate so we can see warmup vs steady state.
-/// All subsets of `phase_row_rebuild_ns`.
+// Hint diagnostic stubs (referenced by diagnostics.zig). The snail 0.13
+// pipeline doesn't populate these yet.
 pub var phase_hint_prepare_ns: u64 = 0;
 pub var phase_hint_append_ns: u64 = 0;
 pub var phase_hint_runs: u64 = 0;
 pub var phase_hint_glyphs_hinted: u64 = 0;
 pub var phase_hint_glyphs_fallback: u64 = 0;
-
-/// Per-reject-reason histogram for fallback glyphs. Populated only
-/// when SCRGO_HINT_DIAG is set (the diagnostic queries `hint_ctx` per
-/// fallback glyph, adding ~50ns × fallback_count per frame). Indices
-/// mirror `snail.TrueTypeHintRejectReason`.
+pub const reject_reason_count: usize = 10;
 pub var phase_hint_reject_counts: [reject_reason_count]u64 = .{0} ** reject_reason_count;
-pub const reject_reason_count: usize = @typeInfo(snail.TrueTypeHintRejectReason).@"enum".fields.len;
-
-fn bumpRejectReason(reason: snail.TrueTypeHintRejectReason) void {
-    phase_hint_reject_counts[@intFromEnum(reason)] +%= 1;
-}
-
-fn collectFallbackReasons(
-    hint_ctx: *snail.TrueTypeHintContext,
-    run: *const snail.TrueTypePreparedHintRun,
-    ppem: snail.TrueTypeHintPpem,
-) void {
-    for (run.glyphs) |g| {
-        switch (g.source) {
-            .hint => {},
-            .fallback => {
-                const key = snail.TrueTypeHintGlyphKey{
-                    .face_index = g.face_index,
-                    .ppem_x_26_6 = ppem.x_26_6,
-                    .ppem_y_26_6 = ppem.y_26_6,
-                    .glyph_id = g.glyph_id,
-                };
-                switch (hint_ctx.queryGlyph(key)) {
-                    .unsupported => |reason| bumpRejectReason(reason),
-                    else => {},
-                }
-            },
-        }
-    }
-}
 
 pub const MAX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 3;
 
@@ -94,9 +55,6 @@ pub const Metrics = struct {
     cell_width: f32,
     cell_height: f32,
     font_size: f32,
-    /// Pixel-snapped baseline (font's ascent at the snapped em). Glyph
-    /// baselines for a row at `row_y` land at `row_y + baseline_offset`,
-    /// so glyph stems sit on whole pixels.
     baseline_offset: f32,
 
     pub fn baseline(self: Metrics) f32 {
@@ -110,31 +68,19 @@ pub const BuildResult = struct {
 };
 
 /// Accumulates an entire row's renderable text in one HB-shapeable
-/// buffer along with the per-byte mapping back to the source cell
-/// column. After the cell walk completes, `flushRow` calls HB once to
-/// shape the lot — ligatures still form because shaping spans the full
-/// row — and then emits builder.append calls per same-fg sub-range of
-/// the resulting glyph stream. Cells whose text isn't renderable (or
-/// blank) contribute nothing; the per-cell x grid (`placement.baseline.x
-/// = first_cell_col * cell_width`) anchors each sub-range absolutely so
-/// the blanks just stay blank — they're not part of the shape.
+/// buffer along with per-cell source ranges for snail 0.13's Cell API.
 const RowAccumulator = struct {
-    /// UTF-8 buffer of renderable text from the row, in column order.
-    /// Cap matches MAX_RECTS_PER_ROW's intent: well over the worst-case
-    /// 167 cols × 4 bytes.
     text: [2048]u8 = undefined,
     text_len: usize = 0,
-    /// Per-byte index into `text`, the source column that contributed
-    /// it. Used after shaping to map glyph.source_start back to its
-    /// originating cell so we can pick up that cell's fg color.
     byte_to_col: [2048]u16 = undefined,
-    /// Per-column fg. Sparse — only columns with renderable text get
-    /// written, but downstream lookups index by column so the array is
-    /// sized to MaxCols.
     col_fg: [render_snapshot.MaxCols]Rgb = undefined,
+    /// snail.Cell entries — source ranges + column numbers + colors.
+    cells: [render_snapshot.MaxCols]snail.Cell = undefined,
+    cell_count: usize = 0,
 
     fn reset(self: *RowAccumulator) void {
         self.text_len = 0;
+        self.cell_count = 0;
     }
 
     fn isEmpty(self: *const RowAccumulator) bool {
@@ -144,11 +90,20 @@ const RowAccumulator = struct {
     fn appendCell(self: *RowAccumulator, codepoint: u32, col: u16, fg: Rgb) void {
         if (self.text_len + 4 > self.text.len) return;
         if (col >= self.col_fg.len) return;
+        if (self.cell_count >= self.cells.len) return;
+        const start = self.text_len;
         const n = std.unicode.utf8Encode(@intCast(codepoint), self.text[self.text_len..]) catch 0;
         if (n == 0) return;
         self.col_fg[col] = fg;
         for (0..n) |i| self.byte_to_col[self.text_len + i] = col;
         self.text_len += n;
+        // Build a snail.Cell for this character.
+        self.cells[self.cell_count] = .{
+            .source = .{ .start = @intCast(start), .end = @intCast(self.text_len) },
+            .column = col,
+            .color = fg.toLinearFloat4(1.0),
+        };
+        self.cell_count += 1;
     }
 };
 
@@ -156,160 +111,21 @@ fn rgbEq(a: Rgb, b: Rgb) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b;
 }
 
-/// Append a sub-range to `bip` using either the prepared hinted glyphs
-/// (`.tt` mode, `run` non-null) or the raw shaped glyphs (`.none` /
-/// `.grid` modes, `run` null). Returns whether any glyph was missing
-/// from the atlas. Updates hint counters when hinting.
-fn appendSubRange(
-    bip: snail.BlobInProgress,
-    shaped: *const snail.ShapedText,
-    run: ?*const snail.TrueTypePreparedHintRun,
-    start: usize,
-    end: usize,
-    placement: snail.TextPlacement,
-    fill_color: [4]f32,
-) !bool {
-    const fill: snail.Paint = .{ .solid = fill_color };
-    if (run) |r| {
-        const append_t0 = perf.Timer.now();
-        const result = try bip.append(.{
-            .source = .{ .hinted = r.glyphs[start..end] },
-            .placement = placement,
-            .fill = fill,
-        });
-        phase_hint_append_ns += append_t0.elapsedNs();
-        return result.missing;
-    }
-    const result = try bip.append(.{
-        .source = .{ .shaped = shaped.glyphs[start..end] },
-        .placement = placement,
-        .fill = fill,
-    });
-    return result.missing;
-}
-
-/// Shape the whole row in one HB call, then walk the shaped glyphs
-/// and emit `builder.append` ranges grouped by fg color. The fg color
-/// for each glyph comes from the cell its `source_start` byte falls in
-/// — that's why the accumulator tracks a byte→column index.
-///
-/// `placement.baseline.x` for each sub-range is anchored to the first
-/// glyph's cell column on the absolute grid, so cells with no
-/// renderable text (which contributed nothing to the shape) leave gaps
-/// in exactly the right places. Cell width matches the font's natural
-/// advance, so ligatures across cells still span the correct number of
-/// columns.
-fn flushRow(
-    row: *RowAccumulator,
-    bip: snail.BlobInProgress,
-    atlas: *const snail.TextAtlas,
-    atlas_ref: *atlas_ref_mod.AtlasRef,
-    allocator: std.mem.Allocator,
-    metrics: Metrics,
-    row_y: f32,
-    misses: *glyph_misses.Set,
-    hint_ctx: *snail.TrueTypeHintContext,
-) !bool {
-    if (row.isEmpty()) return false;
-    var shaped = try atlas_ref.shape(atlas, allocator, .{}, row.text[0..row.text_len]);
-    defer shaped.deinit();
-    if (shaped.glyphs.len == 0) {
-        row.reset();
-        return false;
-    }
-
-    // .tt mode: prepare the whole row once, then sub-slice by fg group.
-    // .none/.grid: skip the hint context entirely.
-    var hint_run: ?snail.TrueTypePreparedHintRun = null;
-    defer if (hint_run) |*r| r.deinit();
-    if (render_env.loadHintMode() == .tt) {
-        const ppem = snail.TrueTypeHintPpem.uniform(@intFromFloat(@round(metrics.font_size * 64.0)));
-        const prepare_t0 = perf.Timer.now();
-        hint_run = try hint_ctx.prepareRun(allocator, .{
-            .shaped = &shaped,
-            .ppem = ppem,
-        });
-        phase_hint_prepare_ns += prepare_t0.elapsedNs();
-        phase_hint_runs += 1;
-        phase_hint_glyphs_hinted += hint_run.?.stats.hinted_count;
-        phase_hint_glyphs_fallback += hint_run.?.stats.fallback_count;
-        if (render_env.hint_diag_enabled and hint_run.?.stats.fallback_count > 0) {
-            collectFallbackReasons(hint_ctx, &hint_run.?, ppem);
-        }
-    }
-    const run_ptr: ?*const snail.TrueTypePreparedHintRun = if (hint_run) |*r| r else null;
-
-    const baseline_y = row_y + metrics.baseline();
-    var had_misses = false;
-    var group_start: usize = 0;
-    var group_col: u16 = colForGlyph(row, &shaped.glyphs[0]);
-    var group_fg: Rgb = row.col_fg[group_col];
-
-    var i: usize = 1;
-    while (i <= shaped.glyphs.len) : (i += 1) {
-        const at_end = i == shaped.glyphs.len;
-        const next_fg = if (at_end) group_fg else row.col_fg[colForGlyph(row, &shaped.glyphs[i])];
-        if (at_end or !rgbEq(next_fg, group_fg)) {
-            const placement: snail.TextPlacement = .{
-                .baseline = .{
-                    .x = @as(f32, @floatFromInt(group_col)) * metrics.cell_width,
-                    .y = baseline_y,
-                },
-                .em = metrics.font_size,
-            };
-            const sub_missing = try appendSubRange(
-                bip,
-                &shaped,
-                run_ptr,
-                group_start,
-                i,
-                placement,
-                group_fg.toFloat4(1.0),
-            );
-            if (sub_missing) had_misses = true;
-            if (!at_end) {
-                group_start = i;
-                group_col = colForGlyph(row, &shaped.glyphs[i]);
-                group_fg = next_fg;
-            }
-        }
-    }
-
-    // If any sub-range had a missing glyph, the atlas thread needs to
-    // see the entire row's text so it can extend coverage for whatever
-    // codepoint produced the .notdef. Sub-range granularity is wasted
-    // here — the miss set is deduped anyway.
-    if (had_misses) misses.addRun(row.text[0..row.text_len]);
-    row.reset();
-    return had_misses;
-}
-
-fn colForGlyph(row: *const RowAccumulator, glyph: *const snail.ShapedText.Glyph) u16 {
-    const start = @min(glyph.source_start, @as(u32, @intCast(row.text_len -| 1)));
-    return row.byte_to_col[start];
-}
-
-/// Build one row of glyphs (into `bip`) and rects (into `scratch_rects`).
-///
-/// Coordinates are biased by `row_y`: pass 0 for a row-local cache entry,
-/// or the row's absolute Y to bake the position into the output. Caller
-/// owns the BlobInProgress and is responsible for `finish` / `abort`.
-///
-/// `cell_index` is advanced past the cells consumed (up to `cols`).
-pub fn buildRow(
+/// Build one row: walk cells, accumulate text, shape, record, place.
+/// Returns the shapes (caller-owned via allocator) and rects.
+fn buildRow(
     snapshot: *const render_snapshot.SharedSnapshot,
     cell_index: *usize,
     cols: u16,
     row_y: f32,
     scratch_rects: []ColoredRect,
-    bip: snail.BlobInProgress,
-    atlas: *const snail.TextAtlas,
-    atlas_ref: *atlas_ref_mod.AtlasRef,
+    atlas: *const snail.Atlas,
+    faces: *snail.Faces,
     allocator: std.mem.Allocator,
     metrics: Metrics,
     misses: *glyph_misses.Set,
-    hint_ctx: *snail.TrueTypeHintContext,
-) !BuildResult {
+    shapes_out: []snail.Shape,
+) !struct { rect_count: usize, shape_count: usize, had_misses: bool } {
     var rect_count: usize = 0;
     var had_misses = false;
 
@@ -340,6 +156,7 @@ pub fn buildRow(
         const fg = resolved.fg;
         const cell_bg = resolved.bg;
 
+        // Background span coalescing
         const bg_matches = if (cell_bg) |cbg|
             if (bg_span_color) |sc| sc.r == cbg.r and sc.g == cbg.g and sc.b == cbg.b else false
         else
@@ -355,7 +172,7 @@ pub fn buildRow(
                             .y = row_y,
                             .w = @as(f32, @floatFromInt(bg_span_len)) * metrics.cell_width,
                             .h = metrics.cell_height,
-                            .color = sc.toFloat4(1.0),
+                            .color = sc.toLinearFloat4(1.0),
                         };
                         rect_count += 1;
                     }
@@ -371,7 +188,7 @@ pub fn buildRow(
             }
         }
 
-        const has_renderable_text = flags.has_text and snail.isRenderableTextCodepoint(cell.codepoint);
+        const has_renderable_text = flags.has_text and isRenderableCodepoint(cell.codepoint);
         if (has_renderable_text) {
             row.appendCell(cell.codepoint, col_idx, fg);
         }
@@ -382,7 +199,7 @@ pub fn buildRow(
                 .y = row_y + metrics.cell_height - 1,
                 .w = metrics.cell_width,
                 .h = 1,
-                .color = fg.toFloat4(1.0),
+                .color = fg.toLinearFloat4(1.0),
             };
             rect_count += 1;
         }
@@ -392,39 +209,107 @@ pub fn buildRow(
                 .y = row_y + metrics.cell_height * 0.45,
                 .w = metrics.cell_width,
                 .h = 1,
-                .color = fg.toFloat4(1.0),
+                .color = fg.toLinearFloat4(1.0),
             };
             rect_count += 1;
         }
     }
 
-    if (try flushRow(&row, bip, atlas, atlas_ref, allocator, metrics, row_y, misses, hint_ctx)) had_misses = true;
-
-    if (bg_span_len > 0) {
-        if (bg_span_color) |sc| {
-            if (rect_count < scratch_rects.len) {
+    // Shape + record + place
+    var shape_count: usize = 0;
+    if (!row.isEmpty()) {
+        var shaped = snail.shape(allocator, faces, row.text[0..row.text_len], .{}) catch {
+            row.reset();
+            // Flush trailing bg span
+            if (bg_span_len > 0 and bg_span_color != null and rect_count < scratch_rects.len) {
                 scratch_rects[rect_count] = .{
                     .x = @as(f32, @floatFromInt(bg_span_start)) * metrics.cell_width,
                     .y = row_y,
                     .w = @as(f32, @floatFromInt(bg_span_len)) * metrics.cell_width,
                     .h = metrics.cell_height,
-                    .color = sc.toFloat4(1.0),
+                    .color = bg_span_color.?.toLinearFloat4(1.0),
                 };
                 rect_count += 1;
             }
+            return .{ .rect_count = rect_count, .shape_count = 0, .had_misses = false };
+        };
+        defer shaped.deinit();
+
+        if (shaped.glyphs.len > 0) {
+            // Detect glyphs not yet present in the (immutable) atlas
+            // snapshot. The render path must never mutate the shared atlas
+            // — the atlas owner thread extends it — so this is read-only:
+            // any absent glyph marks the whole row as a miss and its text
+            // is collected below so the caller can request an extension.
+            for (shaped.glyphs) |glyph| {
+                const font_id = faces.fontIdForFace(glyph.face_index) orelse continue;
+                const key = snail.record_key.unhintedGlyph(font_id, @intCast(glyph.glyph_id));
+                if (!atlas.contains(key)) {
+                    had_misses = true;
+                    break;
+                }
+            }
+
+            // Place cells into shapes
+            const baseline_y = row_y + metrics.baseline();
+            const placement: snail.CellRunPlacement = .{
+                .baseline = .{ .x = 0, .y = baseline_y },
+                .cell_width = metrics.cell_width,
+                .em = metrics.font_size,
+                .snap = .grid,
+                .world_to_pixel = .identity,
+                .colr = true,
+            };
+
+            const expected_count = snail.placedCellRunShapeCount(&shaped, faces, row.cells[0..row.cell_count], placement) catch 0;
+            if (expected_count > 0 and expected_count <= shapes_out.len) {
+                const placed = snail.placeCellRun(shapes_out[0..expected_count], &shaped, faces, row.cells[0..row.cell_count], placement) catch {
+                    row.reset();
+                    if (bg_span_len > 0 and bg_span_color != null and rect_count < scratch_rects.len) {
+                        scratch_rects[rect_count] = .{
+                            .x = @as(f32, @floatFromInt(bg_span_start)) * metrics.cell_width,
+                            .y = row_y,
+                            .w = @as(f32, @floatFromInt(bg_span_len)) * metrics.cell_width,
+                            .h = metrics.cell_height,
+                            .color = bg_span_color.?.toLinearFloat4(1.0),
+                        };
+                        rect_count += 1;
+                    }
+                    return .{ .rect_count = rect_count, .shape_count = 0, .had_misses = had_misses };
+                };
+                shape_count = placed.len;
+            }
+
+            if (had_misses) misses.addRun(row.text[0..row.text_len]);
         }
+        row.reset();
     }
 
-    return .{ .rect_count = rect_count, .had_misses = had_misses };
+    // Flush trailing bg span
+    if (bg_span_len > 0 and bg_span_color != null and rect_count < scratch_rects.len) {
+        scratch_rects[rect_count] = .{
+            .x = @as(f32, @floatFromInt(bg_span_start)) * metrics.cell_width,
+            .y = row_y,
+            .w = @as(f32, @floatFromInt(bg_span_len)) * metrics.cell_width,
+            .h = metrics.cell_height,
+            .color = bg_span_color.?.toLinearFloat4(1.0),
+        };
+        rect_count += 1;
+    }
+
+    return .{ .rect_count = rect_count, .shape_count = shape_count, .had_misses = had_misses };
 }
 
-/// Per-frame stash for heap-allocated `ColoredRect` slices that the
-/// rendered scene references by pointer. Released in bulk at end of
-/// frame; both backends own one. Blobs themselves live in the
-/// `TextBlobBundle`'s arena now and don't need separate stashing.
+fn isRenderableCodepoint(cp: u32) bool {
+    return cp > 0x20 and cp < 0x110000;
+}
+
+// ── Per-frame stash for heap-allocated slices ──
+
 pub const EphemeralBlobs = struct {
     allocator: std.mem.Allocator,
     rect_slices: std.ArrayList([]ColoredRect) = .empty,
+    shape_slices: std.ArrayList([]snail.Shape) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) EphemeralBlobs {
         return .{ .allocator = allocator };
@@ -433,25 +318,29 @@ pub const EphemeralBlobs = struct {
     pub fn deinit(self: *EphemeralBlobs) void {
         self.releaseAll();
         self.rect_slices.deinit(self.allocator);
+        self.shape_slices.deinit(self.allocator);
     }
 
     pub fn releaseAll(self: *EphemeralBlobs) void {
         for (self.rect_slices.items) |r| self.allocator.free(r);
+        for (self.shape_slices.items) |s| self.allocator.free(s);
         self.rect_slices.clearRetainingCapacity();
+        self.shape_slices.clearRetainingCapacity();
     }
 
-    /// Take ownership of a heap-allocated rect slice. The slice is
-    /// freed back to `allocator` at the next `releaseAll`.
     pub fn stashRects(self: *EphemeralBlobs, rects: []ColoredRect) !void {
         try self.rect_slices.append(self.allocator, rects);
     }
+
+    pub fn stashShapes(self: *EphemeralBlobs, shapes: []snail.Shape) !void {
+        try self.shape_slices.append(self.allocator, shapes);
+    }
 };
 
-/// Output of `buildSnapshot`: the per-row draw list (blob + row_y) and
-/// an optional cursor overlay. Backends iterate this to emit the four
-/// passes (clear → bg/decoration rects → cursor rect → text scene).
+// ── Output types ──
+
 pub const RowDraw = struct {
-    blob: *const snail.TextBlob,
+    shapes: []const snail.Shape,
     rects: []ColoredRect,
     row_y: f32,
 };
@@ -461,15 +350,8 @@ pub const CursorOverlay = struct {
     cell_y: u16,
     style: render_snapshot.CursorStyle,
     color: Rgb,
-    /// Block-style cursor's inverted glyph, stashed in the per-frame
-    /// EphemeralBlobs. Null for non-block styles, empty cells, missing
-    /// glyphs, or stash-allocation failure.
-    inverted_glyph: ?*const snail.TextBlob = null,
 };
 
-/// Per-row span of selected columns, in viewport coordinates. Inclusive
-/// of both endpoints. Width-zero spans are skipped at build time. The
-/// renderer paints these as translucent overlays under the row's text.
 pub const SelectionSpan = struct {
     row: u16,
     start_col: u16,
@@ -482,34 +364,26 @@ pub const BuiltSnapshot = struct {
     rows: []const RowDraw,
     cursor: ?CursorOverlay,
     selection_spans: []const SelectionSpan,
-    /// Optional right-edge scrollbar overlay. Renderers paint a thin
-    /// band on top of everything else when present.
     scrollbar: ?render_snapshot.ScrollbarOverlay,
-    /// Visual-bell overlay. Renderers paint a translucent tint over
-    /// the finished frame when present.
     bell: ?render_snapshot.BellOverlay,
 };
 
+/// Max shapes per row — generous upper bound for a full row of glyphs.
+const MAX_SHAPES_PER_ROW: usize = render_snapshot.MaxCols * 4;
+
 /// Walk a snapshot row-by-row, shape each row's text, and capture cursor
-/// state in one pass. Backends own the four submit passes (see
-/// docs/row-render-design.md for the contract); this layer owns
-/// iteration and the per-frame inverted-glyph build.
-///
-/// `selection_spans_out` receives any selection rectangles produced
-/// from `snapshot.selection`. Cap is `MAX_SELECTION_SPANS`.
+/// state in one pass.
 pub fn buildSnapshot(
     snapshot: *const render_snapshot.SharedSnapshot,
     allocator: std.mem.Allocator,
     metrics: Metrics,
-    bundle: *snail.TextBlobBundle,
-    atlas: *const snail.TextAtlas,
-    atlas_ref: *atlas_ref_mod.AtlasRef,
+    atlas: *const snail.Atlas,
+    faces: *snail.Faces,
     scratch_rects: []ColoredRect,
     rows_out: []RowDraw,
     selection_spans_out: []SelectionSpan,
     rect_stash: *EphemeralBlobs,
     misses: *glyph_misses.Set,
-    hint_ctx: *snail.TrueTypeHintContext,
 ) !BuiltSnapshot {
     const header = snapshot.header;
     const default_fg = header.default_fg;
@@ -526,6 +400,7 @@ pub fn buildSnapshot(
         const row_y = @as(f32, @floatFromInt(row_idx)) * metrics.cell_height;
         const row_start_index = cell_index;
 
+        // Capture cursor cell
         if (header.cursor_visible != 0 and header.cursor_in_viewport != 0 and row_idx == header.cursor_y) {
             const cursor_col = header.cursor_x;
             if (cursor_col < cols and row_start_index + cursor_col < header.cell_count) {
@@ -545,72 +420,51 @@ pub fn buildSnapshot(
 
         const next_index = row_start_index + @min(@as(usize, cols), header.cell_count -| row_start_index);
 
-        // Shape every row every frame. A prior content-hash-keyed cache
-        // was removed: on workloads where every row's content changes
-        // per frame (e.g. tmatrix) the hit rate was 0% and the lookup +
-        // store path was pure overhead; on stable text the per-frame
-        // shape work is the known tradeoff.
         const rebuild_t0 = perf.Timer.now();
-        var bip = try bundle.startBlob();
-        errdefer bip.abort();
         const shape_t0 = perf.Timer.now();
+
+        // Scratch shape buffer for this row
+        var row_shapes: [MAX_SHAPES_PER_ROW]snail.Shape = undefined;
         const built = try buildRow(
             snapshot,
             &cell_index,
             cols,
             0,
             scratch_rects,
-            bip,
             atlas,
-            atlas_ref,
+            faces,
             allocator,
             metrics,
             misses,
-            hint_ctx,
+            &row_shapes,
         );
         phase_row_shape_ns += shape_t0.elapsedNs();
-        const finish_t0 = perf.Timer.now();
-        const blob_key = snail.ResourceKey.fromId(@intCast(row_idx));
-        const blob_ptr = try bip.finish(blob_key);
+
+        // Copy shapes + rects to heap for stable references
+        const shapes = try allocator.dupe(snail.Shape, row_shapes[0..built.shape_count]);
+        try rect_stash.stashShapes(shapes);
         const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
         try rect_stash.stashRects(rects);
-        phase_row_finish_ns += finish_t0.elapsedNs();
+
+        phase_row_finish_ns += perf.Timer.now().elapsedNs();
         phase_row_rebuild_ns += rebuild_t0.elapsedNs();
         phase_row_count += 1;
         cell_index = next_index;
 
-        rows_out[row_count] = .{ .blob = blob_ptr, .rects = rects, .row_y = row_y };
+        rows_out[row_count] = .{ .shapes = shapes, .rects = rects, .row_y = row_y };
         row_count += 1;
     }
 
+    // Cursor overlay
     var cursor: ?CursorOverlay = null;
     if (header.cursor_visible != 0 and header.cursor_in_viewport != 0) {
         const cursor_color = if (header.cursor_has_color != 0) header.cursor_color else default_fg;
-        var overlay: CursorOverlay = .{
+        cursor = .{
             .cell_x = header.cursor_x,
             .cell_y = header.cursor_y,
             .style = header.cursor_style,
             .color = cursor_color,
         };
-        if (header.cursor_style == .block) {
-            if (cursor_cell) |cell| {
-                if (cell.has_text and cell.glyph_id != 0) {
-                    overlay.inverted_glyph = buildInvertedGlyph(
-                        atlas,
-                        atlas_ref,
-                        allocator,
-                        metrics,
-                        cell,
-                        header.cursor_x,
-                        header.cursor_y,
-                        bundle,
-                        misses,
-                        hint_ctx,
-                    ) catch null;
-                }
-            }
-        }
-        cursor = overlay;
     }
 
     const spans = resolveSelectionSpans(snapshot, selection_spans_out, rows, cols);
@@ -624,10 +478,6 @@ pub fn buildSnapshot(
     };
 }
 
-/// Translate the snapshot's anchor/head + mode into the per-row column
-/// ranges the renderer paints. Selection cells store *absolute screen y*;
-/// this helper subtracts the snapshot's viewport_offset to recover
-/// viewport rows and clips off-screen portions of the band.
 fn resolveSelectionSpans(
     snapshot: *const render_snapshot.SharedSnapshot,
     spans_out: []SelectionSpan,
@@ -644,8 +494,6 @@ fn resolveSelectionSpans(
     switch (sel.mode) {
         .char => {
             const ord = sel.ordered();
-            // Convert screen-y to viewport row; entire band may be
-            // off-screen above or below — in which case n stays 0.
             const start_vy = @as(i64, ord.start.row) - offset;
             const end_vy = @as(i64, ord.end.row) - offset;
             if (end_vy < 0 or start_vy >= view_rows) return spans_out[0..0];
@@ -654,9 +502,6 @@ fn resolveSelectionSpans(
             const clip_end_vy = @min(view_rows - 1, end_vy);
             var row_vy: i64 = clip_start_vy;
             while (row_vy <= clip_end_vy and n < spans_out.len) : (row_vy += 1) {
-                // start_col only applies on the *real* first row of
-                // the selection; if we clipped that off, the visible
-                // first row begins at col 0.
                 const sc: u16 = if (row_vy == start_vy) @min(ord.start.col, cols - 1) else 0;
                 const ec: u16 = if (row_vy == end_vy) @min(ord.end.col, cols - 1) else cols - 1;
                 if (ec >= sc) {
@@ -706,10 +551,6 @@ fn resolveSelectionSpans(
     return spans_out[0..n];
 }
 
-/// Expand `cell` (in screen coords) to a word range using the
-/// snapshot's row codepoints. Returns the cell unchanged when the
-/// row is outside the captured viewport — word expansion needs the
-/// row content, which the snapshot only has for visible rows.
 fn expandSnapshotWord(
     snapshot: *const render_snapshot.SharedSnapshot,
     cell: selection_mod.Cell,
@@ -735,52 +576,4 @@ fn expandSnapshotWord(
         .start = .{ .row = cell.row, .col = w.start },
         .end = .{ .row = cell.row, .col = w.end },
     };
-}
-
-fn buildInvertedGlyph(
-    atlas: *const snail.TextAtlas,
-    atlas_ref: *atlas_ref_mod.AtlasRef,
-    allocator: std.mem.Allocator,
-    metrics: Metrics,
-    cell: render_common.CursorCell,
-    cursor_x: u16,
-    cursor_y: u16,
-    bundle: *snail.TextBlobBundle,
-    misses: *glyph_misses.Set,
-    hint_ctx: *snail.TrueTypeHintContext,
-) !?*const snail.TextBlob {
-    var tmp: [4]u8 = undefined;
-    const n = std.unicode.utf8Encode(@intCast(cell.codepoint), &tmp) catch return null;
-    var shaped = try atlas_ref.shape(atlas, allocator, .{}, tmp[0..n]);
-    defer shaped.deinit();
-    const cx = @as(f32, @floatFromInt(cursor_x)) * metrics.cell_width;
-    const cy = @as(f32, @floatFromInt(cursor_y)) * metrics.cell_height;
-    const placement: snail.TextPlacement = .{
-        .baseline = .{ .x = cx, .y = cy + metrics.baseline() },
-        .em = metrics.font_size,
-    };
-    const fill_color = cell.bg.toFloat4(1.0);
-
-    var hint_run: ?snail.TrueTypePreparedHintRun = null;
-    defer if (hint_run) |*r| r.deinit();
-    if (render_env.loadHintMode() == .tt) {
-        hint_run = try hint_ctx.prepareRun(allocator, .{
-            .shaped = &shaped,
-            .ppem = snail.TrueTypeHintPpem.uniform(@intFromFloat(@round(metrics.font_size * 64.0))),
-        });
-    }
-    const run_ptr: ?*const snail.TrueTypePreparedHintRun = if (hint_run) |*r| r else null;
-
-    var bip = try bundle.startBlob();
-    errdefer bip.abort();
-    const missing = try appendSubRange(bip, &shaped, run_ptr, 0, shaped.glyphs.len, placement, fill_color);
-    if (missing) {
-        bip.abort();
-        misses.addRun(tmp[0..n]);
-        return null;
-    }
-    // Bundle owns the blob; key just needs to be unique within the bundle.
-    // The cursor blob uses a fixed sentinel — only one cursor inverted
-    // glyph per frame.
-    return try bip.finish(snail.ResourceKey.named("scrgo.cursor_inv"));
 }

@@ -26,7 +26,7 @@ pub fn monotonicNowNs() u64 {
 /// returns the delta in ns, or null if anything failed.
 pub fn premainAgeNs(io: std.Io) ?u64 {
     var stat_buf: [4096]u8 = undefined;
-    const stat_file = std.Io.Dir.cwd.openFile(io, "/proc/self/stat", .{}) catch return null;
+    const stat_file = std.Io.Dir.cwd().openFile(io, "/proc/self/stat", .{}) catch return null;
     const stat_n = stat_file.readStreaming(io, &.{&stat_buf}) catch return null;
     stat_file.close(io);
     if (stat_n == 0) return null;
@@ -42,7 +42,7 @@ pub fn premainAgeNs(io: std.Io) ?u64 {
     const starttime_jiffies = std.fmt.parseInt(u64, starttime_jiffies_str, 10) catch return null;
 
     var uptime_buf: [128]u8 = undefined;
-    const uptime_file = std.Io.Dir.cwd.openFile(io, "/proc/uptime", .{}) catch return null;
+    const uptime_file = std.Io.Dir.cwd().openFile(io, "/proc/uptime", .{}) catch return null;
     const uptime_n = uptime_file.readStreaming(io, &.{&uptime_buf}) catch return null;
     uptime_file.close(io);
     if (uptime_n == 0) return null;
@@ -59,7 +59,7 @@ pub fn premainAgeNs(io: std.Io) ?u64 {
 }
 
 pub fn readProcStatus(io: std.Io, key: []const u8) u64 {
-    const file = std.Io.Dir.cwd.openFile(io, "/proc/self/status", .{}) catch return 0;
+    const file = std.Io.Dir.cwd().openFile(io, "/proc/self/status", .{}) catch return 0;
     defer file.close(io);
     var buf: [16384]u8 = undefined;
     const n = file.readStreaming(io, &.{&buf}) catch return 0;
@@ -233,7 +233,7 @@ pub const Diagnostics = struct {
             });
         }
 
-        gpu_pipeline.GpuPipeline.frame_stats.dump("frame");
+        gpu_pipeline.frame_stats.dump("frame");
 
         if (self.trace_commits) {
             log.info(.diag, "phases", .{
@@ -259,14 +259,14 @@ pub const Diagnostics = struct {
                 .final_rss_mib = readProcStatus(io, "VmRSS:") / 1024,
                 .final_anon_mib = readProcStatus(io, "RssAnon:") / 1024,
             });
-            if (gpu_pipeline.GpuPipeline.phase_frame_count > 0) {
+            if (cpu_pipeline.phase_frame_count > 0) {
                 log.info(.diag, "gpu pipeline", .{
-                    .frames = gpu_pipeline.GpuPipeline.phase_frame_count,
-                    .row_build_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_row_build_ns)) / ms_f}),
-                    .picture_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_picture_ns)) / ms_f}),
-                    .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_upload_ns)) / ms_f}),
-                    .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_drawlist_ns)) / ms_f}),
-                    .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_pipeline.GpuPipeline.phase_draw_ns)) / ms_f}),
+                    .frames = cpu_pipeline.phase_frame_count,
+                    .row_build_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_row_build_ns)) / ms_f}),
+                    .picture_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_picture_ns)) / ms_f}),
+                    .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_upload_ns)) / ms_f}),
+                    .drawlist_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_drawlist_ns)) / ms_f}),
+                    .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f}),
                 });
             }
             if (cpu_pipeline.phase_frame_count > 0) {
@@ -291,17 +291,18 @@ pub const Diagnostics = struct {
                 var any: u64 = 0;
                 for (r) |v| any +%= v;
                 if (any > 0) {
+                    // TODO: snail 0.13 TrueTypeHintRejectReason mapping
                     log.info(.diag, "tt hinter rejects", .{
-                        .invalid_face = r[@intFromEnum(snail.TrueTypeHintRejectReason.invalid_face)],
-                        .no_tt_program = r[@intFromEnum(snail.TrueTypeHintRejectReason.no_true_type_program)],
-                        .synthetic_embolden = r[@intFromEnum(snail.TrueTypeHintRejectReason.synthetic_embolden)],
-                        .color_glyph = r[@intFromEnum(snail.TrueTypeHintRejectReason.color_glyph)],
-                        .grid_fit_disabled = r[@intFromEnum(snail.TrueTypeHintRejectReason.grid_fit_disabled)],
-                        .missing_base_glyph = r[@intFromEnum(snail.TrueTypeHintRejectReason.missing_base_glyph)],
-                        .topology_changed = r[@intFromEnum(snail.TrueTypeHintRejectReason.topology_changed)],
-                        .bands_not_reusable = r[@intFromEnum(snail.TrueTypeHintRejectReason.bands_not_reusable)],
-                        .empty_hinted_outline = r[@intFromEnum(snail.TrueTypeHintRejectReason.empty_hinted_outline)],
-                        .exec_failed = r[@intFromEnum(snail.TrueTypeHintRejectReason.exec_failed)],
+                        .invalid_face = r[0],
+                        .no_tt_program = r[1],
+                        .synthetic_embolden = r[2],
+                        .color_glyph = r[3],
+                        .grid_fit_disabled = r[4],
+                        .missing_base_glyph = r[5],
+                        .topology_changed = r[6],
+                        .bands_not_reusable = r[7],
+                        .empty_hinted_outline = r[8],
+                        .exec_failed = r[9],
                     });
                 }
             }

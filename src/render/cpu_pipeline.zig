@@ -1,10 +1,10 @@
-//! SHM rendering: snail's CPU rasterizer driven through the unified
-//! Scene/ResourceManifest/PreparedResources/DrawList pipeline. Background
-//! fill, decoration rects, cursor rects, and text all flow through snail —
-//! no local blitter on the hot path.
+//! SHM rendering: snail-raster CPU rasterizer. Background fill, decoration
+//! rects, cursor rects, and text all flow through the unified
+//! shape/place/emit/raster pipeline.
 
 const std = @import("std");
 const snail = @import("snail");
+const raster = @import("snail-raster");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
@@ -24,549 +24,433 @@ const c = @cImport({
 
 const wl = @cImport(@cInclude("wayland-client.h"));
 
-// Stable resource keys; see gpu_pipeline.zig for the same convention on the
-// GPU side. Per-blob paint keys come from textKeysFor so hinted-glyph paint
-// records don't collide across rows in the manifest.
-const ATLAS_KEY = snail.ResourceKey.named("scrgo.atlas");
-const PICTURE_KEY = snail.ResourceKey.named("scrgo.rects");
-const MANIFEST_CAP: usize = render_snapshot.MaxRows + 4;
-
-fn textKeysFor(blob: *const snail.TextBlob) snail.TextResourceKeys {
-    return blob.resourceKeys(ATLAS_KEY, snail.ResourceKey.fromId(@intFromPtr(blob)));
-}
-
 /// Pack RGBA bytes into a u32 matching `WL_SHM_FORMAT_ABGR8888` on a
-/// little-endian host (byte order in memory: R, G, B, A). Used by the
-/// splash blitter below; the per-frame CpuPipeline no longer touches
-/// pixels directly.
+/// little-endian host (byte order in memory: R, G, B, A).
 inline fn abgrPixel(r: u8, g: u8, b: u8, a: u8) u32 {
     return (@as(u32, a) << 24) | (@as(u32, b) << 16) | (@as(u32, g) << 8) | r;
 }
 
 /// Wayland SHM buffer + a minimal solid-color fill, used by the bootstrap
-/// splash before EGL is ready (cf. main.zig). The terminal render path no
-/// longer uses this — it goes through `CpuPipeline` below.
+/// splash before Vulkan is ready.
 pub const ShmFrame = struct {
     map_ptr: ?*anyopaque,
-    map_size: usize,
-    fd: c_int,
-    wl_pool: ?*wl.wl_shm_pool,
-    wl_buffer: ?*wl.wl_buffer,
     width: u32,
     height: u32,
-    stride: u32,
+    wl_pool: ?*wl.wl_shm_pool,
+    wl_buffer: ?*wl.wl_buffer,
+    shm_fd: c_int = -1,
 
-    pub fn create(shm_opaque: *anyopaque, w: u32, h: u32) ?ShmFrame {
-        const shm: *wl.wl_shm = @ptrCast(shm_opaque);
-        const stride = w * 4;
-        const size: usize = @as(usize, stride) * h;
+    pub fn create(shm: *anyopaque, width: u32, height: u32) ShmFrame {
+        const stride = width * 4;
+        const size = stride * height;
 
-        const fd = c.memfd_create("scrgo-shm", @as(c_uint, 0));
-        if (fd < 0) return null;
+        const fd = c.memfd_create("scrgo-shm", c.MFD_CLOEXEC);
+        if (fd < 0) return .{
+            .map_ptr = null,
+            .width = width,
+            .height = height,
+            .wl_pool = null,
+            .wl_buffer = null,
+        };
 
         if (c.ftruncate(fd, @intCast(size)) < 0) {
-            std.c.close(fd);
-            return null;
+            _ = std.c.close(fd);
+            return .{
+                .map_ptr = null,
+                .width = width,
+                .height = height,
+                .wl_pool = null,
+                .wl_buffer = null,
+            };
         }
 
-        const map = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, 0);
+        const map = c.mmap(null, @intCast(size), c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, 0);
         if (map == c.MAP_FAILED) {
-            std.c.close(fd);
-            return null;
+            _ = std.c.close(fd);
+            return .{
+                .map_ptr = null,
+                .width = width,
+                .height = height,
+                .wl_pool = null,
+                .wl_buffer = null,
+            };
         }
 
-        const pool = wl.wl_shm_create_pool(shm, fd, @intCast(size)) orelse {
-            _ = c.munmap(map, size);
-            std.c.close(fd);
-            return null;
-        };
-
-        const buffer = wl.wl_shm_pool_create_buffer(
-            pool,
-            0,
-            @intCast(w),
-            @intCast(h),
-            @intCast(stride),
-            wl.WL_SHM_FORMAT_ABGR8888,
-        ) orelse {
-            wl.wl_shm_pool_destroy(pool);
-            _ = c.munmap(map, size);
-            std.c.close(fd);
-            return null;
-        };
+        const pool = wl.wl_shm_create_pool(@ptrCast(shm), fd, @intCast(size));
+        const buffer = wl.wl_shm_pool_create_buffer(pool, 0, @intCast(width), @intCast(height), @intCast(stride), wl.WL_SHM_FORMAT_ABGR8888);
 
         return .{
             .map_ptr = map,
-            .map_size = size,
-            .fd = fd,
+            .width = width,
+            .height = height,
             .wl_pool = pool,
             .wl_buffer = buffer,
-            .width = w,
-            .height = h,
-            .stride = stride,
+            .shm_fd = fd,
         };
     }
 
     pub fn fillBackground(self: *ShmFrame, bg: Rgb) void {
-        const map = self.map_ptr orelse return;
+        if (self.map_ptr == null) return;
+        const ptr: [*]align(4) u32 = @ptrCast(@alignCast(self.map_ptr.?));
         const pixel = abgrPixel(bg.r, bg.g, bg.b, 255);
-        const base: [*]u8 = @ptrCast(map);
-        if (self.stride == self.width * 4) {
-            const total: usize = @as(usize, self.width) * self.height;
-            const pixels: [*]u32 = @ptrCast(@alignCast(base));
-            @memset(pixels[0..total], pixel);
-            return;
-        }
-        var y: u32 = 0;
-        while (y < self.height) : (y += 1) {
-            const row: [*]u32 = @ptrCast(@alignCast(base + @as(usize, y) * self.stride));
-            @memset(row[0..self.width], pixel);
-        }
+        const count = self.width * self.height;
+        @memset(ptr[0..count], pixel);
+    }
+
+    pub fn commit(self: *ShmFrame, surface: *anyopaque, display: *anyopaque) void {
+        if (self.wl_buffer == null) return;
+        wl.wl_surface_attach(@ptrCast(surface), self.wl_buffer, 0, 0);
+        wl.wl_surface_damage_buffer(@ptrCast(surface), 0, 0, @intCast(self.width), @intCast(self.height));
+        wl.wl_surface_commit(@ptrCast(surface));
+        _ = wl.wl_display_flush(@ptrCast(display));
     }
 
     pub fn destroy(self: *ShmFrame) void {
         if (self.wl_buffer) |b| wl.wl_buffer_destroy(b);
         if (self.wl_pool) |p| wl.wl_shm_pool_destroy(p);
-        if (self.map_ptr) |m| _ = c.munmap(m, self.map_size);
-        if (self.fd >= 0) std.c.close(self.fd);
-    }
-
-    pub fn commit(self: *ShmFrame, surface_opaque: *anyopaque, display_opaque: *anyopaque) void {
-        const surface: *wl.wl_surface = @ptrCast(surface_opaque);
-        const display: *wl.wl_display = @ptrCast(display_opaque);
-        wl.wl_surface_set_buffer_transform(surface, wl.WL_OUTPUT_TRANSFORM_NORMAL);
-        wl.wl_surface_attach(surface, self.wl_buffer, 0, 0);
-        wl.wl_surface_damage_buffer(surface, 0, 0, @intCast(self.width), @intCast(self.height));
-        wl.wl_surface_commit(surface);
-        _ = wl.wl_display_flush(display);
+        if (self.map_ptr) |m| _ = c.munmap(m, @intCast(self.width * self.height * 4));
+        if (self.shm_fd >= 0) _ = std.c.close(self.shm_fd);
+        self.wl_buffer = null;
+        self.wl_pool = null;
+        self.map_ptr = null;
+        self.shm_fd = -1;
     }
 };
 
-/// Per-phase wall-time accumulators (ns) for the CPU render path. Written
-/// by the CPU worker thread; main reads them at exit. Single-writer +
-/// single-reader, race is benign for diagnostics.
+pub var phase_frame_count: u64 = 0;
 pub var phase_row_build_ns: u64 = 0;
 pub var phase_picture_ns: u64 = 0;
 pub var phase_upload_ns: u64 = 0;
 pub var phase_drawlist_ns: u64 = 0;
 pub var phase_draw_ns: u64 = 0;
-pub var phase_frame_count: u64 = 0;
 
-/// Persistent CPU renderer + scene state. One instance per CPU worker thread.
+const Instance = snail.render.records.Instance;
+const DrawBatch = snail.render.records.DrawBatch;
+const Binding = snail.render.records.Binding;
+
+const white_tint: [4]f32 = .{ 1, 1, 1, 1 };
+
 pub const CpuPipeline = struct {
     allocator: std.mem.Allocator,
+    atlas_ref: *atlas_ref_mod.AtlasRef,
+    viewport_w: u32 = 0,
+    viewport_h: u32 = 0,
+    font_size: f32 = 0,
+    cell_width: f32 = 0,
+    cell_height: f32 = 0,
+    baseline_offset: f32 = 0,
+    descent: f32 = 0,
 
-    cpu: snail.CpuRenderer,
-    scene: snail.Scene,
-    /// Lazily created on the first frame against the atlas snapshot the
-    /// frontend hands us. Rebound (cache-preserving when canRebindFrom
-    /// holds) on subsequent snapshot changes, including the sync-extend
-    /// between pass 1 and pass 2 of renderToMemory.
-    bundle: ?snail.TextBlobBundle = null,
-    /// TrueType hint context. Lazy-initialised next to the bundle and
-    /// rebound on the same events.
-    hint_ctx: ?snail.TrueTypeHintContext = null,
+    // Scratch buffers for row_build
+    scratch_rects: [row_build.MAX_RECTS_PER_ROW * render_snapshot.MaxRows]row_build.ColoredRect = undefined,
+    rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
+    selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
+    eph: row_build.EphemeralBlobs,
+    misses: glyph_misses.Set = .{},
 
-    /// Cloned lease on the atlas snapshot the bundle is currently
-    /// bound to. Swapped in `ensureBundleForAtlas` when the caller
-    /// hands us a new identity. `null` until the first frame seeds it.
-    /// No blob outlives the frame that built it, so we never need to
-    /// retain more than one snapshot.
-    atlas_lease: ?atlas_ref_mod.AtlasRef.Lease = null,
-    bundle_atlas_identity: u64 = 0,
+    // snail-raster software renderer state.
+    device_atlas: raster.DeviceAtlas,
+    renderer: ?raster.Renderer = null,
+    instances: std.ArrayList(Instance) = .empty,
+    batches: std.ArrayList(DrawBatch) = .empty,
+    /// Live binding from the last `device_atlas.upload`, released and
+    /// re-issued each frame.
+    cache_binding: ?Binding = null,
 
-    draw_buf: std.ArrayList(u32) = .empty,
-    seg_buf: std.ArrayList(snail.DrawList.Segment) = .empty,
-    overrides: [render_snapshot.MaxRows + 4]snail.Override = undefined,
-    manifest_entries: [MANIFEST_CAP]snail.ResourceManifest.Entry = undefined,
-    scratch_rects: []row_build.ColoredRect,
-    config: render_env.RenderConfig,
-
-    /// Per-frame ephemeral blobs (cursor inversion). Bulk-released after
-    /// each frame.
-    ephemeral_blobs: row_build.EphemeralBlobs,
-
-    pub fn init(allocator: std.mem.Allocator) !CpuPipeline {
-        const config = render_env.loadRenderConfigFromEnv();
-
-        // Buffer is reinit'd per frame with the SHM map. Target encoding /
-        // subpixel order / resolve strategy are all per-frame state on the
-        // DrawPass — no renderer-global setters needed in 0.9.
-        const cpu = snail.CpuRenderer.init(@ptrFromInt(@alignOf(u8)), 1, 1, 4);
-
-        var scene = snail.Scene.init(allocator);
-        errdefer scene.deinit();
-
-        const scratch_rects = try allocator.alloc(row_build.ColoredRect, row_build.MAX_RECTS_PER_ROW);
-        errdefer allocator.free(scratch_rects);
-
-        return .{
+    /// Initialize in place. `self` must point at allocated (uninitialized)
+    /// storage — CpuPipeline embeds several-MB scratch arrays, so returning
+    /// it by value would blow the caller's stack.
+    pub fn init(self: *CpuPipeline, allocator: std.mem.Allocator, atlas_ref: *atlas_ref_mod.AtlasRef) !void {
+        const device_atlas = try raster.DeviceAtlas.init(allocator, atlas_ref.pool, .{});
+        self.* = .{
             .allocator = allocator,
-            .cpu = cpu,
-            .scene = scene,
-            .scratch_rects = scratch_rects,
-            .config = config,
-            .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
+            .atlas_ref = atlas_ref,
+            .eph = row_build.EphemeralBlobs.init(allocator),
+            .device_atlas = device_atlas,
         };
     }
 
     pub fn deinit(self: *CpuPipeline) void {
-        self.ephemeral_blobs.deinit();
-        self.draw_buf.deinit(self.allocator);
-        self.seg_buf.deinit(self.allocator);
-        if (self.bundle) |*b| b.deinit();
-        if (self.hint_ctx) |*ctx| ctx.deinit();
-        if (self.atlas_lease) |*lease| lease.release();
-        self.scene.deinit();
-        self.allocator.free(self.scratch_rects);
+        if (self.cache_binding) |b| self.device_atlas.release(b);
+        self.device_atlas.deinit();
+        self.eph.deinit();
+        self.instances.deinit(self.allocator);
+        self.batches.deinit(self.allocator);
     }
 
-    fn ensureBundleForAtlas(self: *CpuPipeline, atlas_lease: *const atlas_ref_mod.AtlasRef.Lease) void {
-        const atlas = atlas_lease.get();
-        const id = atlas.snapshotIdentity();
-        if (id == self.bundle_atlas_identity) return;
-        const reset_t0 = perf.Timer.now();
-        if (self.bundle) |*b| {
-            b.rebindAtlas(atlas) catch {
-                b.deinit();
-                self.bundle = snail.TextBlobBundle.init(self.allocator, atlas);
-            };
-        } else {
-            self.bundle = snail.TextBlobBundle.init(self.allocator, atlas);
-        }
-        if (self.hint_ctx) |*ctx| ctx.rebindAtlas(atlas) else self.hint_ctx = snail.TrueTypeHintContext.initWithOptions(self.allocator, atlas, .{ .cvt_headroom = 32 });
-        const reset_ns = reset_t0.elapsedNs();
-        if (self.atlas_lease) |*prev| prev.release();
-        self.atlas_lease = atlas_lease.clone();
-        self.bundle_atlas_identity = id;
-        log.info(.cpu, "atlas snapshot", .{
-            .identity = id,
-            .rebind_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
-        });
-    }
-
-    fn currentAtlas(self: *CpuPipeline) *const snail.TextAtlas {
-        const lease = if (self.atlas_lease) |*l| l else unreachable;
-        return lease.get();
-    }
-
-    /// Emit cursor geometry into the per-frame path picture. Same edge-snap
-    /// strategy as the GPU path: edges (not widths) round to integer pixels
-    /// so adjacent cell rects tile without gaps under fractional cell_width.
-    fn emitCursor(
-        picture: *snail.PathPictureBuilder,
-        cursor: row_build.CursorOverlay,
-        cell_width: f32,
-        cell_height: f32,
-    ) !void {
-        const x0_f = @as(f32, @floatFromInt(cursor.cell_x)) * cell_width;
-        const y0_f = @as(f32, @floatFromInt(cursor.cell_y)) * cell_height;
-        const x1_f = @as(f32, @floatFromInt(cursor.cell_x + 1)) * cell_width;
-        const y1_f = @as(f32, @floatFromInt(cursor.cell_y + 1)) * cell_height;
-        const x0 = @round(x0_f);
-        const y0 = @round(y0_f);
-        const x1 = @round(x1_f);
-        const y1 = @round(y1_f);
-        const cw = @max(1.0, x1 - x0);
-        const ch = @max(1.0, y1 - y0);
-        const cc = cursor.color.toFloat4(1.0);
-        const fill: snail.FillStyle = .{ .paint = .{ .solid = cc } };
-        switch (cursor.style) {
-            .block => try picture.addFilledRect(.{ .x = x0, .y = y0, .w = cw, .h = ch }, fill, .identity),
-            .bar => try picture.addFilledRect(.{ .x = x0, .y = y0, .w = 2.0, .h = ch }, fill, .identity),
-            .underline => try picture.addFilledRect(.{ .x = x0, .y = y0 + ch - 2.0, .w = cw, .h = 2.0 }, fill, .identity),
-            .block_hollow => try picture.addStrokedRect(
-                .{ .x = x0, .y = y0, .w = cw, .h = ch },
-                .{ .paint = .{ .solid = cc }, .width = 1.5, .placement = .inside },
-                .identity,
-            ),
-        }
-    }
-
-    /// Paint a translucent rect over the whole viewport, tinted with
-    /// default_fg. `alpha` is the visual-bell fade value — 1.0 at the
-    /// strike, fading to 0. Multiplied by 0.25 to land on a soft tint
-    /// rather than a wash.
-    fn paintBellOverlay(
-        picture: *snail.PathPictureBuilder,
-        bell: render_snapshot.BellOverlay,
-        viewport_w: f32,
-        viewport_h: f32,
-        default_fg: Rgb,
-    ) !void {
-        if (bell.alpha <= 0) return;
-        const tint = default_fg.toFloat4(1.0);
-        const a = @min(1.0, @max(0.0, bell.alpha)) * 0.25;
-        try picture.addFilledRect(
-            .{ .x = 0, .y = 0, .w = viewport_w, .h = viewport_h },
-            .{ .paint = .{ .solid = .{ tint[0], tint[1], tint[2], a } } },
-            .identity,
-        );
-    }
-
-    /// Paint the right-edge scrollbar overlay (gutter + thumb). Both
-    /// renderers share the geometry helpers in render_common so the
-    /// scrollbar looks identical regardless of which path is active.
-    fn paintScrollbar(
-        picture: *snail.PathPictureBuilder,
-        sb: render_snapshot.ScrollbarOverlay,
-        viewport_w: f32,
-        viewport_h: f32,
-        default_fg: Rgb,
-    ) !void {
-        if (sb.alpha <= 0) return;
-        const geom = render_common.scrollbarGeometry(viewport_w, viewport_h, sb.thumb_offset, sb.thumb_size);
-        const colors = render_common.scrollbarColors(default_fg, sb.alpha);
-        try picture.addFilledRect(
-            .{ .x = geom.gutter_x, .y = geom.gutter_y, .w = geom.gutter_w, .h = geom.gutter_h },
-            .{ .paint = .{ .solid = colors.gutter } },
-            .identity,
-        );
-        try picture.addFilledRect(
-            .{ .x = geom.gutter_x, .y = geom.thumb_y, .w = geom.gutter_w, .h = geom.thumb_h },
-            .{ .paint = .{ .solid = colors.thumb } },
-            .identity,
-        );
-    }
-
-    /// Render a snapshot to a Wayland SHM buffer. Returns any text runs
-    /// whose glyphs weren't in the atlas — caller forwards to the atlas
-    /// thread for extension.
-    pub fn renderToMemory(
+    pub fn configure(
         self: *CpuPipeline,
-        map_ptr: *anyopaque,
         width: u32,
         height: u32,
-        stride: u32,
-        snapshot: *const render_snapshot.SharedSnapshot,
-        atlas_lease: *const atlas_ref_mod.AtlasRef.Lease,
         font_size: f32,
         cell_width: f32,
         cell_height: f32,
         baseline_offset: f32,
+        descent: f32,
+    ) void {
+        self.viewport_w = width;
+        self.viewport_h = height;
+        self.font_size = font_size;
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.baseline_offset = baseline_offset;
+        self.descent = descent;
+    }
+
+    /// Render the snapshot to the SHM buffer pixels (ABGR8888 memory order).
+    /// Every fill goes through snail-raster's `fillRect`/`clearRect`, which
+    /// blend in linear light and encode sRGB on store — the exact math the
+    /// GPU's sRGB attachment does in hardware, so the two paths are pixel-exact.
+    pub fn renderToMemory(
+        self: *CpuPipeline,
+        pixels: [*]u8,
+        width: u32,
+        height: u32,
+        stride: u32,
+        snapshot: *const render_snapshot.SharedSnapshot,
+        atlas: *const snail.Atlas,
     ) !void {
-        var misses: glyph_misses.Set = .{};
+        self.eph.releaseAll();
+        self.misses.clear();
+        self.instances.clearRetainingCapacity();
+        self.batches.clearRetainingCapacity();
+
+        const buf: []u8 = pixels[0 .. @as(usize, stride) * height];
         const default_bg = snapshot.header.default_bg;
+        const default_fg = snapshot.header.default_fg;
 
-        // Reinitialize CPU renderer for this frame's buffer geometry.
-        self.cpu.reinitBuffer(@ptrCast(map_ptr), width, height, stride);
-
-        self.ensureBundleForAtlas(atlas_lease);
-
-        const metrics: row_build.Metrics = .{
-            .cell_width = cell_width,
-            .cell_height = cell_height,
-            .font_size = font_size,
-            .baseline_offset = baseline_offset,
+        const surface: raster.TargetSurface = .{
+            .pixel_width = width,
+            .pixel_height = height,
+            .encoding = .srgb,
+            .format = .rgba8_unorm,
         };
 
-        self.scene.reset();
-        self.bundle.?.reset();
+        // Point the software renderer at this frame's SHM buffer.
+        if (self.renderer) |*r| {
+            try r.reinitBuffer(buf, width, height, stride, .rgba8_unorm);
+        } else {
+            self.renderer = try raster.Renderer.init(buf, width, height, stride, .rgba8_unorm);
+        }
+        const r = &self.renderer.?;
 
-        var rows_buf: [render_snapshot.MaxRows]row_build.RowDraw = undefined;
-        var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
-        const row_build_t0 = perf.Timer.now();
+        // ── 1. Background clear (sRGB, no blend) ──
+        r.clearRect(surface, .full(width, height), default_bg.toFloat4(1.0)) catch {};
+
+        // ── 2. Build the frame; grow the atlas on glyph misses ──
+        // The atlas starts empty: when the build reports misses, extend the
+        // shared atlas (publishing a new snapshot) and rebuild against it.
+        const metrics: row_build.Metrics = .{
+            .cell_width = self.cell_width,
+            .cell_height = self.cell_height,
+            .font_size = self.font_size,
+            .baseline_offset = self.baseline_offset,
+        };
+        const faces = self.atlas_ref.faces orelse return error.NoFaces;
+
+        var cur_atlas = atlas;
+        var extra_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
+        defer if (extra_lease) |*l| l.release();
+
         var built = try row_build.buildSnapshot(
             snapshot,
             self.allocator,
             metrics,
-            &self.bundle.?,
-            self.currentAtlas(),
-            atlas_lease.ref,
-            self.scratch_rects,
-            rows_buf[0..],
-            sel_buf[0..],
-            &self.ephemeral_blobs,
-            &misses,
-            &self.hint_ctx.?,
+            cur_atlas,
+            faces,
+            &self.scratch_rects,
+            &self.rows_out,
+            &self.selection_spans,
+            &self.eph,
+            &self.misses,
         );
-        phase_row_build_ns += row_build_t0.elapsedNs();
 
-        // Pass 1 had glyph misses; try a single sync atlas extension.
-        // On success: republish, refresh local state, re-run the build
-        // against the new atlas. On miss/failure: ship partial — buffer
-        // shows gaps for the missing glyphs but the rest paints.
-        if (!misses.isEmpty()) {
-            const baseline_atlas = self.currentAtlas();
-            const result = self.extendAtlas(atlas_lease, baseline_atlas, misses.text());
-            if (result == .extended) {
-                self.scene.reset();
-                self.bundle.?.reset();
-                self.ephemeral_blobs.releaseAll();
-                misses.clear();
-                const rebuild_t0 = perf.Timer.now();
-                built = try row_build.buildSnapshot(
-                    snapshot,
-                    self.allocator,
-                    metrics,
-                    &self.bundle.?,
-                    self.currentAtlas(),
-                    atlas_lease.ref,
-                    self.scratch_rects,
-                    rows_buf[0..],
-                    sel_buf[0..],
-                    &self.ephemeral_blobs,
-                    &misses,
-                    &self.hint_ctx.?,
-                );
-                phase_row_build_ns += rebuild_t0.elapsedNs();
-            }
-        }
-
-        try self.flushDraw(built, default_bg, snapshot.header.default_fg, width, height, cell_width, cell_height);
-        self.ephemeral_blobs.releaseAll();
-    }
-
-    fn extendAtlas(
-        self: *CpuPipeline,
-        atlas_lease: *const atlas_ref_mod.AtlasRef.Lease,
-        baseline: *const snail.TextAtlas,
-        miss_text: []const u8,
-    ) atlas_ref_mod.AtlasRef.ExtendResult {
-        const atlas_ref = atlas_lease.ref;
-        const result = atlas_ref.extend(baseline, miss_text) catch return .missing;
-        if (result != .extended) return result;
-        var new_lease = atlas_ref.acquire();
-        defer new_lease.release();
-        self.ensureBundleForAtlas(&new_lease);
-        return .extended;
-    }
-
-    fn flushDraw(
-        self: *CpuPipeline,
-        built: row_build.BuiltSnapshot,
-        default_bg: Rgb,
-        default_fg: Rgb,
-        viewport_w: u32,
-        viewport_h: u32,
-        cell_width: f32,
-        cell_height: f32,
-    ) !void {
-        const picture_t0 = perf.Timer.now();
-        var picture_builder = snail.PathPictureBuilder.init(self.allocator);
-        defer picture_builder.deinit();
-
-        for (built.rows) |row_draw| {
-            for (row_draw.rects) |r| {
-                if (r.w <= 0.0 or r.h <= 0.0) continue;
-                try picture_builder.addFilledRect(
-                    .{ .x = r.x, .y = r.y + row_draw.row_y, .w = r.w, .h = r.h },
-                    .{ .paint = .{ .solid = r.color } },
-                    .identity,
-                );
-            }
-        }
-        // Selection sits between cell backgrounds and the text run:
-        // the highlight covers cell bg but the glyphs draw on top of
-        // it. We use the default fg with a fixed alpha so the
-        // selection is visible on any theme; the linear-resolve pass
-        // blends it against whatever's beneath.
-        const sel_color = render_common.selectionFillColor(default_bg);
-        for (built.selection_spans) |span| {
-            const x0 = @as(f32, @floatFromInt(span.start_col)) * cell_width;
-            const y0 = @as(f32, @floatFromInt(span.row)) * cell_height;
-            const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * cell_width;
-            try picture_builder.addFilledRect(
-                .{ .x = x0, .y = y0, .w = w, .h = cell_height },
-                .{ .paint = .{ .solid = sel_color } },
-                .identity,
+        var extend_attempts: u32 = 0;
+        while (!self.misses.isEmpty() and extend_attempts < 4) : (extend_attempts += 1) {
+            const result = self.atlas_ref.extend(cur_atlas, faces, self.misses.text()) catch break;
+            if (result == .missing) break;
+            if (extra_lease) |*l| l.release();
+            extra_lease = self.atlas_ref.acquire();
+            cur_atlas = extra_lease.?.get();
+            self.eph.releaseAll();
+            self.misses.clear();
+            built = try row_build.buildSnapshot(
+                snapshot,
+                self.allocator,
+                metrics,
+                cur_atlas,
+                faces,
+                &self.scratch_rects,
+                &self.rows_out,
+                &self.selection_spans,
+                &self.eph,
+                &self.misses,
             );
         }
-        if (built.cursor) |cursor| try emitCursor(&picture_builder, cursor, cell_width, cell_height);
 
-        // Scrollbar overlay: thin band on the right edge, drawn after
-        // text/cursor so it sits on top of everything. Snapshot carries
-        // null when the scrollbar should be hidden.
-        if (built.scrollbar) |sb| {
-            try paintScrollbar(&picture_builder, sb, @floatFromInt(viewport_w), @floatFromInt(viewport_h), default_fg);
-        }
-
-        // Visual-bell overlay: a translucent full-viewport rect tinted
-        // by default_fg, alpha-fading across the bell window. Last in
-        // paint order so the tint blends over text + scrollbar.
-        if (built.bell) |bell| {
-            try paintBellOverlay(&picture_builder, bell, @floatFromInt(viewport_w), @floatFromInt(viewport_h), default_fg);
-        }
-
-        // Glyph-only frames leave the builder empty; `freeze` would
-        // error with EmptyPicture. Skip the picture path entirely in
-        // that case — `backdrop = .clear` below still seeds the buffer
-        // to default_bg and the text scene paints on top.
-        var maybe_picture: ?snail.PathPicture = if (picture_builder.shapeCount() > 0) try picture_builder.freeze(.{
-            .persistent_allocator = self.allocator,
-            .scratch_allocator = self.allocator,
-        }) else null;
-        defer if (maybe_picture) |*p| p.deinit();
-        phase_picture_ns += picture_t0.elapsedNs();
-
-        var manifest = snail.ResourceManifest.init(self.manifest_entries[0..]);
-        if (maybe_picture) |*picture| {
-            try manifest.putPathPicture(PICTURE_KEY, picture);
-            try self.scene.addPath(.{ .picture = picture, .resource_key = PICTURE_KEY });
-        }
-
-        var override_index: usize = 0;
-        for (built.rows) |row_draw| {
-            if (row_draw.blob.glyphCount() == 0) continue;
-            if (override_index >= self.overrides.len) break;
-            self.overrides[override_index] = .{
-                .transform = snail.Transform2D.translate(0, row_draw.row_y),
-                .tint = .{ 1, 1, 1, 1 },
-            };
-            const slot = self.overrides[override_index .. override_index + 1];
-            override_index += 1;
-            const row_keys = textKeysFor(row_draw.blob);
-            try manifest.putTextBlob(row_keys, row_draw.blob);
-            try self.scene.addText(.{
-                .blob = row_draw.blob,
-                .resources = row_keys,
-                .instances = slot,
-            });
-        }
-        if (built.cursor) |cursor| {
-            if (cursor.inverted_glyph) |blob| {
-                const cursor_keys = textKeysFor(blob);
-                try manifest.putTextBlob(cursor_keys, blob);
-                try self.scene.addText(.{ .blob = blob, .resources = cursor_keys });
+        // ── 3. Background spans + decoration rects (linear, row-local +row_y) ──
+        for (built.rows) |row| {
+            for (row.rects) |rect| {
+                fillRect(r, surface, rect.x, rect.y + row.row_y, rect.w, rect.h, rect.color);
             }
         }
 
-        const upload_t0 = perf.Timer.now();
-        var prepared = try self.cpu.uploadResourcesBlocking(
-            .{ .persistent = self.allocator, .scratch = self.allocator },
-            &manifest,
-        );
-        defer prepared.deinit();
-        phase_upload_ns += upload_t0.elapsedNs();
+        // ── 4. Selection highlight (translucent, behind text) ──
+        if (built.selection_spans.len > 0) {
+            const sel = render_common.selectionFillColor(default_bg);
+            for (built.selection_spans) |span| {
+                const x = @as(f32, @floatFromInt(span.start_col)) * self.cell_width;
+                const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * self.cell_width;
+                const y = @as(f32, @floatFromInt(span.row)) * self.cell_height;
+                fillRect(r, surface, x, y, w, self.cell_height, sel);
+            }
+        }
 
-        const drawlist_t0 = perf.Timer.now();
-        const buf_words = snail.DrawList.estimate(&self.scene);
-        const seg_count = snail.DrawList.estimateSegments(&self.scene);
-        try self.draw_buf.resize(self.allocator, buf_words);
-        try self.seg_buf.resize(self.allocator, seg_count);
-        var draw_list = snail.DrawList.init(self.draw_buf.items, self.seg_buf.items);
-        try draw_list.addScene(&prepared, &self.scene);
-        phase_drawlist_ns += drawlist_t0.elapsedNs();
+        // ── 5. Text ──
+        try self.drawText(surface, cur_atlas, built.rows);
 
-        const pass: snail.DrawPass = .{
-            .state = .{
-                .mvp = snail.Mat4.ortho(0, @floatFromInt(viewport_w), @floatFromInt(viewport_h), 0, -1, 1),
-                .surface = .{
-                    .pixel_width = @floatFromInt(viewport_w),
-                    .pixel_height = @floatFromInt(viewport_h),
-                    .encoding = .srgb_pixels_on_linear_attachment,
-                },
-                .raster = render_env.effectiveRasterOptions(self.config),
-            },
-            .resolve = .{ .linear = .{
-                // Snail owns the whole pixel now — seed with the default bg
-                // and the rect picture + text run land on top.
-                .backdrop = .{ .clear = default_bg.toFloat4(1.0) },
-            } },
+        // ── 6. Cursor ──
+        if (built.cursor) |cursor| self.drawCursor(r, surface, cursor);
+
+        // ── 7. Scrollbar ──
+        if (built.scrollbar) |sb| {
+            if (sb.alpha > 0) {
+                const geo = render_common.scrollbarGeometry(
+                    @floatFromInt(width),
+                    @floatFromInt(height),
+                    sb.thumb_offset,
+                    sb.thumb_size,
+                );
+                const colors = render_common.scrollbarColors(default_fg, sb.alpha);
+                fillRect(r, surface, geo.gutter_x, geo.gutter_y, geo.gutter_w, geo.gutter_h, colors.gutter);
+                fillRect(r, surface, geo.gutter_x, geo.thumb_y, geo.gutter_w, geo.thumb_h, colors.thumb);
+            }
+        }
+
+        // ── 8. Visual bell — full-viewport tint ──
+        if (built.bell) |bell| {
+            if (bell.alpha > 0) {
+                const fg = default_fg.toLinearFloat4(1.0);
+                fillRect(r, surface, 0, 0, @floatFromInt(width), @floatFromInt(height), .{ fg[0], fg[1], fg[2], 0.15 * bell.alpha });
+            }
+        }
+    }
+
+    /// Emit every row's placed glyph shapes and rasterize them over the buffer.
+    fn drawText(
+        self: *CpuPipeline,
+        surface: raster.TargetSurface,
+        atlas: *const snail.Atlas,
+        rows: []const row_build.RowDraw,
+    ) !void {
+        var total_shapes: usize = 0;
+        for (rows) |row| total_shapes += row.shapes.len;
+        if (total_shapes == 0) return;
+
+        // Refresh the software atlas cache for the current atlas snapshot.
+        // The prepared pages are cache-owned copies, so the binding stays
+        // valid across the frame regardless of atlas republication.
+        if (self.cache_binding) |b| {
+            self.device_atlas.release(b);
+            self.cache_binding = null;
+        }
+        var bindings: [1]Binding = undefined;
+        try self.device_atlas.upload(self.allocator, &[_]*const snail.Atlas{atlas}, &bindings);
+        self.cache_binding = bindings[0];
+        const binding = bindings[0];
+
+        // Generous upper bound: emit may expand a shape into several
+        // per-layer instances (COLR / hinted).
+        const cap = total_shapes * 8 + 64;
+        try self.instances.resize(self.allocator, cap);
+        try self.batches.resize(self.allocator, cap);
+
+        var instance_len: usize = 0;
+        var batch_len: usize = 0;
+        for (rows) |row| {
+            if (row.shapes.len == 0) continue;
+            const xform = snail.Transform2D.translate(0, row.row_y);
+            _ = snail.emit.emit(
+                self.instances.items,
+                self.batches.items,
+                &instance_len,
+                &batch_len,
+                binding,
+                atlas,
+                row.shapes,
+                xform,
+                white_tint,
+            ) catch |err| {
+                log.warn(.cpu, "emit failed for row", .{ .err = err });
+                continue;
+            };
+        }
+        if (instance_len == 0) return;
+
+        const wf: f32 = @floatFromInt(surface.pixel_width);
+        const hf: f32 = @floatFromInt(surface.pixel_height);
+        const draw_state: raster.DrawState = .{
+            .surface = surface,
+            .raster = .{},
+            .mvp = snail.Mat4.ortho(0, wf, hf, 0, -1, 1),
         };
-        const draw_t0 = perf.Timer.now();
-        try self.cpu.drawPass(&prepared, &draw_list, pass);
-        phase_draw_ns += draw_t0.elapsedNs();
-        phase_frame_count += 1;
+
+        raster.draw(
+            &self.renderer.?,
+            draw_state,
+            .{ .instances = self.instances.items[0..instance_len], .batches = self.batches.items[0..batch_len] },
+            &[_]*const raster.DeviceAtlas{&self.device_atlas},
+            null,
+        ) catch |err| {
+            log.warn(.cpu, "raster draw failed", .{ .err = err });
+        };
+    }
+
+    fn drawCursor(
+        self: *CpuPipeline,
+        r: *raster.Renderer,
+        surface: raster.TargetSurface,
+        cursor: row_build.CursorOverlay,
+    ) void {
+        const x = @as(f32, @floatFromInt(cursor.cell_x)) * self.cell_width;
+        const y = @as(f32, @floatFromInt(cursor.cell_y)) * self.cell_height;
+        const cw = self.cell_width;
+        const ch = self.cell_height;
+        switch (cursor.style) {
+            .block => fillRect(r, surface, x, y, cw, ch, cursor.color.toLinearFloat4(0.7)),
+            .bar => {
+                const ext = render_common.barCursorExtent(y, ch, self.baseline_offset, self.descent);
+                fillRect(r, surface, x, ext.y, 2, ext.h, cursor.color.toLinearFloat4(1.0));
+            },
+            .underline => {
+                const ext = render_common.underlineCursorExtent(y, ch, self.baseline_offset, self.descent);
+                fillRect(r, surface, x, ext.y, cw, ext.h, cursor.color.toLinearFloat4(1.0));
+            },
+            .block_hollow => {
+                const c1 = cursor.color.toLinearFloat4(1.0);
+                fillRect(r, surface, x, y, cw, 1, c1);
+                fillRect(r, surface, x, y + ch - 1, cw, 1, c1);
+                fillRect(r, surface, x, y, 1, ch, c1);
+                fillRect(r, surface, x + cw - 1, y, 1, ch, c1);
+            },
+        }
     }
 };
+
+/// Convert a float pixel rectangle to an integer `PixelRect` (floor origin,
+/// ceil extent so nothing is dropped) and source-over it in linear light via
+/// snail-raster. `color` is linear straight-alpha.
+fn fillRect(r: *raster.Renderer, surface: raster.TargetSurface, fx: f32, fy: f32, fw: f32, fh: f32, col: [4]f32) void {
+    if (fw <= 0 or fh <= 0 or col[3] <= 0) return;
+    const x0: i32 = @intFromFloat(@floor(fx));
+    const y0: i32 = @intFromFloat(@floor(fy));
+    const x1: i32 = @intFromFloat(@ceil(fx + fw));
+    const y1: i32 = @intFromFloat(@ceil(fy + fh));
+    const rect: raster.PixelRect = .{
+        .x = x0,
+        .y = y0,
+        .w = @intCast(@max(0, x1 - x0)),
+        .h = @intCast(@max(0, y1 - y0)),
+    };
+    r.fillRect(surface, rect, col) catch {};
+}

@@ -134,7 +134,6 @@ pub const Terminal = struct {
         _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_WRITE_PTY, @ptrCast(&writePtyCallback));
         _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_BELL, @ptrCast(&bellCallback));
         _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, @ptrCast(&titleChangedCallback));
-
     }
 
     pub fn deinit(self: *Terminal) void {
@@ -182,7 +181,6 @@ pub const Terminal = struct {
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb);
         return .{ .total = sb.total, .offset = sb.offset, .len = sb.len };
     }
-
 
     pub fn updateRenderState(self: *Terminal) !void {
         if (c.ghostty_render_state_update(self.render_state, self.handle) != c.GHOSTTY_SUCCESS)
@@ -306,13 +304,21 @@ pub const Terminal = struct {
             @ptrCast(&style),
         };
         _ = c.ghostty_render_state_row_cells_get_multi(
-            self.row_cells, 2, &base_keys, &base_values, null,
+            self.row_cells,
+            2,
+            &base_keys,
+            &base_values,
+            null,
         );
         const has_fg = c.ghostty_render_state_row_cells_get(
-            self.row_cells, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, @ptrCast(&fg_rgb),
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+            @ptrCast(&fg_rgb),
         ) == c.GHOSTTY_SUCCESS;
         const has_bg = c.ghostty_render_state_row_cells_get(
-            self.row_cells, c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, @ptrCast(&bg_rgb),
+            self.row_cells,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+            @ptrCast(&bg_rgb),
         ) == c.GHOSTTY_SUCCESS;
 
         var info: CellInfo = .{

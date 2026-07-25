@@ -227,7 +227,7 @@ fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    const file = std.Io.Dir.cwd.openFile(io, path_z, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.cwd().openFile(io, path_z, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return error.OpenFailed,
     };

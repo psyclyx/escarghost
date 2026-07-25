@@ -99,33 +99,50 @@ fn createColorModule(b: *std.Build, deps: Deps) *std.Build.Module {
 
 fn createSnailModule(b: *std.Build, deps: Deps) *std.Build.Module {
     const snail_dep = b.dependency("snail", .{});
-    const snail_opts = b.addOptions();
-    snail_opts.addOption(bool, "enable_profiling", false);
-    snail_opts.addOption(bool, "enable_harfbuzz", true);
-    snail_opts.addOption(bool, "enable_vulkan", false);
-    // snail 0.11.0 split the GL backend into three independent toggles.
-    // scrgo only uses the GLES 3.0 renderer; gl33/gl44 stay disabled so
-    // the snail module doesn't link libOpenGL.
-    snail_opts.addOption(bool, "enable_gl33", false);
-    snail_opts.addOption(bool, "enable_gl44", false);
-    snail_opts.addOption(bool, "enable_gles30", true);
-    snail_opts.addOption(bool, "enable_cpu", true);
-
-    const vk_stub = b.createModule(.{
-        .root_source_file = b.addWriteFiles().add("vk_stub.zig", ""),
-    });
-
     const snail_mod = b.createModule(.{
         .root_source_file = snail_dep.path("src/snail/root.zig"),
         .target = deps.target,
         .optimize = deps.optimize,
         .link_libc = true,
     });
-    snail_mod.addOptions("build_options", snail_opts);
-    snail_mod.linkSystemLibrary("GLESv2", .{});
     snail_mod.linkSystemLibrary("harfbuzz", .{});
-    snail_mod.addImport("vulkan_shaders", vk_stub);
     return snail_mod;
+}
+
+/// snail-raster: the CPU rasterizer module. Requires a render-state
+/// sub-module (which re-exports DrawState, TargetSurface, etc.) and
+/// the snail-raster-support module. Both are created from snail's
+/// source tree — no vendoring, just module wiring matching snail's
+/// own build.zig createRasterModule().
+fn createSnailRasterModule(b: *std.Build, deps: Deps, snail_mod: *std.Build.Module) *std.Build.Module {
+    const snail_dep = b.dependency("snail", .{});
+
+    // render-state module — shared DrawState/TargetSurface/etc.
+    const render_state_mod = b.createModule(.{
+        .root_source_file = snail_dep.path("src/render_state.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .imports = &.{.{ .name = "snail", .module = snail_mod }},
+    });
+
+    // snail-raster-support module
+    const raster_support_mod = b.createModule(.{
+        .root_source_file = snail_dep.path("src/snail/raster_support.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .imports = &.{.{ .name = "snail", .module = snail_mod }},
+    });
+
+    const raster_mod = b.createModule(.{
+        .root_source_file = snail_dep.path("src/snail-raster/root.zig"),
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .link_libc = true,
+    });
+    raster_mod.addImport("snail", snail_mod);
+    raster_mod.addImport("render-state", render_state_mod);
+    raster_mod.addImport("snail-raster-support", raster_support_mod);
+    return raster_mod;
 }
 
 const MainOptions = struct {
@@ -135,8 +152,8 @@ const MainOptions = struct {
     wayland_scanner: []const u8,
 };
 
-/// Module for the main scrgo executable: libghostty-vt + snail + the
-/// Wayland/EGL/OpenGL stack + first-party and scanned protocols.
+/// Module for the main scrgo executable: libghostty-vt + snail + snail-raster
+/// + the Vulkan/Wayland stack + first-party and scanned protocols.
 fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -146,15 +163,16 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     });
     mod.addIncludePath(.{ .cwd_relative = opts.vt_include });
     mod.addObjectFile(.{ .cwd_relative = opts.vt_static_lib });
-    mod.addImport("snail", createSnailModule(b, deps));
+    const snail_mod = createSnailModule(b, deps);
+    mod.addImport("snail", snail_mod);
+    mod.addImport("snail-raster", createSnailRasterModule(b, deps, snail_mod));
+    const snail_dep = b.dependency("snail", .{});
+    mod.addImport("snail-shaders", snail_dep.module("snail-shaders"));
     mod.addImport("color", createColorModule(b, deps));
 
     mod.linkSystemLibrary("wayland-client", .{});
-    mod.linkSystemLibrary("wayland-egl", .{});
-    mod.linkSystemLibrary("egl", .{});
     mod.linkSystemLibrary("xkbcommon", .{});
-    mod.linkSystemLibrary("GLESv2", .{});
-    mod.linkSystemLibrary("gbm", .{});
+    mod.linkSystemLibrary("vulkan", .{});
     mod.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
     mod.linkSystemLibrary("fontconfig", .{});
     mod.linkSystemLibrary("libpulse-simple", .{});
@@ -174,10 +192,6 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml", "linux-dmabuf-unstable-v1-client-protocol.h", "linux-dmabuf-unstable-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/primary-selection/primary-selection-unstable-v1.xml", "primary-selection-unstable-v1-client-protocol.h", "primary-selection-unstable-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/text-input/text-input-unstable-v3.xml", "text-input-unstable-v3-client-protocol.h", "text-input-unstable-v3-protocol.c");
-    // Explicit synchronization via DRM syncobj timelines. Local copy
-    // because wayland-protocols may ship newer versions than the
-    // compositor advertises; we pin a known revision.
-    addLocalProtocol(b, mod, opts.wayland_scanner, "protocol/linux-drm-syncobj-v1.xml", "linux-drm-syncobj-v1-client-protocol.h", "linux-drm-syncobj-v1-protocol.c");
 
     return mod;
 }
@@ -273,12 +287,19 @@ fn createWlrClientModule(b: *std.Build, deps: Deps, harness_mod: *std.Build.Modu
     return mod;
 }
 
-/// Generate + install shell completions and the freedesktop entry.
-/// These have no runtime deps on ghostty-vt/snail/Wayland, so they
-/// install whenever the main binary builds — the codegen tool just
-/// imports cli.zig.
-fn installAuxiliaryArtifacts(b: *std.Build, deps: Deps) void {
-    // Codegen tool: depends only on cli.zig.
+/// Codegen exe that emits shell-completion scripts from `cli.zig`'s
+/// option table. Two attachment points:
+///   - `zig build gen-completions` installs just the exe into
+///     `zig-out/bin/gen-completions` (used by the `scrgo-completions`
+///     Nix derivation, which then patchelfs and runs it — sandbox
+///     can't exec a Zig-stamped interpreter directly).
+///   - With `-Dgen-completions=true` (default), the main install runs
+///     it and drops the three files into share/{bash,zsh,fish} dirs.
+/// Pulled out of `installAuxiliaryArtifacts` so the `gen-completions`
+/// step is always registered, even when the main scrgo target isn't
+/// (i.e. when vt/wayland env vars are unset, as in the completions
+/// derivation).
+fn registerGenCompletions(b: *std.Build, deps: Deps) *std.Build.Step.Compile {
     const gen_module = b.createModule(.{
         .root_source_file = b.path("src/gen_completions.zig"),
         .target = deps.target,
@@ -292,24 +313,39 @@ fn installAuxiliaryArtifacts(b: *std.Build, deps: Deps) void {
         .link_libc = true,
     }));
     const gen_exe = b.addExecutable(.{ .name = "gen-completions", .root_module = gen_module });
-    const gen_run = b.addRunArtifact(gen_exe);
-    const out_dir = gen_run.addOutputDirectoryArg("completions");
 
-    // Install each generated file into the conventional location for
-    // that shell. Bash's site dir is `bash-completion/completions/`,
-    // zsh's is `zsh/site-functions/`, fish's is `fish/vendor_completions.d/`.
-    b.getInstallStep().dependOn(&b.addInstallFile(
-        out_dir.path(b, "scrgo.bash"),
-        "share/bash-completion/completions/scrgo",
-    ).step);
-    b.getInstallStep().dependOn(&b.addInstallFile(
-        out_dir.path(b, "_scrgo"),
-        "share/zsh/site-functions/_scrgo",
-    ).step);
-    b.getInstallStep().dependOn(&b.addInstallFile(
-        out_dir.path(b, "scrgo.fish"),
-        "share/fish/vendor_completions.d/scrgo.fish",
-    ).step);
+    const gen_exe_install = b.addInstallArtifact(gen_exe, .{});
+    b.step(
+        "gen-completions",
+        "Build the gen-completions codegen exe (no run).",
+    ).dependOn(&gen_exe_install.step);
+
+    return gen_exe;
+}
+
+/// Install the freedesktop entry and (optionally) generated shell
+/// completions during the default install. Only called from the main
+/// scrgo target — separated from `registerGenCompletions` so the
+/// `gen-completions` step is registered unconditionally.
+fn installAuxiliaryArtifacts(b: *std.Build, gen_exe: *std.Build.Step.Compile, gen_completions: bool) void {
+    if (gen_completions) {
+        const gen_run = b.addRunArtifact(gen_exe);
+        const out_dir = gen_run.addOutputDirectoryArg("completions");
+        // Bash's site dir is `bash-completion/completions/`,
+        // zsh's is `zsh/site-functions/`, fish's is `fish/vendor_completions.d/`.
+        b.getInstallStep().dependOn(&b.addInstallFile(
+            out_dir.path(b, "scrgo.bash"),
+            "share/bash-completion/completions/scrgo",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallFile(
+            out_dir.path(b, "_scrgo"),
+            "share/zsh/site-functions/_scrgo",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallFile(
+            out_dir.path(b, "scrgo.fish"),
+            "share/fish/vendor_completions.d/scrgo.fish",
+        ).step);
+    }
 
     // Desktop entry — static, copied verbatim. Lives next to the rest
     // of the dist artifacts so the nix derivation has one source of
@@ -331,8 +367,17 @@ pub fn build(b: *std.Build) void {
     const vt_static_lib = b.option([]const u8, "ghostty-vt-static-lib", "Full path to libghostty-vt.a") orelse b.graph.environ_map.get("GHOSTTY_VT_LIB");
     const wayland_protocols_dir = b.option([]const u8, "wayland-protocols-dir", "Path to wayland-protocols pkgdatadir") orelse b.graph.environ_map.get("WAYLAND_PROTOCOLS_DIR");
     const wayland_scanner = b.option([]const u8, "wayland-scanner", "Path to wayland-scanner binary") orelse b.graph.environ_map.get("WAYLAND_SCANNER");
+    // Default on for dev shell use; Nix passes false and runs the
+    // codegen in a separate derivation (nix/scrgo-completions.nix) so
+    // the freshly-built exe gets its interpreter patched before exec.
+    const gen_completions = b.option(bool, "gen-completions", "Generate + install shell completions during install (default true)") orelse true;
 
     const deps: Deps = .{ .target = target, .optimize = optimize };
+
+    // Always register the gen-completions step — it has no wayland/vt
+    // deps, and the `scrgo-completions` Nix derivation needs it to be
+    // accessible without setting those env vars.
+    const gen_exe = registerGenCompletions(b, deps);
 
     // ── scrgo (default install + `zig build run`) ──────────────────────
     if (vt_include != null and vt_static_lib != null and wayland_protocols_dir != null and wayland_scanner != null) {
@@ -353,7 +398,7 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_cmd.addArgs(args);
         b.step("run", "Run scrgo").dependOn(&run_cmd.step);
 
-        installAuxiliaryArtifacts(b, deps);
+        installAuxiliaryArtifacts(b, gen_exe, gen_completions);
     }
 
     // ── headless tests (`zig build test`, plus per-suite aliases) ──────

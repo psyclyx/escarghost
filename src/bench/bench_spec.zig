@@ -13,12 +13,13 @@ pub const TerminalSpec = struct {
     app_id: []const u8,
     env_var: []const u8,
     /// Tokens that go between <bin> and the command (e.g. "-e" for
-    /// foot/alacritty/kitty/scrgo, the `start --` dance for wezterm).
+    /// foot/alacritty/kitty, bare `--` for scrgo, the `start --` dance
+    /// for wezterm).
     args_after_bin: []const []const u8,
 };
 
 pub const all = [_]TerminalSpec{
-    .{ .label = "scrgo", .app_id = "scrgo", .env_var = "SCRGO_BIN", .args_after_bin = &.{"-e"} },
+    .{ .label = "scrgo", .app_id = "scrgo", .env_var = "SCRGO_BIN", .args_after_bin = &.{"--"} },
     .{ .label = "foot", .app_id = "foot", .env_var = "FOOT_BIN", .args_after_bin = &.{} },
     .{ .label = "alacritty", .app_id = "Alacritty", .env_var = "ALACRITTY_BIN", .args_after_bin = &.{"-e"} },
     .{ .label = "kitty", .app_id = "kitty", .env_var = "KITTY_BIN", .args_after_bin = &.{"-e"} },

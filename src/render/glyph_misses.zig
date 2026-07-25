@@ -2,7 +2,6 @@
 /// Passed to the atlas owner thread which uses HarfBuzz-aware
 /// extension (`TextAtlas.ensureText`) to discover all needed glyphs
 /// — including ligature substitutions.
-
 pub const MaxBytes = 4096;
 
 pub const Set = struct {

@@ -57,7 +57,7 @@ pub const FrontendBuffer = struct {
             desc.format,
             0,
         ) orelse return error.WlBufferCreateFailed;
-        std.c.close(fd);
+        _ = std.c.close(fd);
 
         return .{
             .desc = desc,
@@ -80,8 +80,11 @@ pub const FrontendBuffer = struct {
         const surface: *wl.wl_surface = @ptrCast(surface_opaque);
         const display: *wl.wl_display = @ptrCast(display_opaque);
 
-        // GBM/GL writes rows in the opposite orientation for Wayland buffers.
-        wl.wl_surface_set_buffer_transform(surface, wl.WL_OUTPUT_TRANSFORM_FLIPPED_180);
+        // The Vulkan renderer already draws with a Y-flipped viewport (to
+        // cancel Vulkan's inverted NDC), so the dmabuf is upright — no
+        // surface transform needed. (The old GL/GBM path rendered bottom-up
+        // and needed FLIPPED_180 here.)
+        wl.wl_surface_set_buffer_transform(surface, wl.WL_OUTPUT_TRANSFORM_NORMAL);
         wl.wl_surface_attach(surface, self.wl_buffer, 0, 0);
         wl.wl_surface_damage_buffer(surface, 0, 0, @intCast(self.desc.width), @intCast(self.desc.height));
         wl.wl_surface_commit(surface);

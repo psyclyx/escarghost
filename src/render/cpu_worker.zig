@@ -44,6 +44,7 @@ const Request = struct {
     cell_width: f32 = 0,
     cell_height: f32 = 0,
     baseline_offset: f32 = 0,
+    descent: f32 = 0,
     serial: u32 = 0,
 };
 
@@ -85,8 +86,10 @@ pub const Frontend = struct {
         const pipe_fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return error.PipeFailed;
         self.response_fds = pipe_fds;
         errdefer {
-            std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(io);
-            std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(io);
+            const f0: std.Io.File = .{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } };
+            f0.close(io);
+            const f1: std.Io.File = .{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } };
+            f1.close(io);
             self.response_fds = [_]c_int{-1} ** 2;
         }
         self.thread = try std.Thread.spawn(.{}, Frontend.workerMain, .{self});
@@ -119,8 +122,14 @@ pub const Frontend = struct {
         }
         if (self.thread) |thread| thread.join();
         self.thread = null;
-        if (self.response_fds[0] >= 0) std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(self.io);
-        if (self.response_fds[1] >= 0) std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(self.io);
+        if (self.response_fds[0] >= 0) {
+            const f: std.Io.File = .{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } };
+            f.close(self.io);
+        }
+        if (self.response_fds[1] >= 0) {
+            const f: std.Io.File = .{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } };
+            f.close(self.io);
+        }
         self.response_fds = [_]c_int{-1} ** 2;
         _ = c.pthread_cond_destroy(&self.cond);
         _ = c.pthread_mutex_destroy(&self.mutex);
@@ -175,6 +184,7 @@ pub const Frontend = struct {
         cell_width: f32,
         cell_height: f32,
         baseline_offset: f32,
+        descent: f32,
         serial: u32,
         selection: ?@import("../selection.zig").Snapshot,
         scrollbar: ?render_snapshot.ScrollbarOverlay,
@@ -202,6 +212,7 @@ pub const Frontend = struct {
             .cell_width = cell_width,
             .cell_height = cell_height,
             .baseline_offset = baseline_offset,
+            .descent = descent,
             .serial = serial,
         };
         self.request_pending = true;
@@ -241,11 +252,15 @@ pub const Frontend = struct {
 
     fn workerMain(self: *Frontend) void {
         log.info(.cpu, "thread running", .{});
-        var ctx = cpu_pipeline.CpuPipeline.init(std.heap.smp_allocator) catch |e| {
-            log.err(.cpu, "init failed", .{ .err = e });
-            return;
+        // The pipeline is created lazily on the first render request: the
+        // worker thread is spawned early (before NVIDIA EGL hooks pthread),
+        // which is before `start()` assigns `atlas_ref`. It also embeds
+        // several-MB scratch arrays, so it lives on the heap, not the stack.
+        var ctx: ?*cpu_pipeline.CpuPipeline = null;
+        defer if (ctx) |cp| {
+            cp.deinit();
+            std.heap.smp_allocator.destroy(cp);
         };
-        defer ctx.deinit();
 
         const warn_slow_budget_ms = render_env.parseWarnSlowMs(
             if (c.getenv("SCRGO_WARN_SLOW_MS")) |v| std.mem.sliceTo(v, 0) else null,
@@ -300,17 +315,49 @@ pub const Frontend = struct {
                     var atlas_lease = self.atlas_ref.acquire();
                     defer atlas_lease.release();
 
-                    ctx.renderToMemory(
-                        map_ptr,
-                        buffer.desc.width,
-                        buffer.desc.height,
-                        buffer.desc.stride,
-                        &self.snapshots[snapshot_slot],
-                        &atlas_lease,
+                    // Lazily build the pipeline now that atlas_ref is set.
+                    const pipeline = ctx orelse blk: {
+                        const p = std.heap.smp_allocator.create(cpu_pipeline.CpuPipeline) catch |e| {
+                            log.err(.cpu, "alloc failed", .{ .err = e });
+                            writeResponse(self.response_fds[1], self.io, .{
+                                .tag = .failed,
+                                .buffer_index = buffer_index,
+                                .snapshot_slot = snapshot_slot,
+                                .serial = request.serial,
+                            });
+                            continue;
+                        };
+                        cpu_pipeline.CpuPipeline.init(p, std.heap.smp_allocator, self.atlas_ref) catch |e| {
+                            std.heap.smp_allocator.destroy(p);
+                            log.err(.cpu, "init failed", .{ .err = e });
+                            writeResponse(self.response_fds[1], self.io, .{
+                                .tag = .failed,
+                                .buffer_index = buffer_index,
+                                .snapshot_slot = snapshot_slot,
+                                .serial = request.serial,
+                            });
+                            continue;
+                        };
+                        ctx = p;
+                        break :blk p;
+                    };
+
+                    pipeline.configure(
+                        request.width,
+                        request.height,
                         request.font_size,
                         request.cell_width,
                         request.cell_height,
                         request.baseline_offset,
+                        request.descent,
+                    );
+                    pipeline.renderToMemory(
+                        @ptrCast(map_ptr),
+                        buffer.desc.width,
+                        buffer.desc.height,
+                        buffer.desc.stride,
+                        &self.snapshots[snapshot_slot],
+                        atlas_lease.get(),
                     ) catch |e| {
                         log.err(.cpu, "render failed", .{ .buffer = buffer_index, .err = e });
                         writeResponse(self.response_fds[1], self.io, .{

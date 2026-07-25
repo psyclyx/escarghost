@@ -5,36 +5,50 @@ const c = @cImport({
     @cInclude("pthread.h");
 });
 
-/// Thread-safe TextAtlas snapshot reference.
+/// Thread-safe snail.Atlas snapshot reference.
 ///
 /// The atlas thread publishes new (immutable) snapshots by calling `publish()`.
 /// Renderer threads acquire leases for snapshots they use. A retired snapshot
 /// is freed only after its last lease is released, so long CPU frames and
-/// cached TextBlobs cannot race atlas publication.
+/// in-flight GPU frames cannot race atlas publication.
+///
+/// In snail 0.13, the atlas is a value type (`snail.Atlas`) backed by a
+/// `snail.PagePool`. Extensions produce a new `Atlas` value (sharing
+/// unchanged pages with the parent via persistent-map structure sharing).
+/// The `PagePool` outlives all atlases — it's owned by `AtlasRef` and
+/// shared across every snapshot.
 pub const AtlasRef = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    /// Serializes every HarfBuzz shape operation against any snapshot
-    /// in this ref. snail's TextAtlas keeps one `hb_buffer_t` per
-    /// snapshot, and all our threads share that buffer when they call
-    /// `shapeText` / `ensureText`: a render thread shaping a row, the
-    /// atlas-owner prefetch thread extending coverage, the CPU worker
-    /// at startup. Concurrent users tripped HarfBuzz internal asserts
-    /// (`have_output`, `assert_unicode`, `replace_glyphs`) in dense
-    /// workloads.
-    ///
-    /// Also covers `ensureText + publish` in `extend`, replacing the
-    /// old `extension_lock` — two extenders against the same baseline
-    /// would otherwise overwrite each other on publish. pthread_mutex
-    /// (blocking) instead of the spin `mutex` above because shape can
-    /// take milliseconds; spinning would burn CPU.
+    /// Serializes every HarfBuzz shape operation. snail's `Faces` keeps
+    /// one `hb_buffer_t` per face; all our threads share that buffer when
+    /// they call `snail.shape`. Concurrent users would trip HarfBuzz
+    /// internal asserts. pthread_mutex (blocking) because shape can take
+    /// milliseconds; spinning would burn CPU.
     shape_lock: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
     current: ?*Snapshot = null,
     retired: ?*Snapshot = null,
     generation: std.atomic.Value(u64) = .init(0),
     allocator: std.mem.Allocator,
+    /// The shared page pool. Outlives all atlas snapshots.
+    pool: *snail.PagePool,
+    /// The shared Faces collection. Outlives all atlas snapshots.
+    /// Shape operations need this; it's stored here so render threads
+    /// can access it through the AtlasRef without a separate pointer.
+    faces: ?*snail.Faces = null,
+
+    /// A unit filled-rectangle path record (namespace `path_fill`) baked into
+    /// the atlas at bootstrap. Renderers instance it — varying `local_transform`
+    /// (position/size) per shape and `world_tint` (color/alpha) per emit call —
+    /// to draw solid/translucent cell backgrounds, decorations, selection,
+    /// cursor, scrollbar, and bell through the ordinary path pipeline, with no
+    /// separate solid-color pipeline. The record persists across atlas
+    /// extensions via persistent-map structure sharing.
+    rect_key: snail.record_key.RecordKey = .{ .namespace = 0, .a = 0, .b = 0, .c = 0 },
+    rect_xform: snail.Transform2D = .identity,
+    has_rect: bool = false,
 
     const Snapshot = struct {
-        atlas: *snail.TextAtlas,
+        atlas: *snail.Atlas,
         readers: usize = 0,
         retired: bool = false,
         next_retired: ?*Snapshot = null,
@@ -44,7 +58,7 @@ pub const AtlasRef = struct {
         ref: *AtlasRef,
         snapshot: ?*Snapshot,
 
-        pub fn get(self: *const Lease) *snail.TextAtlas {
+        pub fn get(self: *const Lease) *snail.Atlas {
             return self.snapshot.?.atlas;
         }
 
@@ -59,36 +73,23 @@ pub const AtlasRef = struct {
         }
     };
 
-    /// Shape `text` against `atlas` with the cross-thread shape lock
-    /// held. All HarfBuzz work funnels through here so concurrent
-    /// renderers + the atlas-owner thread don't race the snapshot's
-    /// shared `hb_buffer_t`. Caller takes ownership of the returned
-    /// ShapedText.
-    pub fn shape(
-        self: *AtlasRef,
-        atlas: *const snail.TextAtlas,
-        allocator: std.mem.Allocator,
-        style: snail.FontStyle,
-        text: []const u8,
-    ) !snail.ShapedText {
-        _ = c.pthread_mutex_lock(&self.shape_lock);
-        defer _ = c.pthread_mutex_unlock(&self.shape_lock);
-        return atlas.shapeText(allocator, style, text);
-    }
+    /// Create an AtlasRef with an initial empty atlas on the heap.
+    /// The pool is owned by the AtlasRef and destroyed in deinit.
+    pub fn init(allocator: std.mem.Allocator, pool: *snail.PagePool, faces: *snail.Faces) !AtlasRef {
+        const atlas_ptr = try allocator.create(snail.Atlas);
+        errdefer allocator.destroy(atlas_ptr);
+        atlas_ptr.* = try snail.Atlas.init(allocator, pool);
 
-    /// Create an AtlasRef with the given snapshot moved to the heap.
-    /// The caller must not use `initial` after this call.
-    pub fn init(allocator: std.mem.Allocator, initial: snail.TextAtlas) !AtlasRef {
-        const heap = try allocator.create(snail.TextAtlas);
-        errdefer allocator.destroy(heap);
-        heap.* = initial;
         const snapshot = try allocator.create(Snapshot);
         errdefer allocator.destroy(snapshot);
-        snapshot.* = .{ .atlas = heap };
+        snapshot.* = .{ .atlas = atlas_ptr };
+
         var ref: AtlasRef = .{
             .current = snapshot,
             .generation = .init(1),
             .allocator = allocator,
+            .pool = pool,
+            .faces = faces,
         };
         if (c.pthread_mutex_init(&ref.shape_lock, null) != 0) return error.MutexInitFailed;
         return ref;
@@ -111,29 +112,40 @@ pub const AtlasRef = struct {
     }
 
     pub const ExtendResult = enum {
-        /// The extension produced a new atlas snapshot and it has been
-        /// published. Caller should re-acquire to see it.
         extended,
-        /// The font has no glyphs for some of the requested codepoints.
-        /// No new snapshot was produced; caller should ship partial.
         missing,
     };
 
-    /// Synchronously extend the atlas snapshot to cover `miss_text`. Holds
-    /// `shape_lock` across the `ensureText + publish` pair to keep two
-    /// concurrent extenders from clobbering each other.
+    /// Synchronously extend the atlas snapshot to cover `miss_text`.
+    /// Shapes the text, records missing glyphs into a new atlas, and
+    /// publishes the new snapshot. Holds `shape_lock` across the
+    /// shape + record + publish to keep concurrent extenders safe.
     pub fn extend(
         self: *AtlasRef,
-        baseline: *const snail.TextAtlas,
+        baseline: *const snail.Atlas,
+        faces: *snail.Faces,
         miss_text: []const u8,
     ) !ExtendResult {
         _ = c.pthread_mutex_lock(&self.shape_lock);
         defer _ = c.pthread_mutex_unlock(&self.shape_lock);
 
-        var next = (try baseline.ensureText(.{}, miss_text)) orelse return .missing;
-        const heap = self.allocator.create(snail.TextAtlas) catch |err| {
+        // Shape the miss text
+        var shaped = snail.shape(self.allocator, faces, miss_text, .{}) catch return .missing;
+        defer shaped.deinit();
+
+        // Clone the baseline atlas (shares unchanged pages via persistent-map)
+        var next = try baseline.extend(self.allocator, &.{});
+
+        // Record unhinted glyphs from the shaped text (in-place on the clone)
+        snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch {
             next.deinit();
-            return err;
+            return .missing;
+        };
+
+        // Publish the new snapshot
+        const heap = self.allocator.create(snail.Atlas) catch {
+            next.deinit();
+            return error.OutOfMemory;
         };
         heap.* = next;
         self.publish(heap) catch |err| {
@@ -144,9 +156,46 @@ pub const AtlasRef = struct {
         return .extended;
     }
 
+    /// Record the unit filled-rectangle primitive into the current atlas.
+    /// Idempotent; call once during bootstrap before any rendering. The
+    /// record's key and design→source placement are stashed for renderers.
+    pub fn ensureRectPrimitive(self: *AtlasRef) !void {
+        if (self.has_rect) return;
+        const alloc = self.allocator;
+
+        var p = snail.Path.init(alloc);
+        defer p.deinit();
+        try p.addRect(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
+
+        var prep = try p.prepare(alloc);
+        defer prep.deinit();
+
+        var curves = try prep.fillCurves(alloc, alloc);
+        defer curves.deinit();
+
+        const key = snail.record_key.RecordKey{
+            .namespace = snail.record_key.ns.path_fill,
+            .a = 0,
+            .b = 0,
+            .c = 0,
+        };
+        const entry = snail.AtlasEntry{
+            .key = key,
+            .curves = curves,
+            .paint = try prep.paintForDesign(.{ .solid = .{ 1, 1, 1, 1 } }),
+        };
+
+        self.lock();
+        defer self.unlock();
+        try self.current.?.atlas.extendInPlace(alloc, &.{entry});
+        self.rect_key = key;
+        self.rect_xform = prep.design_to_source;
+        self.has_rect = true;
+        _ = self.generation.fetchAdd(1, .release);
+    }
+
     /// Publish a new snapshot, retiring the old one.
-    /// Must only be called from the atlas thread.
-    pub fn publish(self: *AtlasRef, next: *snail.TextAtlas) !void {
+    pub fn publish(self: *AtlasRef, next: *snail.Atlas) !void {
         const next_snapshot = try self.allocator.create(Snapshot);
         errdefer self.allocator.destroy(next_snapshot);
         next_snapshot.* = .{ .atlas = next };

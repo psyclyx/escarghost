@@ -6,6 +6,7 @@ const log = @import("../log.zig");
 const c = @cImport({
     @cInclude("pthread.h");
     @cInclude("stdlib.h");
+    @cInclude("unistd.h");
     @cInclude("time.h");
     @cInclude("errno.h");
     @cInclude("sys/stat.h");
@@ -40,6 +41,10 @@ pub const BootstrapConfig = struct {
 /// There's no post-bootstrap loop — the thread joins cleanly on stop.
 pub const AtlasWorker = struct {
     atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
+    /// Shared page pool — outlives all atlas snapshots.
+    page_pool: ?*snail.PagePool = null,
+    /// Shared faces collection — outlives all atlas snapshots.
+    faces: ?*snail.Faces = null,
     response_fds: [2]c_int = [_]c_int{-1} ** 2,
     thread: ?std.Thread = null,
     active: bool = false,
@@ -61,8 +66,10 @@ pub const AtlasWorker = struct {
         const pipe_fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return error.PipeFailed;
         self.response_fds = pipe_fds;
         errdefer {
-            std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(io);
-            std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(io);
+            const f0: std.Io.File = .{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } };
+            f0.close(io);
+            const f1: std.Io.File = .{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } };
+            f1.close(io);
             self.response_fds = [_]c_int{-1} ** 2;
         }
 
@@ -73,13 +80,16 @@ pub const AtlasWorker = struct {
 
     pub fn stop(self: *AtlasWorker) void {
         if (!self.active) return;
-        // No interrupt mechanism — bootstrap is short (a few ms) and
-        // post-bootstrap the thread is already exited. join() returns
-        // immediately for the already-exited case.
         if (self.thread) |thread| thread.join();
         self.thread = null;
-        if (self.response_fds[0] >= 0) std.Io.File{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } }.close(self.io);
-        if (self.response_fds[1] >= 0) std.Io.File{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } }.close(self.io);
+        if (self.response_fds[0] >= 0) {
+            const f: std.Io.File = .{ .handle = self.response_fds[0], .flags = .{ .nonblocking = false } };
+            f.close(self.io);
+        }
+        if (self.response_fds[1] >= 0) {
+            const f: std.Io.File = .{ .handle = self.response_fds[1], .flags = .{ .nonblocking = false } };
+            f.close(self.io);
+        }
         self.response_fds = [_]c_int{-1} ** 2;
         self.active = false;
         log.info(.atlas, "stopped", .{});
@@ -112,11 +122,10 @@ pub const AtlasWorker = struct {
     fn runBootstrap(self: *AtlasWorker, config: BootstrapConfig) !void {
         const alloc = config.allocator;
 
-        // Phase 1: parse the primary font into a TextAtlas. Fallbacks
-        // (if any) are resolved through fontconfig and appended as
-        // additional FaceSpec entries with `fallback = true` so snail's
-        // shaper consults them only when the primary face's cmap is
-        // missing the codepoint. No rasterization happens here.
+        // Phase 1: resolve and mmap the primary font, plus any fallbacks.
+        // Font files are mmap'd and kept alive for the process lifetime
+        // (snail.Font borrows the data slice; we exit via _exit so no
+        // explicit cleanup is needed).
         const font_path = resolvePrimaryFont(alloc, self.io, config.font_path_cfg) catch |err| {
             log.err(.atlas, "primary font resolution failed", .{
                 .config_value = config.font_path_cfg,
@@ -131,12 +140,19 @@ pub const AtlasWorker = struct {
             return err;
         };
 
-        var specs: std.ArrayListUnmanaged(snail.FaceSpec) = .empty;
-        defer specs.deinit(alloc);
-        try specs.append(alloc, .{ .data = font_data });
+        // Parse the primary font.
+        // Heap-allocate: the Face stores this pointer and it must outlive
+        // this bootstrap frame (the shared Faces is read for the process
+        // lifetime — e.g. computeCellMetrics after bootstrap returns).
+        const primary_font = try alloc.create(snail.Font);
+        primary_font.* = try snail.Font.init(font_data);
+        var face_entries: std.ArrayListUnmanaged(snail.Face) = .empty;
+        defer face_entries.deinit(alloc);
+        try face_entries.append(alloc, .{ .font = primary_font, .font_id = 0 });
 
-        for (config.fallback_fonts) |name| {
-            const path = resolveFontByQuery(alloc, name) catch |err| {
+        // Resolve and add fallback fonts.
+        for (config.fallback_fonts, 1..) |name, i| {
+            const path = resolveFontByQuery(alloc, self.io, name) catch |err| {
                 log.warn(.atlas, "fallback lookup failed", .{ .name = name, .err = err });
                 continue;
             };
@@ -145,24 +161,53 @@ pub const AtlasWorker = struct {
                 log.warn(.atlas, "fallback mmap failed", .{ .name = name, .err = err });
                 continue;
             };
-            try specs.append(alloc, .{ .data = data, .fallback = true });
+            // Parse the fallback font. Stored on the heap so it outlives
+            // this scope; the mmap'd data outlives the process.
+            const fb_font = alloc.create(snail.Font) catch continue;
+            fb_font.* = snail.Font.init(data) catch {
+                alloc.destroy(fb_font);
+                continue;
+            };
+            try face_entries.append(alloc, .{
+                .font = fb_font,
+                .font_id = @intCast(i),
+                .fallback = true,
+            });
             log.info(.atlas, "fallback registered", .{ .name = name, .path = path });
         }
 
-        var initial_atlas = try snail.TextAtlas.init(alloc, specs.items);
-        errdefer initial_atlas.deinit();
+        // Build the Faces collection (parses HarfBuzz shapers).
+        const faces = try alloc.create(snail.Faces);
+        errdefer alloc.destroy(faces);
+        faces.* = try snail.Faces.build(alloc, face_entries.items);
+        errdefer faces.deinit();
 
+        // Create the page pool. Conservative defaults for a terminal.
+        const pool = try snail.PagePool.init(alloc, .{
+            .max_layers = 64,
+            .curve_words_per_page = 256 * 1024,
+            .band_words_per_page = 128 * 1024,
+        });
+        errdefer pool.deinit();
+
+        // Create the AtlasRef (initially empty atlas + pool + faces).
         const atlas_ref = try alloc.create(atlas_ref_mod.AtlasRef);
         errdefer alloc.destroy(atlas_ref);
-        atlas_ref.* = try atlas_ref_mod.AtlasRef.init(alloc, initial_atlas);
+        atlas_ref.* = try atlas_ref_mod.AtlasRef.init(alloc, pool, faces);
+        errdefer atlas_ref.deinit();
+
+        // Bake the unit-rectangle primitive so renderers can draw solid /
+        // translucent fills (cell backgrounds, cursor, selection, …) through
+        // the path pipeline.
+        try atlas_ref.ensureRectPrimitive();
 
         self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
-        log.info(.atlas, "font ready", .{ .fallbacks = specs.items.len - 1 });
+        self.page_pool = pool;
+        self.faces = faces;
+        log.info(.atlas, "font ready", .{ .fallbacks = face_entries.items.len - 1 });
 
         // Tell main it can compute cell metrics and fork the PTY now.
-        // Glyph rasterization happens lazily on the render thread via
-        // AtlasRef.extend whenever shaping turns up a miss.
         writeResponse(self.response_fds[1], self.io, .{ .tag = .font_ready });
     }
 };
@@ -338,7 +383,7 @@ fn tryReadFontPathCache(allocator: std.mem.Allocator, io: std.Io, query: []const
     const cache_mtime = mtimeNs(cache_z.ptr) orelse return null;
     if (cacheInvalidated(cache_mtime)) return null;
 
-    const file = std.Io.Dir.cwd.openFile(io, cache_z, .{}) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, cache_z, .{}) catch return null;
     defer file.close(io);
 
     var data_buf: [4096]u8 = undefined;
@@ -360,31 +405,31 @@ fn writeFontPathCache(io: std.Io, query: []const u8, path: []const u8) void {
 
     const last_slash = std.mem.lastIndexOfScalar(u8, cache_z, '/') orelse return;
     const dir = cache_z[0..last_slash];
-    std.Io.Dir.cwd.createDir(io, dir, .default_dir) catch {};
+    std.Io.Dir.cwd().createDir(io, dir, .default_dir) catch {};
 
     var tmp_buf: [4096]u8 = undefined;
     const tmp_z = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{cache_z}) catch return;
 
-    const file = std.Io.Dir.cwd.createFile(io, tmp_z, .{ .read = false, .truncate = true }) catch return;
+    const file = std.Io.Dir.cwd().createFile(io, tmp_z, .{ .read = false, .truncate = true }) catch return;
     file.writeStreamingAll(io, path) catch {};
     file.writeStreamingAll(io, "\n") catch {};
     file.close(io);
 
-    std.Io.Dir.cwd.rename(io, tmp_z, cache_z) catch {};
+    std.Io.Dir.cwd().rename(tmp_z, std.Io.Dir.cwd(), cache_z, io) catch {};
 }
 
 fn mmapFontFile(io: std.Io, path: []const u8) ![]const u8 {
     const path_z = std.heap.smp_allocator.dupeZ(u8, path) catch return error.OutOfMemory;
     defer std.heap.smp_allocator.free(path_z);
 
-    const file = std.Io.Dir.cwd.openFile(io, path_z, .{}) catch return error.FileNotFound;
+    const file = std.Io.Dir.cwd().openFile(io, path_z, .{}) catch return error.FileNotFound;
     const stat = file.stat(io) catch {
         file.close(io);
         return error.StatFailed;
     };
     const size: usize = @intCast(stat.size);
 
-    var mm = std.Io.File.MemoryMap.create(io, file, .{
+    const mm = std.Io.File.MemoryMap.create(io, file, .{
         .len = size,
         .protection = .{ .read = true, .write = false },
         .undefined_contents = false,

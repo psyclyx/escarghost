@@ -26,7 +26,7 @@ pub const Pty = struct {
         if (c.openpty(&master, &slave, null, null, null) != 0) {
             return error.OpenPtyFailed;
         }
-        errdefer std.c.close(master);
+        errdefer _ = std.c.close(master);
 
         // Set initial terminal size on the slave
         var ws: c.winsize = .{
@@ -42,14 +42,14 @@ pub const Pty = struct {
 
         if (pid == 0) {
             // ── Child process ──
-            std.c.close(master);
+            _ = std.c.close(master);
             _ = c.setsid();
             _ = c.ioctl(slave, c.TIOCSCTTY, @as(c_int, 0));
 
             _ = c.dup2(slave, c.STDIN_FILENO);
             _ = c.dup2(slave, c.STDOUT_FILENO);
             _ = c.dup2(slave, c.STDERR_FILENO);
-            if (slave > c.STDERR_FILENO) std.c.close(slave);
+            if (slave > c.STDERR_FILENO) _ = std.c.close(slave);
 
             // Build null-terminated argv for exec
             var c_argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
@@ -69,7 +69,7 @@ pub const Pty = struct {
         }
 
         // ── Parent process ──
-        std.c.close(slave);
+        _ = std.c.close(slave);
 
         // Set master to non-blocking
         const flags = c.fcntl(master, c.F_GETFL, @as(c_int, 0));
@@ -117,7 +117,7 @@ pub const Pty = struct {
 
     pub fn close(self: *Pty) void {
         if (self.master_fd >= 0) {
-            std.c.close(self.master_fd);
+            _ = std.c.close(self.master_fd);
             self.master_fd = -1;
         }
         if (self.child_pid > 0) {

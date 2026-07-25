@@ -131,10 +131,9 @@ pub fn prepare(
 /// Walk the terminal's render_state (already populated by `prepare`) into
 /// `snapshot`. Reads the render_state only — safe to run on a worker
 /// thread as long as `prepare` is not called concurrently.
-pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atlas: *const snail.TextAtlas) !void {
+pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, _: *const snail.Atlas) !void {
     const colors = term.getColors();
     const cursor = term.getCursor();
-    const primary = atlas.primaryFaceIndex() catch 0;
 
     snapshot.header.default_fg = colors.foreground;
     snapshot.header.default_bg = colors.background;
@@ -187,8 +186,7 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atl
                 if (!cursor_visible_in_view) break :blk 0;
                 if (!info.has_text) break :blk 0;
                 if (!render_common.isRenderableCodepoint(info.codepoint)) break :blk 0;
-                const cp: u21 = @intCast(info.codepoint);
-                if (atlas.glyphIndex(primary, cp) catch null) |gid| break :blk gid;
+                // TODO: look up glyph_id via snail.Font.glyphIndex — needs Faces ref
                 break :blk 0;
             };
 
@@ -225,7 +223,7 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, atl
 pub fn capture(
     snapshot: *SharedSnapshot,
     term: *terminal_mod.Terminal,
-    atlas: *const snail.TextAtlas,
+    atlas: *const snail.Atlas,
     selection: ?selection_mod.Snapshot,
     scrollbar: ?ScrollbarOverlay,
     bell: ?BellOverlay,

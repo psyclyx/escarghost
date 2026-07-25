@@ -53,9 +53,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     std.debug.print("harness: pre-spawn frame {}x{} stride={} fmt=0x{x}, ({},{}) = rgb({},{},{}) ({d:.1}ms)\n", .{
-        out_w, out_h, stride, harness.cached_frame.format,
-        probe_px, probe_py, initial_px[0], initial_px[1], initial_px[2],
-        t_start.elapsedMs(),
+        out_w,         out_h,               stride,        harness.cached_frame.format,
+        probe_px,      probe_py,            initial_px[0], initial_px[1],
+        initial_px[2], t_start.elapsedMs(),
     });
 
     const t_spawn = perf.Timer.now();

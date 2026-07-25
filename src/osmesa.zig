@@ -52,14 +52,18 @@ pub const OsMesaContext = struct {
         errdefer wl.wl_shm_pool_destroy(pool);
 
         const buffer = wl.wl_shm_pool_create_buffer(
-            pool, 0, @intCast(width), @intCast(height), @intCast(stride),
+            pool,
+            0,
+            @intCast(width),
+            @intCast(height),
+            @intCast(stride),
             wl.WL_SHM_FORMAT_ARGB8888,
         ) orelse return error.BufferFailed;
 
         // Create OSMesa context (GL 3.3 core)
         const attribs = [_]c_int{
-            c.OSMESA_FORMAT,          c.OSMESA_BGRA,
-            c.OSMESA_PROFILE,         c.OSMESA_CORE_PROFILE,
+            c.OSMESA_FORMAT,                c.OSMESA_BGRA,
+            c.OSMESA_PROFILE,               c.OSMESA_CORE_PROFILE,
             c.OSMESA_CONTEXT_MAJOR_VERSION, 3,
             c.OSMESA_CONTEXT_MINOR_VERSION, 3,
             0,

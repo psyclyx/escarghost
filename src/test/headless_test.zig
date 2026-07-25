@@ -88,7 +88,7 @@ test "render state iteration over a populated 80x24 grid" {
     const cols: u16 = 80;
     const rows: u16 = 24;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,cols, rows, 1000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, cols, rows, 1000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     for (default_sequences) |seq| term.feedData(seq);
@@ -109,7 +109,7 @@ test "cursor style switch preserves grid contents" {
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     for (default_sequences) |seq| term.feedData(seq);
@@ -134,7 +134,7 @@ test "resize narrows the grid" {
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 80, 24, 1000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     term.feedData("seed line\r\n");
@@ -154,7 +154,7 @@ test "inverse / bold / italic style flags propagate through render state" {
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     term.feedData("\x1b[7minverse\x1b[0m \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m");
@@ -191,7 +191,7 @@ test "encodePaste round-trips ascii unchanged when bracketed-paste is off" {
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     try testing.expect(!term.isBracketedPaste());
@@ -208,7 +208,7 @@ test "encodePaste wraps bracketed paste markers when 2004h is set" {
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 40, 5, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     term.feedData("\x1b[?2004h");
@@ -234,7 +234,7 @@ test "scrollbar getter reports total/offset/len once content overflows" {
     const cols: u16 = 40;
     const rows: u16 = 5;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,cols, rows, 200, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, cols, rows, 200, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     // Empty terminal: total == len, no scrollback to show.
@@ -267,7 +267,7 @@ test "fillRowFromScreen reads rows that have scrolled into scrollback" {
     const cols: u16 = 40;
     const rows: u16 = 5;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,cols, rows, 5000, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, cols, rows, 5000, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     var i: usize = 0;
@@ -315,7 +315,7 @@ test "max_scrollback config in lines actually yields ~that many lines" {
     const rows: u16 = 5;
     const requested_lines: usize = 5000;
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,cols, rows, requested_lines, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, cols, rows, requested_lines, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     // Feed more lines than we ask the floor would give us. The post-
@@ -337,7 +337,7 @@ test "colCount / rowCount mirror the configured grid" {
     defer cfg.deinit(allocator);
 
     var term: terminal_mod.Terminal = undefined;
-    try term.init(io,80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
+    try term.init(io, 80, 24, 100, cfg.palette, cfg.foreground, cfg.background);
     defer term.deinit();
 
     try testing.expectEqual(@as(u16, 80), term.colCount());

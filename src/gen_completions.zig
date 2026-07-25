@@ -30,13 +30,13 @@ pub fn main(init: std.process.Init) !void {
     const out_dir = argv_list.items[1];
 
     // Make sure the directory exists. EEXIST is fine.
-    std.Io.Dir.cwd.createDir(io, out_dir, .default_dir) catch {};
+    std.Io.Dir.cwd().createDir(io, out_dir, .default_dir) catch {};
 
     for (shells) |s| {
         const path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ out_dir, s.name });
         defer init.gpa.free(path);
 
-        const file = std.Io.Dir.cwd.createFile(io, path, .{ .read = false, .truncate = true }) catch std.process.exit(1);
+        const file = std.Io.Dir.cwd().createFile(io, path, .{ .read = false, .truncate = true }) catch std.process.exit(1);
         defer file.close(io);
 
         var buf: [4096]u8 = undefined;

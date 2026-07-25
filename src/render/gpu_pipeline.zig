@@ -1,5 +1,16 @@
+//! GPU pipeline: cell metrics, grid sizing, and Vulkan render integration.
+//!
+//! In snail 0.13, the render flow is:
+//!   row_build.buildSnapshot → snail.Shape[]
+//!   → snail.emit.emit → Instance[] + DrawBatch[]
+//!   → vk.Renderer.render (records Vulkan draw commands)
+//!
+//! The GpuPipeline struct owns the per-frame scratch buffers and
+//! coordinates atlas refresh + snapshot building + emit + draw.
+
 const std = @import("std");
 const snail = @import("snail");
+const raster = @import("snail-raster");
 const atlas_ref_mod = @import("atlas_ref.zig");
 const render_env = @import("render_env.zig");
 const render_snapshot = @import("render_snapshot.zig");
@@ -11,122 +22,65 @@ const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 const Rgb = color.Rgb;
 
-const gl = @cImport({
-    @cDefine("GL_GLEXT_PROTOTYPES", "1");
-    @cInclude("GLES3/gl3.h");
-    @cInclude("GLES3/gl3ext.h");
-    // EXT_disjoint_timer_query lives in the GLES2 ext header.
-    @cInclude("GLES2/gl2ext.h");
-});
-
-const egl = @cImport({
-    @cInclude("EGL/egl.h");
-});
-
-/// Function pointers for EXT_disjoint_timer_query, resolved lazily via
-/// eglGetProcAddress. libGLESv2 doesn't statically export these — they
-/// must be queried at runtime through EGL. Null indicates the extension
-/// isn't available; the timestamp diagnostic is then a no-op.
-const TimerQueryFns = struct {
-    gen: ?*const fn (n: gl.GLsizei, ids: [*c]gl.GLuint) callconv(.c) void = null,
-    del: ?*const fn (n: gl.GLsizei, ids: [*c]const gl.GLuint) callconv(.c) void = null,
-    counter: ?*const fn (id: gl.GLuint, target: gl.GLenum) callconv(.c) void = null,
-    get_u32: ?*const fn (id: gl.GLuint, pname: gl.GLenum, params: [*c]gl.GLuint) callconv(.c) void = null,
-    get_u64: ?*const fn (id: gl.GLuint, pname: gl.GLenum, params: [*c]gl.GLuint64) callconv(.c) void = null,
-
-    fn load() TimerQueryFns {
-        return .{
-            .gen = @ptrCast(egl.eglGetProcAddress("glGenQueriesEXT")),
-            .del = @ptrCast(egl.eglGetProcAddress("glDeleteQueriesEXT")),
-            .counter = @ptrCast(egl.eglGetProcAddress("glQueryCounterEXT")),
-            .get_u32 = @ptrCast(egl.eglGetProcAddress("glGetQueryObjectuivEXT")),
-            .get_u64 = @ptrCast(egl.eglGetProcAddress("glGetQueryObjectui64vEXT")),
-        };
-    }
-
-    fn available(self: TimerQueryFns) bool {
-        return self.gen != null and self.del != null and self.counter != null and self.get_u32 != null and self.get_u64 != null;
-    }
-};
-
-var timer_query_fns: TimerQueryFns = .{};
-var timer_query_loaded: bool = false;
-
-const MAX_SNAPSHOT_ROWS: usize = render_snapshot.MaxRows;
-const MAX_OVERRIDES: usize = MAX_SNAPSHOT_ROWS + 4; // rows + cursor blob
-
-// Stable resource keys. Atlas dedupes across blobs; the picture is rebuilt
-// every frame but reuses the same key so snail's resource cache can identify
-// the upload as a content change rather than a new resource. Per-blob paint
-// keys (derived from blob pointer in textKeysFor) are unique per blob so
-// hinted glyphs' paint records survive the manifest's dedupe.
-const ATLAS_KEY = snail.ResourceKey.named("scrgo.atlas");
-const PICTURE_KEY = snail.ResourceKey.named("scrgo.rects");
-
-/// Resource keys for a blob: shared atlas key + (for hinted/painted blobs) a
-/// per-blob paint key derived from the blob pointer. Non-hinted blobs return
-/// `.paint = null`, matching the old single-key behaviour.
-fn textKeysFor(blob: *const snail.TextBlob) snail.TextResourceKeys {
-    return blob.resourceKeys(ATLAS_KEY, snail.ResourceKey.fromId(@intFromPtr(blob)));
-}
-
-// 1 atlas + 1 picture + up to (MAX_SNAPSHOT_ROWS + cursor) paint records.
-const MANIFEST_CAP: usize = MAX_SNAPSHOT_ROWS + 4;
-
-// Baseline offset factor for the warmup glyph. Synthetic — close enough
-// to a typical font's ascent ratio that the warm-up output lands in a
-// sane place on the dmabuf before we invalidate and repaint. Real frames
-// use the font's snapped ascent (CellMetrics.baseline_offset).
-const baseline_warm: f32 = 0.8;
+pub var snapshot_phase_ns: u64 = 0;
+pub var snapshot_phase_count: u64 = 0;
+pub var capture_cells_accum_ns: u64 = 0;
+pub var worker_wait_accum_ns: u64 = 0;
+pub var worker_wait_count: u64 = 0;
+pub var buffer_starvation_accum_ns: u64 = 0;
+pub var buffer_starvation_count: u64 = 0;
 
 pub const CellMetrics = struct {
-    /// Pixel-snapped em. The user's requested font_size rounded to
-    /// the device pixel grid so glyph rasterization happens at integer
-    /// ppem. Stored back into app state so subsequent zoom steps work
-    /// off the snapped value (an unchanged ±1 stays an unchanged ±1).
     em: f32,
-    /// Font's natural 'M' advance at the snapped em — *not* pixel-
-    /// snapped. A well-behaved monospace font's ligatures (`==`, `=>`,
-    /// `fl`, etc.) have advances that are exact N×em multiples of this,
-    /// so HB's per-glyph positions land on our cell grid by construction.
-    /// Snapping cell_width to whole pixels would drift the cell grid
-    /// away from HB's pen and break long uniform-color stretches.
     cell_width: f32,
-    /// Line height with @ceil to preserve descender headroom.
     cell_height: f32,
-    /// Font's snapped ascent. Glyph baselines land at row_y +
-    /// baseline_offset, on whole pixels.
     baseline_offset: f32,
+    /// Font descent below the baseline, in device pixels (positive). The
+    /// baseline sits at `baseline_offset` from the cell top; the glyph text
+    /// box therefore ends at `baseline_offset + descent`. Used to size the
+    /// bar and underline cursors to the font rather than the full cell.
+    descent: f32,
 };
 
-/// Compute terminal cell dimensions from the atlas's primary face.
-/// In `.grid` / `.tt` modes, snaps `em` and `baseline_offset` to whole
-/// pixels via snail's TextCellGrid helper. In `.none` mode, returns
-/// the raw unsnapped em with a synthetic `cell_height * 0.8` baseline,
-/// matching the pre-cellGrid behaviour for A/B comparison.
-pub fn computeCellMetrics(atlas: *const snail.TextAtlas, font_size: f32) !CellMetrics {
-    const mode = render_env.loadHintMode();
-    if (mode == .none) {
-        const cm = try atlas.cellMetrics(.{ .em = font_size });
-        const cell_height = @ceil(cm.line_height);
-        return .{
-            .em = font_size,
-            .cell_width = cm.cell_width,
-            .cell_height = cell_height,
-            .baseline_offset = cell_height * 0.8,
-        };
-    }
-    const grid = try atlas.cellGrid(.{
-        .em = font_size,
-        .pixel_step = .{ .x = 1.0, .y = 1.0 },
-        .snap_rule = .nearest,
-    });
-    const cm = try atlas.cellMetrics(.{ .em = grid.em });
+/// Compute terminal cell dimensions from the primary font.
+pub fn computeCellMetrics(faces: *const snail.Faces, font_size: f32) !CellMetrics {
+    const face = faces.faceCount() > 0;
+    if (!face) return error.NoFaces;
+    const font = faces.fontForFace(0) orelse return error.NoPrimaryFont;
+
+    const units_per_em: f32 = @floatFromInt(font.unitsPerEm());
+    const scale = font_size / units_per_em;
+
+    const line = try font.lineMetrics();
+    const ascent_f: f32 = @floatFromInt(line.ascent);
+    const descent_f: f32 = @floatFromInt(line.descent);
+    const line_gap_f: f32 = @floatFromInt(line.line_gap);
+
+    const line_height = (ascent_f - descent_f + line_gap_f) * scale;
+    const cell_height = @ceil(line_height);
+    const baseline_offset = @floor(ascent_f * scale);
+    // `line.descent` is negative (below baseline); flip to a positive device
+    // depth. Clamp to whatever room is left under the baseline in the cell.
+    const descent = @min(@round(-descent_f * scale), cell_height - baseline_offset);
+
+    // Round the cell width to whole device pixels. snail's placeCellRun snaps
+    // glyphs to `@round(world_to_pixel.xx * cell_width)` under `CellSnap.grid`
+    // (world_to_pixel is identity here), so every column→pixel conversion we do
+    // ourselves — cursor, background spans, decorations, selection — must use
+    // the same integer advance or the cursor drifts ahead of the glyphs.
+    const glyph_id = font.glyphIndex('M') catch 0;
+    const cell_width: f32 = if (glyph_id != 0) blk: {
+        const adv = font.advanceWidth(glyph_id) catch 0;
+        const adv_f: f32 = @floatFromInt(adv);
+        break :blk @round(adv_f * scale);
+    } else @round(font_size * 0.6);
+
     return .{
-        .em = grid.em,
-        .cell_width = cm.cell_width,
-        .cell_height = @ceil(cm.line_height),
-        .baseline_offset = grid.baseline_offset,
+        .em = font_size,
+        .cell_width = cell_width,
+        .cell_height = cell_height,
+        .baseline_offset = baseline_offset,
+        .descent = descent,
     };
 }
 
@@ -137,723 +91,306 @@ pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h:
     };
 }
 
-/// GPU renderer state. Owned exclusively by the GPU renderer thread.
-/// Reads the shared atlas (via AtlasRef, lock-free).
+pub const frame_stats = FrameStats{};
+
+pub const FrameStats = struct {
+    pub fn dump(self: FrameStats, label: []const u8) void {
+        _ = self;
+        _ = label;
+    }
+};
+
+/// GPU renderer state. Owned by the GPU worker thread.
+/// Reads the shared atlas via AtlasRef (lock-free).
+const Instance = snail.render.records.Instance;
+const DrawBatch = snail.render.records.DrawBatch;
+const Binding = snail.render.records.Binding;
+
+const white_tint: [4]f32 = .{ 1, 1, 1, 1 };
+
 pub const GpuPipeline = struct {
     allocator: std.mem.Allocator,
     atlas_ref: *atlas_ref_mod.AtlasRef,
-    /// Lease on the current atlas snapshot. Swapped (and the old one
-    /// released) in `refreshAtlas` when the atlas thread publishes a
-    /// new identity. No blob outlives the frame that built it, so we
-    /// never need to retain more than one snapshot.
-    atlas_lease: atlas_ref_mod.AtlasRef.Lease,
+    viewport_w: u32 = 0,
+    viewport_h: u32 = 0,
+    font_size: f32 = 0,
+    cell_width: f32 = 0,
+    cell_height: f32 = 0,
+    baseline_offset: f32 = 0,
+    descent: f32 = 0,
 
-    gl_renderer: snail.Gles30Renderer,
-    scene: snail.Scene,
-    /// Bundle that owns every text blob built this frame. Reset at the
-    /// top of each `drawSnapshot`; rebound (cache-preserving) when the
-    /// atlas snapshot changes via `refreshAtlas`. The bundle's hint pool
-    /// is shared across all blobs, so per-blob `text_paint` uploads only
-    /// carry per-blob references — the hint deltas upload once per
-    /// bundle generation as one `text_hint` resource.
-    bundle: snail.TextBlobBundle,
-    /// TrueType hint context bound to the current atlas snapshot.
-    /// Rebound (cache-preserving when `canRebindFrom` holds) on snapshot
-    /// changes via `refreshAtlas`. Per-glyph hint computations are
-    /// cached inside until the cache is cleared by an incompatible
-    /// rebind.
-    hint_ctx: snail.TrueTypeHintContext,
+    // Scratch buffers for row_build
+    scratch_rects: [row_build.MAX_RECTS_PER_ROW * render_snapshot.MaxRows]row_build.ColoredRect = undefined,
+    rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
+    selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
+    eph: row_build.EphemeralBlobs,
+    misses: glyph_misses.Set = .{},
 
-    last_atlas_gen: u64 = 0,
-    last_atlas_identity: u64 = 0,
+    // Result of the last `buildShapes` — consumed by `emitBuilt`. Its slices
+    // point into rows_out / selection_spans / the eph stash, valid until the
+    // next `buildShapes` (which releases the stash).
+    built: ?row_build.BuiltSnapshot = null,
 
-    scratch_rects: []row_build.ColoredRect = &.{},
-    overrides: [MAX_OVERRIDES]snail.Override = undefined,
-    manifest_entries: [MANIFEST_CAP]snail.ResourceManifest.Entry = undefined,
+    // Emit output — refilled each frame; valid slices are
+    // instances.items[0..emit_instance_len] / batches.items[0..emit_batch_len].
+    instances: std.ArrayList(Instance) = .empty,
+    batches: std.ArrayList(DrawBatch) = .empty,
+    emit_instance_len: usize = 0,
+    emit_batch_len: usize = 0,
 
-    draw_buf: std.ArrayList(u32) = .empty,
-    seg_buf: std.ArrayList(snail.DrawList.Segment) = .empty,
-
-    /// Per-frame ephemeral blob storage (cursor inversion). Heap-allocated
-    /// so the scene can record stable `*const TextBlob` pointers across
-    /// mid-frame growth; bulk-released after each frame.
-    ephemeral_blobs: row_build.EphemeralBlobs,
-
-    cell_width: f32,
-    cell_height: f32,
-    font_size: f32,
-    baseline_offset: f32,
-    viewport_w: f32,
-    viewport_h: f32,
-    config: render_env.RenderConfig,
-
-    /// GL_TIMESTAMP queries via EXT_disjoint_timer_query, bracketing
-    /// drawPass. Two slots so we can write frame N's queries while
-    /// reading frame N-1's results without stalling on GPU work that's
-    /// already complete by the time the gpu_worker fence is done. Used
-    /// to distinguish actual GPU compute time from driver-side sync
-    /// wait (the dominant component of fence_ms on NVIDIA + dmabuf).
-    gpu_query_ids: [4]gl.GLuint = .{ 0, 0, 0, 0 },
-    gpu_query_slot: u8 = 0,
-    gpu_query_slot_used: [2]bool = .{ false, false },
-    gpu_queries_initialized: bool = false,
-
-    scratch_ready: bool = false,
-    /// Enables expensive per-frame GL instrumentation: glFinish to wait
-    /// for the draw to complete before reading back, glReadPixels to
-    /// sample the FBO, and the scene-sample log line. Driven by
-    /// SCRGO_TRACE; off in normal use.
-    trace_frames: bool = false,
-    debug_reset_atlas_each_frame: bool = false,
-
-    pub var frame_stats: perf.FrameStats = .{};
-
-    /// Per-phase wall-time accumulators (ns). Written by the GPU worker
-    /// thread only; main reads them at exit when SCRGO_LOG=commits. Single
-    /// writer + single reader, race is benign for diagnostics.
-    pub var phase_row_build_ns: u64 = 0;
-    pub var phase_picture_ns: u64 = 0;
-    pub var phase_upload_ns: u64 = 0;
-    pub var phase_drawlist_ns: u64 = 0;
-    pub var phase_draw_ns: u64 = 0;
-    pub var phase_frame_count: u64 = 0;
-    /// Actual GPU compute time measured via GL_TIMESTAMP queries
-    /// around drawPass. Updated lazily: frame N's value lands when
-    /// frame N+1 (or later) reads it back, so the gauge runs ~1 frame
-    /// behind. Compare to `phase_draw_ns` to see how much of "draw
-    /// time" is GPU work vs sync wait.
-    pub var phase_gpu_compute_ns: u64 = 0;
-    pub var phase_gpu_compute_samples: u64 = 0;
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        atlas_ref: *atlas_ref_mod.AtlasRef,
-        font_size: f32,
-        cell_width: f32,
-        cell_height: f32,
-        baseline_offset: f32,
-    ) !GpuPipeline {
-        var gl_renderer = try snail.Gles30Renderer.init(allocator);
-        errdefer gl_renderer.deinit();
-
-        var atlas_lease = atlas_ref.acquire();
-        errdefer atlas_lease.release();
-        const atlas = atlas_lease.get();
-        const initial_identity = atlas.snapshotIdentity();
-        var bundle = snail.TextBlobBundle.init(allocator, atlas);
-        errdefer bundle.deinit();
-        var scene = snail.Scene.init(allocator);
-        errdefer scene.deinit();
-        // CVT headroom of 32 entries tolerates fonts that write past the
-        // declared `cvt ` table size (Berkeley Mono's replacementCharacter,
-        // for one) — matches FreeType/Skia/CoreText behaviour.
-        const hint_ctx = snail.TrueTypeHintContext.initWithOptions(allocator, atlas, .{ .cvt_headroom = 32 });
-
-        return .{
+    /// Initialize in place. `self` must point at allocated (uninitialized)
+    /// storage — GpuPipeline embeds several-MB scratch arrays, so returning
+    /// it by value would blow the caller's stack.
+    pub fn init(self: *GpuPipeline, allocator: std.mem.Allocator, atlas_ref: *atlas_ref_mod.AtlasRef) !void {
+        self.* = .{
             .allocator = allocator,
             .atlas_ref = atlas_ref,
-            .atlas_lease = atlas_lease,
-            .gl_renderer = gl_renderer,
-            .scene = scene,
-            .bundle = bundle,
-            .hint_ctx = hint_ctx,
-            .last_atlas_gen = atlas_ref.loadGeneration(),
-            .last_atlas_identity = initial_identity,
-            .ephemeral_blobs = row_build.EphemeralBlobs.init(allocator),
-            .cell_width = cell_width,
-            .cell_height = cell_height,
-            .font_size = font_size,
-            .baseline_offset = baseline_offset,
-            .viewport_w = 0,
-            .viewport_h = 0,
-            .config = render_env.loadRenderConfigFromEnv(),
+            .eph = row_build.EphemeralBlobs.init(allocator),
         };
     }
 
     pub fn deinit(self: *GpuPipeline) void {
-        self.deinitGpuTimestamps();
-        self.ephemeral_blobs.deinit();
-        if (self.scratch_ready) self.allocator.free(self.scratch_rects);
-        self.draw_buf.deinit(self.allocator);
-        self.seg_buf.deinit(self.allocator);
-        self.bundle.deinit();
-        self.hint_ctx.deinit();
-        self.atlas_lease.release();
-        self.scene.deinit();
-        self.gl_renderer.deinit();
+        self.eph.deinit();
+        self.instances.deinit(self.allocator);
+        self.batches.deinit(self.allocator);
     }
 
-    fn currentAtlas(self: *const GpuPipeline) *const snail.TextAtlas {
-        return self.atlas_lease.get();
-    }
-
-    /// No-op kept for API stability with the gpu_worker worker. We
-    /// don't keep per-dmabuf paint state anymore — every frame paints
-    /// itself fully into whichever dmabuf the caller bound.
-    pub fn setActiveTarget(self: *GpuPipeline, idx: u8) void {
-        _ = self;
-        _ = idx;
-    }
-
-    /// Render a tiny synthetic frame to compile every shader program
-    /// snail will use at steady state: text (glyph blob), vector path
-    /// (filled rect), and the linear-resolve shaders. Atlas textures +
-    /// glyph pages get uploaded here too. Without this, those one-time
-    /// costs would land on the first real frames the user sees as
-    /// visible jank.
-    pub fn warmPipeline(self: *GpuPipeline) !void {
-        defer {
-            self.scene.reset();
-            self.bundle.reset();
-            self.ephemeral_blobs.releaseAll();
-        }
-
-        const atlas = self.currentAtlas();
-        self.scene.reset();
-        self.bundle.reset();
-
-        // Path picture: one tiny rect → compiles vector path shader
-        // and exercises the path-picture upload path.
-        var picture_builder = snail.PathPictureBuilder.init(self.allocator);
-        defer picture_builder.deinit();
-        try picture_builder.addFilledRect(
-            .{ .x = 0, .y = 0, .w = 2, .h = 2 },
-            .{ .paint = .{ .solid = .{ 1, 1, 1, 1 } } },
-            .identity,
-        );
-        var picture = try picture_builder.freeze(.{
-            .persistent_allocator = self.allocator,
-            .scratch_allocator = self.allocator,
-        });
-        defer picture.deinit();
-
-        // Text blob: shape & lay out one glyph → compiles text shader
-        // and forces the atlas to be uploaded to the GPU. We pick 'a'
-        // because atlas_owner's bootstrap populates ASCII.
-        const blob_opt: ?*const snail.TextBlob = blob: {
-            var shaped = self.atlas_ref.shape(atlas, self.allocator, .{}, "a") catch break :blob null;
-            defer shaped.deinit();
-            if (shaped.glyphs.len == 0) break :blob null;
-            var bip = self.bundle.startBlob() catch break :blob null;
-            errdefer bip.abort();
-            _ = bip.append(.{
-                .source = .{ .shaped = shaped.glyphs },
-                .placement = .{
-                    .baseline = .{ .x = 0, .y = self.cell_height * baseline_warm },
-                    .em = self.font_size,
-                },
-                .fill = .{ .solid = .{ 1, 1, 1, 1 } },
-            }) catch {
-                bip.abort();
-                break :blob null;
-            };
-            break :blob bip.finish(snail.ResourceKey.named("scrgo.warm")) catch null;
-        };
-
-        var manifest = snail.ResourceManifest.init(self.manifest_entries[0..]);
-        try manifest.putPathPicture(PICTURE_KEY, &picture);
-        try self.scene.addPath(.{ .picture = &picture, .resource_key = PICTURE_KEY });
-
-        if (blob_opt) |blob| {
-            const text_keys = textKeysFor(blob);
-            try manifest.putTextBlob(text_keys, blob);
-            try self.scene.addText(.{ .blob = blob, .resources = text_keys });
-        }
-
-        var prepared = try self.gl_renderer.uploadResourcesBlocking(
-            .{ .persistent = self.allocator, .scratch = self.allocator },
-            &manifest,
-        );
-        defer prepared.deinit();
-
-        const buf_words = snail.DrawList.estimate(&self.scene);
-        const seg_count = snail.DrawList.estimateSegments(&self.scene);
-        try self.draw_buf.resize(self.allocator, buf_words);
-        try self.seg_buf.resize(self.allocator, seg_count);
-        var draw_list = snail.DrawList.init(self.draw_buf.items, self.seg_buf.items);
-        try draw_list.addScene(&prepared, &self.scene);
-
-        const pass: snail.DrawPass = .{
-            .state = self.drawState(),
-            .resolve = .{ .linear = .{
-                .backdrop = .target,
-                .region = .{ .pixel_rect = .{ .x = 0, .y = 0, .w = 4, .h = 4 } },
-            } },
-        };
-        try self.gl_renderer.drawPass(&prepared, &draw_list, pass);
-        gl.glFinish();
-    }
-
-    /// Notify the renderer that the output buffer set has been
-    /// (re)allocated. Every dmabuf now backs a *new* texture with
-    /// undefined pixel contents, so any "this buffer is seeded"
-    /// belief from the prior allocation is stale and must be dropped
-    /// — otherwise the next paint reads garbage via `backdrop = .target`.
-    /// Call this whenever the GPU side re-imports its dmabufs (initial
-    /// install, reconfigure, GPU/context restart, etc.), even if the
-    /// viewport dimensions didn't change.
-    /// No-op kept for API stability. With every frame fully repainting
-    /// every row, there is no per-dmabuf "seeded" state to invalidate
-    /// when the GPU side reinstalls its dmabufs.
-    pub fn notifyTargetsReinstalled(self: *GpuPipeline) void {
-        _ = self;
-    }
-
-    fn ensureScratch(self: *GpuPipeline) !void {
-        if (self.scratch_ready) return;
-        self.scratch_rects = try self.allocator.alloc(row_build.ColoredRect, row_build.MAX_RECTS_PER_ROW);
-        self.scratch_ready = true;
-    }
-
-    pub fn setDebugResetAtlas(self: *GpuPipeline, enabled: bool) void {
-        self.debug_reset_atlas_each_frame = enabled;
-    }
-
-    pub fn setTraceFrames(self: *GpuPipeline, enabled: bool) void {
-        self.trace_frames = enabled;
-    }
-
-    /// Resize the drawable. Pure window-resize; cell metrics are unchanged.
-    pub fn setViewport(self: *GpuPipeline, w: u32, h: u32) void {
-        if (self.viewport_w == @as(f32, @floatFromInt(w)) and self.viewport_h == @as(f32, @floatFromInt(h))) return;
-        self.viewport_w = @floatFromInt(w);
-        self.viewport_h = @floatFromInt(h);
-    }
-
-    /// Update font metrics. No-op when metrics are unchanged.
-    pub fn setMetrics(self: *GpuPipeline, font_size: f32, cell_width: f32, cell_height: f32, baseline_offset: f32) void {
-        if (self.font_size == font_size and
-            self.cell_width == cell_width and
-            self.cell_height == cell_height and
-            self.baseline_offset == baseline_offset) return;
+    pub fn configure(
+        self: *GpuPipeline,
+        width: u32,
+        height: u32,
+        font_size: f32,
+        cell_width: f32,
+        cell_height: f32,
+        baseline_offset: f32,
+        descent: f32,
+    ) void {
+        self.viewport_w = width;
+        self.viewport_h = height;
         self.font_size = font_size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
         self.baseline_offset = baseline_offset;
+        self.descent = descent;
     }
 
-    /// Pick up the latest atlas snapshot. Swaps the retained lease and
-    /// rebinds the bundle + hint context against the fresh atlas. Safe
-    /// to call only at frame boundaries: the previous frame's blobs and
-    /// ephemeral rects must have been released first (bundle.reset()
-    /// and ephemeral_blobs.releaseAll()). When the new snapshot extends
-    /// the old (the common case for `ensureText` growth) the hint cache
-    /// and bundle hint pool both survive; otherwise both clear.
-    fn refreshAtlas(self: *GpuPipeline) *const snail.TextAtlas {
-        var next_lease = self.atlas_ref.acquire();
-        const atlas = next_lease.get();
-        const identity = atlas.snapshotIdentity();
-        if (identity == self.last_atlas_identity) {
-            next_lease.release();
-            return self.atlas_lease.get();
-        }
-
-        self.atlas_lease.release();
-        self.atlas_lease = next_lease;
-        self.last_atlas_gen = self.atlas_ref.loadGeneration();
-        self.last_atlas_identity = identity;
-
-        const reset_t0 = perf.Timer.now();
-        // Bundle and hint context both prefer cache-preserving rebind
-        // when canRebindFrom holds. If the new snapshot is incompatible
-        // (font config changed — never happens at runtime today), the
-        // bundle's rebindAtlas returns an error and we fall back to
-        // deinit+init.
-        self.bundle.rebindAtlas(atlas) catch {
-            self.bundle.deinit();
-            self.bundle = snail.TextBlobBundle.init(self.allocator, atlas);
-        };
-        self.hint_ctx.rebindAtlas(atlas);
-        const reset_ns = reset_t0.elapsedNs();
-
-        log.info(.gpu, "atlas snapshot", .{
-            .identity = identity,
-            .rebind_us = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(reset_ns)) / @as(f64, std.time.ns_per_us)}),
-        });
-        return atlas;
+    /// Placed glyph instances built by the last `buildAndEmit` call.
+    pub fn emittedInstances(self: *const GpuPipeline) []const Instance {
+        return self.instances.items[0..self.emit_instance_len];
     }
 
-    fn rowMetrics(self: *const GpuPipeline) row_build.Metrics {
-        return .{
+    /// Draw batches built by the last `buildAndEmit` call.
+    pub fn emittedBatches(self: *const GpuPipeline) []const DrawBatch {
+        return self.batches.items[0..self.emit_batch_len];
+    }
+
+    /// Shape + place the snapshot against `atlas`, storing the result for a
+    /// later `emitBuilt`. Returns true if any glyph is missing from `atlas`
+    /// (caller should extend the atlas and rebuild before emitting — emitting
+    /// against an incomplete atlas would fail per row). No emit happens here,
+    /// so the miss-then-extend cycle produces no spurious emit errors.
+    pub fn buildShapes(
+        self: *GpuPipeline,
+        atlas: *const snail.Atlas,
+        faces: *snail.Faces,
+        snapshot: *const render_snapshot.SharedSnapshot,
+    ) !bool {
+        self.eph.releaseAll();
+        self.misses.clear();
+
+        const metrics: row_build.Metrics = .{
             .cell_width = self.cell_width,
             .cell_height = self.cell_height,
             .font_size = self.font_size,
             .baseline_offset = self.baseline_offset,
         };
-    }
 
-    fn ensureGpuTimestamps(self: *GpuPipeline) void {
-        if (self.gpu_queries_initialized) return;
-        if (!timer_query_loaded) {
-            timer_query_fns = TimerQueryFns.load();
-            timer_query_loaded = true;
-        }
-        if (!timer_query_fns.available()) return;
-        timer_query_fns.gen.?(self.gpu_query_ids.len, &self.gpu_query_ids);
-        self.gpu_queries_initialized = true;
-    }
-
-    fn deinitGpuTimestamps(self: *GpuPipeline) void {
-        if (!self.gpu_queries_initialized) return;
-        if (timer_query_fns.del) |del| del(self.gpu_query_ids.len, &self.gpu_query_ids);
-        self.gpu_queries_initialized = false;
-    }
-
-    /// Read the previous slot's TIMESTAMP queries iff they're already
-    /// available — never blocks. The gpu_worker's fence wait at the end
-    /// of the previous frame guarantees the queries are done by the
-    /// time this frame's flushDraw runs, so AVAILABLE almost always
-    /// returns true. On disjoint hardware events (GPU reset etc.) the
-    /// driver may invalidate the query; we just skip the sample.
-    fn harvestPriorGpuTimestamps(self: *GpuPipeline) void {
-        if (!self.gpu_queries_initialized) return;
-        const prev: u8 = 1 - self.gpu_query_slot;
-        if (!self.gpu_query_slot_used[prev]) return;
-        const id_pre = self.gpu_query_ids[@as(usize, prev) * 2];
-        const id_post = self.gpu_query_ids[@as(usize, prev) * 2 + 1];
-        var available: gl.GLuint = 0;
-        timer_query_fns.get_u32.?(id_post, gl.GL_QUERY_RESULT_AVAILABLE_EXT, &available);
-        if (available == 0) return;
-        var t0: gl.GLuint64 = 0;
-        var t1: gl.GLuint64 = 0;
-        timer_query_fns.get_u64.?(id_pre, gl.GL_QUERY_RESULT_EXT, &t0);
-        timer_query_fns.get_u64.?(id_post, gl.GL_QUERY_RESULT_EXT, &t1);
-        self.gpu_query_slot_used[prev] = false;
-        if (t1 < t0) return; // disjoint event
-        phase_gpu_compute_ns += t1 - t0;
-        phase_gpu_compute_samples += 1;
-    }
-
-    fn beginGpuTimestamp(self: *GpuPipeline) void {
-        self.ensureGpuTimestamps();
-        if (!self.gpu_queries_initialized) return;
-        const slot = self.gpu_query_slot;
-        timer_query_fns.counter.?(self.gpu_query_ids[@as(usize, slot) * 2], gl.GL_TIMESTAMP_EXT);
-    }
-
-    fn endGpuTimestamp(self: *GpuPipeline) void {
-        if (!self.gpu_queries_initialized) return;
-        const slot = self.gpu_query_slot;
-        timer_query_fns.counter.?(self.gpu_query_ids[@as(usize, slot) * 2 + 1], gl.GL_TIMESTAMP_EXT);
-        self.gpu_query_slot_used[slot] = true;
-        self.gpu_query_slot = 1 - slot;
-    }
-
-    /// Emit cursor geometry into the per-frame path picture. Cursor edges
-    /// snap to integer pixel boundaries by computing both edges in float
-    /// (cell_width is fractional) and rounding each separately — never
-    /// multiplying `cell_x` by a truncated width.
-    fn emitCursor(self: *const GpuPipeline, picture: *snail.PathPictureBuilder, cursor: row_build.CursorOverlay) !void {
-        const x0_f = @as(f32, @floatFromInt(cursor.cell_x)) * self.cell_width;
-        const y0_f = @as(f32, @floatFromInt(cursor.cell_y)) * self.cell_height;
-        const x1_f = @as(f32, @floatFromInt(cursor.cell_x + 1)) * self.cell_width;
-        const y1_f = @as(f32, @floatFromInt(cursor.cell_y + 1)) * self.cell_height;
-        const x0 = @round(x0_f);
-        const y0 = @round(y0_f);
-        const x1 = @round(x1_f);
-        const y1 = @round(y1_f);
-        const cw = @max(1.0, x1 - x0);
-        const ch = @max(1.0, y1 - y0);
-        const cc = cursor.color.toFloat4(1.0);
-        const fill: snail.FillStyle = .{ .paint = .{ .solid = cc } };
-        switch (cursor.style) {
-            .block => try picture.addFilledRect(.{ .x = x0, .y = y0, .w = cw, .h = ch }, fill, .identity),
-            .bar => try picture.addFilledRect(.{ .x = x0, .y = y0, .w = 2.0, .h = ch }, fill, .identity),
-            .underline => try picture.addFilledRect(.{ .x = x0, .y = y0 + ch - 2.0, .w = cw, .h = 2.0 }, fill, .identity),
-            .block_hollow => try picture.addStrokedRect(
-                .{ .x = x0, .y = y0, .w = cw, .h = ch },
-                .{ .paint = .{ .solid = cc }, .width = 1.5, .placement = .inside },
-                .identity,
-            ),
-        }
-    }
-
-    fn drawState(self: *const GpuPipeline) snail.DrawState {
-        return .{
-            .mvp = snail.Mat4.ortho(0, self.viewport_w, self.viewport_h, 0, -1, 1),
-            .surface = .{
-                .pixel_width = self.viewport_w,
-                .pixel_height = self.viewport_h,
-                // FBO storage is linear-format (mesa rejects sRGB dmabuf
-                // imports), consumer expects sRGB bytes. The .linear resolve
-                // below tells snail to render into a linear RGBA16F
-                // intermediate and encode-pass the result into our linear
-                // attachment.
-                .encoding = .srgb_pixels_on_linear_attachment,
-            },
-            .raster = render_env.effectiveRasterOptions(self.config),
-        };
-    }
-
-    pub fn drawSnapshot(self: *GpuPipeline, snapshot: *const render_snapshot.SharedSnapshot, misses: *glyph_misses.Set) !void {
-        const frame_timer = perf.Timer.now();
-        const atlas = self.refreshAtlas();
-        try self.ensureScratch();
-        // Caller has already bound the active target's dmabuf FBO; we
-        // render straight into it. Each dmabuf retains its own pixels
-        // across the swap chain rotation, so backdrop=.target preserves
-        // prior frames painted into the *same* dmabuf and we only have
-        // to repaint rows that differ from this buffer's recorded era.
-        self.scene.reset();
-        // Drop every blob the previous frame produced. Bundle keeps its
-        // arena + hint pool capacity; the next frame's appends reuse it.
-        self.bundle.reset();
-
-        var rows_buf: [MAX_SNAPSHOT_ROWS]row_build.RowDraw = undefined;
-        var sel_buf: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined;
-        const row_build_t0 = perf.Timer.now();
-        const built = try row_build.buildSnapshot(
+        self.built = try row_build.buildSnapshot(
             snapshot,
             self.allocator,
-            self.rowMetrics(),
-            &self.bundle,
+            metrics,
             atlas,
-            self.atlas_ref,
-            self.scratch_rects,
-            rows_buf[0..],
-            sel_buf[0..],
-            &self.ephemeral_blobs,
-            misses,
-            &self.hint_ctx,
+            faces,
+            &self.scratch_rects,
+            &self.rows_out,
+            &self.selection_spans,
+            &self.eph,
+            &self.misses,
         );
-        phase_row_build_ns += row_build_t0.elapsedNs();
-
-        // Misses on the freshly-shaped blob are reported via `misses`
-        // upward. The GPU worker (gpu_worker.zig) hands them to the
-        // async atlas thread (`atlas_thread.requestMany`) so the next
-        // frame's atlas snapshot will include them. We deliberately do
-        // NOT extend the atlas synchronously and re-shape this frame:
-        // the old path doubled the per-frame row-build cost whenever a
-        // new glyph showed up, which on a workload like tmatrix (a
-        // steady trickle of fresh codepoints) means every-other frame
-        // is twice as expensive and blows the vsync budget. Shipping
-        // partial-glyph content for one frame is invisible at 60 Hz
-        // when the surrounding cells are turning over anyway.
-
-        try self.flushDraw(built, snapshot.header.default_bg, snapshot.header.default_fg);
-        self.ephemeral_blobs.releaseAll();
-        frame_stats.record(frame_timer.elapsedUs());
+        return !self.misses.isEmpty();
     }
 
-    fn flushDraw(self: *GpuPipeline, built: row_build.BuiltSnapshot, default_bg: Rgb, default_fg: Rgb) !void {
-        // Full-frame repaint every frame: paint the background, every
-        // row's bg/decoration rects, every row's glyphs, the cursor,
-        // any selection bands, and the scrollbar. We rely on snail's
-        // `backdrop = .clear` to seed the output to the bg color so we
-        // don't have to emit a per-row bg fill.
-        const picture_t0 = perf.Timer.now();
-        var picture_builder = snail.PathPictureBuilder.init(self.allocator);
-        defer picture_builder.deinit();
+    /// Emit the shapes from the last `buildShapes` into the instance/batch
+    /// buffers using `binding` — which MUST be the binding returned by the
+    /// device-atlas upload of the same `atlas` the shapes were built against.
+    pub fn emitBuilt(
+        self: *GpuPipeline,
+        atlas: *const snail.Atlas,
+        binding: Binding,
+        snapshot: *const render_snapshot.SharedSnapshot,
+    ) !void {
+        self.instances.clearRetainingCapacity();
+        self.batches.clearRetainingCapacity();
+        self.emit_instance_len = 0;
+        self.emit_batch_len = 0;
 
-        for (built.rows) |row_draw| {
-            for (row_draw.rects) |r| {
-                if (r.w <= 0.0 or r.h <= 0.0) continue;
-                try picture_builder.addFilledRect(
-                    .{ .x = r.x, .y = r.y + row_draw.row_y, .w = r.w, .h = r.h },
-                    .{ .paint = .{ .solid = r.color } },
-                    .identity,
-                );
+        const built = self.built orelse return;
+
+        var total_shapes: usize = 0;
+        for (built.rows) |row| total_shapes += row.shapes.len;
+        var total_rects: usize = 0;
+        for (built.rows) |row| total_rects += row.rects.len;
+        total_rects += built.selection_spans.len + 8; // cursor(≤4) + scrollbar(2) + bell(1) + slack
+
+        // Generous upper bound: emit may fan a glyph shape into several
+        // per-layer instances (COLR / hinted); each rect is one instance.
+        const cap = (total_shapes + total_rects) * 8 + 128;
+        try self.instances.resize(self.allocator, cap);
+        try self.batches.resize(self.allocator, cap);
+
+        const default_bg = snapshot.header.default_bg;
+        const default_fg = snapshot.header.default_fg;
+
+        // Emit back-to-front. All fills reference the atlas's unit-rect record;
+        // per-rect color/alpha rides in `world_tint` (path fills ignore
+        // local_color), so consecutive rects coalesce into a few path batches.
+        var il: usize = 0;
+        var bl: usize = 0;
+
+        // ── Layer 1: background spans + decoration rects (row-local → +row_y) ──
+        for (built.rows) |row| {
+            for (row.rects) |rect| {
+                self.emitRect(&il, &bl, binding, atlas, rect.x, rect.y + row.row_y, rect.w, rect.h, rect.color);
             }
         }
-        // Selection highlight: covers cell bg, text reads on top of it.
+
+        // ── Layer 2: selection highlight (translucent, behind text) ──
         if (built.selection_spans.len > 0) {
-            const sel_color = render_common.selectionFillColor(default_bg);
+            const sel = render_common.selectionFillColor(default_bg);
             for (built.selection_spans) |span| {
-                const x0 = @as(f32, @floatFromInt(span.start_col)) * self.cell_width;
-                const y0 = @as(f32, @floatFromInt(span.row)) * self.cell_height;
+                const x = @as(f32, @floatFromInt(span.start_col)) * self.cell_width;
                 const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * self.cell_width;
-                try picture_builder.addFilledRect(
-                    .{ .x = x0, .y = y0, .w = w, .h = self.cell_height },
-                    .{ .paint = .{ .solid = sel_color } },
-                    .identity,
-                );
+                const y = @as(f32, @floatFromInt(span.row)) * self.cell_height;
+                self.emitRect(&il, &bl, binding, atlas, x, y, w, self.cell_height, sel);
             }
         }
-        if (built.cursor) |cursor| try self.emitCursor(&picture_builder, cursor);
 
-        // Scrollbar overlay on the right edge. Paint last so it sits
-        // on top of everything else. When the scrollbar is visible we
-        // emit it on every dirty frame (the dirty set already covers
-        // every row whenever the scrollbar state changes).
-        if (built.scrollbar) |sb| {
-            const geom = render_common.scrollbarGeometry(self.viewport_w, self.viewport_h, sb.thumb_offset, sb.thumb_size);
-            const sc = render_common.scrollbarColors(default_fg, sb.alpha);
-            try picture_builder.addFilledRect(
-                .{ .x = geom.gutter_x, .y = geom.gutter_y, .w = geom.gutter_w, .h = geom.gutter_h },
-                .{ .paint = .{ .solid = sc.gutter } },
-                .identity,
-            );
-            try picture_builder.addFilledRect(
-                .{ .x = geom.gutter_x, .y = geom.thumb_y, .w = geom.gutter_w, .h = geom.thumb_h },
-                .{ .paint = .{ .solid = sc.thumb } },
-                .identity,
-            );
+        // ── Layer 3: text glyphs ──
+        for (built.rows) |row| {
+            if (row.shapes.len == 0) continue;
+            const xform = snail.Transform2D.translate(0, row.row_y);
+            _ = snail.emit.emit(
+                self.instances.items,
+                self.batches.items,
+                &il,
+                &bl,
+                binding,
+                atlas,
+                row.shapes,
+                xform,
+                white_tint,
+            ) catch |err| {
+                log.warn(.gpu, "emit failed for row", .{ .err = err });
+                continue;
+            };
         }
 
-        // Visual-bell overlay: translucent full-viewport rect tinted by
-        // default_fg. Last in paint order so the tint sits over text +
-        // scrollbar; alpha fades to 0 across the bell window.
+        // ── Layer 4: cursor ──
+        if (built.cursor) |cursor| self.emitCursor(&il, &bl, binding, atlas, cursor);
+
+        // ── Layer 5: scrollbar ──
+        if (built.scrollbar) |sb| {
+            if (sb.alpha > 0) {
+                const geo = render_common.scrollbarGeometry(
+                    @floatFromInt(self.viewport_w),
+                    @floatFromInt(self.viewport_h),
+                    sb.thumb_offset,
+                    sb.thumb_size,
+                );
+                const colors = render_common.scrollbarColors(default_fg, sb.alpha);
+                self.emitRect(&il, &bl, binding, atlas, geo.gutter_x, geo.gutter_y, geo.gutter_w, geo.gutter_h, colors.gutter);
+                self.emitRect(&il, &bl, binding, atlas, geo.gutter_x, geo.thumb_y, geo.gutter_w, geo.thumb_h, colors.thumb);
+            }
+        }
+
+        // ── Layer 6: visual bell — full-viewport tint ──
         if (built.bell) |bell| {
             if (bell.alpha > 0) {
-                const tint = default_fg.toFloat4(1.0);
-                const a = @min(1.0, @max(0.0, bell.alpha)) * 0.25;
-                try picture_builder.addFilledRect(
-                    .{ .x = 0, .y = 0, .w = self.viewport_w, .h = self.viewport_h },
-                    .{ .paint = .{ .solid = .{ tint[0], tint[1], tint[2], a } } },
-                    .identity,
-                );
+                const fg = default_fg.toLinearFloat4(1.0);
+                self.emitRect(&il, &bl, binding, atlas, 0, 0, @floatFromInt(self.viewport_w), @floatFromInt(self.viewport_h), .{ fg[0], fg[1], fg[2], 0.15 * bell.alpha });
             }
         }
 
-        // Picture is optional: a frame that paints only glyphs (no bg
-        // rects, no cursor, no scrollbar) leaves the builder empty and
-        // `freeze` errors with EmptyPicture. The text-only path still
-        // works — backdrop=.clear gives us a clean default-bg canvas.
-        var maybe_picture: ?snail.PathPicture = if (picture_builder.shapeCount() > 0) try picture_builder.freeze(.{
-            .persistent_allocator = self.allocator,
-            .scratch_allocator = self.allocator,
-        }) else null;
-        defer if (maybe_picture) |*p| p.deinit();
-        phase_picture_ns += picture_t0.elapsedNs();
+        self.emit_instance_len = il;
+        self.emit_batch_len = bl;
+    }
 
-        var manifest = snail.ResourceManifest.init(self.manifest_entries[0..]);
-        if (maybe_picture) |*picture| {
-            try manifest.putPathPicture(PICTURE_KEY, picture);
-            try self.scene.addPath(.{ .picture = picture, .resource_key = PICTURE_KEY });
-        }
+    /// Emit one solid/translucent rectangle (in pixel space) as an instance of
+    /// the atlas's unit-rect record. Color+alpha ride in `world_tint`.
+    fn emitRect(
+        self: *GpuPipeline,
+        il: *usize,
+        bl: *usize,
+        binding: Binding,
+        atlas: *const snail.Atlas,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        tint: [4]f32,
+    ) void {
+        if (w <= 0 or h <= 0 or tint[3] <= 0) return;
+        // Map the unit rect (0,0,1,1) onto (x,y,w,h), then into the record's
+        // design frame. Color rides in `local_color` (snail 0.13.1 honors it
+        // for path fills), so all rects share one white `world_tint`.
+        const outer = snail.Transform2D{ .xx = w, .yy = h, .tx = x, .ty = y };
+        const shape = snail.Shape{
+            .key = self.atlas_ref.rect_key,
+            .local_transform = outer.multiply(self.atlas_ref.rect_xform),
+            .local_color = tint,
+        };
+        _ = snail.emit.emit(
+            self.instances.items,
+            self.batches.items,
+            il,
+            bl,
+            binding,
+            atlas,
+            &.{shape},
+            .identity,
+            white_tint,
+        ) catch {};
+    }
 
-        var override_index: usize = 0;
-        for (built.rows) |row_draw| {
-            if (row_draw.blob.glyphCount() == 0) continue;
-            if (override_index >= self.overrides.len) break;
-            self.overrides[override_index] = .{
-                .transform = snail.Transform2D.translate(0, row_draw.row_y),
-                .tint = .{ 1, 1, 1, 1 },
-            };
-            const slot = self.overrides[override_index .. override_index + 1];
-            override_index += 1;
-            const row_keys = textKeysFor(row_draw.blob);
-            try manifest.putTextBlob(row_keys, row_draw.blob);
-            try self.scene.addText(.{
-                .blob = row_draw.blob,
-                .resources = row_keys,
-                .instances = slot,
-            });
-        }
-        if (built.cursor) |cursor| {
-            if (cursor.inverted_glyph) |blob| {
-                const cursor_keys = textKeysFor(blob);
-                try manifest.putTextBlob(cursor_keys, blob);
-                try self.scene.addText(.{ .blob = blob, .resources = cursor_keys });
-            }
-        }
-
-        const upload_t0 = perf.Timer.now();
-        var prepared = try self.gl_renderer.uploadResourcesBlocking(
-            .{ .persistent = self.allocator, .scratch = self.allocator },
-            &manifest,
-        );
-        defer prepared.deinit();
-        phase_upload_ns += upload_t0.elapsedNs();
-
-        const drawlist_t0 = perf.Timer.now();
-        const buf_words = snail.DrawList.estimate(&self.scene);
-        const seg_count = snail.DrawList.estimateSegments(&self.scene);
-        try self.draw_buf.resize(self.allocator, buf_words);
-        try self.seg_buf.resize(self.allocator, seg_count);
-        var draw_list = snail.DrawList.init(self.draw_buf.items, self.seg_buf.items);
-        try draw_list.addScene(&prepared, &self.scene);
-        phase_drawlist_ns += drawlist_t0.elapsedNs();
-
-        // Every frame paints the entire viewport from scratch into the
-        // caller's dmabuf, so backdrop is always .clear (snail seeds
-        // the output with the default bg) and the resolve region is
-        // always the full target.
-        // .direct = no linear intermediate, no full-screen resolve pass.
-        // Each shader writes encoded sRGB straight to the dmabuf and
-        // fixed-function blending operates on encoded values. Saves the
-        // ~48ms per-frame full-screen resolve at the cost of slightly
-        // inaccurate translucent blending. Toggled via SCRGO_DIRECT_RESOLVE
-        // so we can A/B compare without rebuilding.
-        const pass: snail.DrawPass = if (render_env.directResolveEnabled())
-            .{ .state = self.drawState(), .resolve = .direct }
-        else
-            .{
-                .state = self.drawState(),
-                .resolve = .{ .linear = .{
-                    .backdrop = .{ .clear = default_bg.toFloat4(1.0) },
-                    .region = .full_target,
-                } },
-            };
-        // Per-frame scene stats so we can spot "GPU went blank" cases. Counts
-        // include the rect-picture shape count, the number of text blobs
-        // added to the scene, and the total glyph count across all blobs.
-        // If a frame goes blank but stats are non-zero, the issue is on the
-        // GL side (resource-cache or context); if stats drop to zero, the
-        // build/snapshot is the suspect.
-        var total_glyphs: usize = 0;
-        for (built.rows) |row_draw| total_glyphs += row_draw.blob.glyphCount();
-        if (built.cursor) |cursor| {
-            if (cursor.inverted_glyph) |blob| total_glyphs += blob.glyphCount();
-        }
-        const scene_shapes: usize = if (maybe_picture) |*p| p.shapeCount() else 0;
-        const scene_text_blobs = self.scene.commandCount();
-
-        self.harvestPriorGpuTimestamps();
-        const draw_t0 = perf.Timer.now();
-        self.beginGpuTimestamp();
-        try self.gl_renderer.drawPass(&prepared, &draw_list, pass);
-        self.endGpuTimestamp();
-
-        // Block on the GPU pipeline before reading back. glFlush alone is
-        // fire-and-forget; for a readback we need the FBO to actually have
-        // its contents before glReadPixels samples it. (The cost is paid
-        // only when frame logging is on.)
-        if (self.trace_frames) gl.glFinish() else gl.glFlush();
-        phase_draw_ns += draw_t0.elapsedNs();
-        phase_frame_count += 1;
-
-        // Check for GL errors after the draw. Persistent errors after a
-        // context loss / driver hiccup explain "screen went blank but our
-        // pipeline thinks it's fine".
-        var gl_err: gl.GLenum = gl.glGetError();
-        var error_count: u32 = 0;
-        while (gl_err != gl.GL_NO_ERROR and error_count < 4) {
-            error_count += 1;
-            log.warn(.gpu, "GL error after drawPass", .{
-                .code = log.fmt("0x{x}", .{gl_err}),
-                .frame = phase_frame_count,
-            });
-            gl_err = gl.glGetError();
-        }
-
-        if (self.trace_frames) {
-            // Sample 5 pixels across the FBO to see what actually landed in
-            // it. If the dmabuf is all bg color (or all zero) while scene
-            // stats show content, the snail/GL pipeline produced an empty
-            // output despite non-empty inputs.
-            const w_i: gl.GLint = @intFromFloat(@max(self.viewport_w, 1.0));
-            const h_i: gl.GLint = @intFromFloat(@max(self.viewport_h, 1.0));
-            const sample_xs = [_]gl.GLint{ @divTrunc(w_i, 5), @divTrunc(w_i * 2, 5), @divTrunc(w_i, 2), @divTrunc(w_i * 3, 5), @divTrunc(w_i * 4, 5) };
-            const sample_y: gl.GLint = @divTrunc(h_i, 2);
-            var pixels: [5][4]u8 = undefined;
-            for (sample_xs, 0..) |x, i| {
-                gl.glReadPixels(x, sample_y, 1, 1, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, &pixels[i]);
-            }
-            log.info(.gpu, "scene", .{
-                .frame = phase_frame_count,
-                .rects = scene_shapes,
-                .blobs = scene_text_blobs,
-                .glyphs = total_glyphs,
-                .rows = built.rows.len,
-                .px = log.fmt("[{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}]", .{
-                    pixels[0][0], pixels[0][1], pixels[0][2],
-                    pixels[1][0], pixels[1][1], pixels[1][2],
-                    pixels[2][0], pixels[2][1], pixels[2][2],
-                    pixels[3][0], pixels[3][1], pixels[3][2],
-                    pixels[4][0], pixels[4][1], pixels[4][2],
-                }),
-            });
+    fn emitCursor(
+        self: *GpuPipeline,
+        il: *usize,
+        bl: *usize,
+        binding: Binding,
+        atlas: *const snail.Atlas,
+        cursor: row_build.CursorOverlay,
+    ) void {
+        const x = @as(f32, @floatFromInt(cursor.cell_x)) * self.cell_width;
+        const y = @as(f32, @floatFromInt(cursor.cell_y)) * self.cell_height;
+        const cw = self.cell_width;
+        const ch = self.cell_height;
+        switch (cursor.style) {
+            .block => self.emitRect(il, bl, binding, atlas, x, y, cw, ch, cursor.color.toLinearFloat4(0.7)),
+            .bar => {
+                const ext = render_common.barCursorExtent(y, ch, self.baseline_offset, self.descent);
+                self.emitRect(il, bl, binding, atlas, x, ext.y, 2, ext.h, cursor.color.toLinearFloat4(1.0));
+            },
+            .underline => {
+                const ext = render_common.underlineCursorExtent(y, ch, self.baseline_offset, self.descent);
+                self.emitRect(il, bl, binding, atlas, x, ext.y, cw, ext.h, cursor.color.toLinearFloat4(1.0));
+            },
+            .block_hollow => {
+                const c1 = cursor.color.toLinearFloat4(1.0);
+                self.emitRect(il, bl, binding, atlas, x, y, cw, 1, c1);
+                self.emitRect(il, bl, binding, atlas, x, y + ch - 1, cw, 1, c1);
+                self.emitRect(il, bl, binding, atlas, x, y, 1, ch, c1);
+                self.emitRect(il, bl, binding, atlas, x + cw - 1, y, 1, ch, c1);
+            },
         }
     }
 };

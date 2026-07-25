@@ -4,7 +4,6 @@ const log = @import("log.zig");
 
 const wl = @cImport({
     @cInclude("wayland-client.h");
-    @cInclude("wayland-egl.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("xdg-decoration-client-protocol.h");
     @cInclude("viewporter-client-protocol.h");
@@ -13,12 +12,90 @@ const wl = @cImport({
     @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
     @cInclude("primary-selection-unstable-v1-client-protocol.h");
     @cInclude("text-input-unstable-v3-client-protocol.h");
-    @cInclude("linux-drm-syncobj-v1-client-protocol.h");
 });
 
-const egl = @cImport({
-    @cInclude("EGL/egl.h");
-});
+// EGL types are no longer used (switched to Vulkan). These stubs
+// keep the Wayland struct's field types valid without requiring
+// EGL headers. The fields are dead code — never accessed when
+// using the Vulkan renderer.
+const egl = struct {
+    pub const EGLDisplay = ?*anyopaque;
+    pub const EGLContext = ?*anyopaque;
+    pub const EGLSurface = ?*anyopaque;
+    pub const EGLConfig = ?*anyopaque;
+    pub const EGLAttrib = isize;
+    pub const EGL_NO_DISPLAY: EGLDisplay = null;
+    pub const EGL_NO_CONTEXT: EGLContext = null;
+    pub const EGL_NO_SURFACE: EGLSurface = null;
+    pub const EGL_FALSE: c_int = 0;
+    pub const EGL_TRUE: c_int = 1;
+    pub const EGLint = c_int;
+    pub const EGL_NONE: EGLint = 0;
+    pub const EGL_RED_SIZE: EGLint = 1;
+    pub const EGL_GREEN_SIZE: EGLint = 2;
+    pub const EGL_BLUE_SIZE: EGLint = 3;
+    pub const EGL_ALPHA_SIZE: EGLint = 4;
+    pub const EGL_SURFACE_TYPE: EGLint = 5;
+    pub const EGL_RENDERABLE_TYPE: EGLint = 6;
+    pub const EGL_SAMPLE_BUFFERS: EGLint = 7;
+    pub const EGL_SAMPLES: EGLint = 8;
+    pub const EGL_WINDOW_BIT: EGLint = 1;
+    pub const EGL_OPENGL_BIT: EGLint = 8;
+    pub const EGL_OPENGL_API: EGLint = 2;
+    pub const EGL_CONTEXT_MAJOR_VERSION: EGLint = 9;
+    pub const EGL_CONTEXT_MINOR_VERSION: EGLint = 10;
+    pub const EGL_CONTEXT_OPENGL_PROFILE_MASK: EGLint = 12;
+    pub const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: EGLint = 1;
+    pub fn eglGetProcAddress(_: [*:0]const u8) ?*anyopaque {
+        return null;
+    }
+    pub fn eglGetDisplay(_: ?*anyopaque) EGLDisplay {
+        return null;
+    }
+    pub fn eglInitialize(_: EGLDisplay, _: ?*EGLint, _: ?*EGLint) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglBindAPI(_: EGLint) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglChooseConfig(_: EGLDisplay, _: ?[*]const EGLint, _: ?[*]EGLConfig, _: EGLint, _: ?*EGLint) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglCreateContext(_: EGLDisplay, _: EGLConfig, _: EGLContext, _: ?[*]const EGLint) EGLContext {
+        return null;
+    }
+    pub fn eglCreateWindowSurface(_: EGLDisplay, _: EGLConfig, _: ?*anyopaque, _: ?[*]const EGLint) EGLSurface {
+        return null;
+    }
+    pub fn eglMakeCurrent(_: EGLDisplay, _: EGLSurface, _: EGLSurface, _: EGLContext) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglDestroyContext(_: EGLDisplay, _: EGLContext) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglDestroySurface(_: EGLDisplay, _: EGLSurface) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglSwapBuffers(_: EGLDisplay, _: EGLSurface) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglSwapInterval(_: EGLDisplay, _: EGLint) c_int {
+        return EGL_FALSE;
+    }
+    pub fn eglTerminate(_: EGLDisplay) c_int {
+        return EGL_FALSE;
+    }
+    pub fn glViewport(_: c_int, _: c_int, _: c_int, _: c_int) void {}
+};
+
+// wl_egl_window was from wayland-egl.h (removed — we use Vulkan now).
+// Stub the type and functions so wayland.zig compiles; these are dead code.
+const wl_egl_window = opaque {};
+inline fn wl_egl_window_create(_: *anyopaque, _: c_int, _: c_int) ?*wl_egl_window {
+    return null;
+}
+inline fn wl_egl_window_destroy(_: *wl_egl_window) void {}
+inline fn wl_egl_window_resize(_: *wl_egl_window, _: c_int, _: c_int, _: c_int, _: c_int) void {}
 
 const xkb = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
@@ -26,9 +103,9 @@ const xkb = @cImport({
 
 const time_c = @cImport(@cInclude("time.h"));
 
-const gl = @cImport({
-    @cInclude("GL/gl.h");
-});
+// GL/EGL types are no longer used (switched to Vulkan). The `gl`
+// alias points to the same stub as `egl` above.
+const gl = egl;
 
 pub const KeyEvent = struct {
     keysym: u32,
@@ -102,20 +179,6 @@ pub const Wayland = struct {
     primary_selection_device: ?*wl.zwp_primary_selection_device_v1 = null,
     text_input_manager: ?*wl.zwp_text_input_manager_v3 = null,
     text_input: ?*wl.zwp_text_input_v3 = null,
-    /// Explicit-sync manager. Null = compositor doesn't advertise the
-    /// protocol; we fall back to implicit (driver-side) fencing and the
-    /// per-frame glClientWaitSync stall.
-    drm_syncobj_manager: ?*wl.wp_linux_drm_syncobj_manager_v1 = null,
-    /// Per-surface extension object — created lazily after we have a
-    /// surface AND the manager. Lifetime tied to the surface.
-    drm_syncobj_surface: ?*wl.wp_linux_drm_syncobj_surface_v1 = null,
-    /// Per-buffer timeline proxies, indexed by buffer slot. One per
-    /// dmabuf so each buffer's release point lives on its own
-    /// monotonic counter (see the protocol's note about shared
-    /// timelines + out-of-order release signaling). Populated by
-    /// `importDrmSyncobjTimelines` once after configure. Cap of 4
-    /// covers MaxBuffers=3 with room to spare; extra slots stay null.
-    drm_syncobj_timelines: [4]?*wl.wp_linux_drm_syncobj_timeline_v1 = [_]?*wl.wp_linux_drm_syncobj_timeline_v1{null} ** 4,
     /// Client-side serial bumped on every text-input `commit` request.
     /// The server's `done` event echoes back the serial that was
     /// current when it processed our state — used by the protocol to
@@ -151,7 +214,7 @@ pub const Wayland = struct {
     egl_context: egl.EGLContext = egl.EGL_NO_CONTEXT,
     egl_surface: egl.EGLSurface = egl.EGL_NO_SURFACE,
     egl_config: egl.EGLConfig = null,
-    egl_window: ?*wl.wl_egl_window = null,
+    egl_window: ?*wl_egl_window = null,
 
     xkb_context: ?*xkb.xkb_context = null,
     xkb_keymap: ?*xkb.xkb_keymap = null,
@@ -224,9 +287,6 @@ pub const Wayland = struct {
         self.primary_selection_device = null;
         self.text_input_manager = null;
         self.text_input = null;
-        self.drm_syncobj_manager = null;
-        self.drm_syncobj_surface = null;
-        self.drm_syncobj_timelines = [_]?*wl.wp_linux_drm_syncobj_timeline_v1{null} ** 4;
         self.ti_serial = 0;
         self.ti_commit_len = 0;
         self.ti_focused = false;
@@ -379,7 +439,7 @@ pub const Wayland = struct {
     /// EGL Phase 2: window surface + make current. Must be called on the
     /// main thread after initEglContext() completes and wl_surface exists.
     pub fn initEglSurface(self: *Wayland) !void {
-        self.egl_window = wl.wl_egl_window_create(self.surface.?, @intCast(self.width), @intCast(self.height));
+        self.egl_window = wl_egl_window_create(self.surface.?, @intCast(self.width), @intCast(self.height));
         if (self.egl_window == null) return error.EglWindowFailed;
 
         self.egl_surface = egl.eglCreateWindowSurface(self.egl_display, self.egl_config, @intFromPtr(self.egl_window.?), null);
@@ -402,7 +462,7 @@ pub const Wayland = struct {
             if (self.egl_context != egl.EGL_NO_CONTEXT) _ = egl.eglDestroyContext(self.egl_display, self.egl_context);
             _ = egl.eglTerminate(self.egl_display);
         }
-        if (self.egl_window) |w| wl.wl_egl_window_destroy(w);
+        if (self.egl_window) |w| wl_egl_window_destroy(w);
 
         if (self.frame_callback) |cb| wl.wl_callback_destroy(cb);
         if (self.solid_background_buffer) |buffer| wl.wl_buffer_destroy(buffer);
@@ -418,14 +478,6 @@ pub const Wayland = struct {
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
         if (self.text_input) |ti| wl.zwp_text_input_v3_destroy(ti);
         if (self.text_input_manager) |mgr| wl.zwp_text_input_manager_v3_destroy(mgr);
-        for (&self.drm_syncobj_timelines) |*slot| {
-            if (slot.*) |t| {
-                wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
-                slot.* = null;
-            }
-        }
-        if (self.drm_syncobj_surface) |s| wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
-        if (self.drm_syncobj_manager) |mgr| wl.wp_linux_drm_syncobj_manager_v1_destroy(mgr);
         if (self.primary_selection_device) |d| wl.zwp_primary_selection_device_v1_destroy(d);
         if (self.primary_selection_manager) |mgr| wl.zwp_primary_selection_device_manager_v1_destroy(mgr);
         if (self.data_device) |d| wl.wl_data_device_destroy(d);
@@ -552,7 +604,7 @@ pub const Wayland = struct {
         self.height = h;
         // Only resize if EGL is already initialized
         if (self.egl_window) |win| {
-            wl.wl_egl_window_resize(win, @intCast(w), @intCast(h), 0, 0);
+            wl_egl_window_resize(win, @intCast(w), @intCast(h), 0, 0);
             gl.glViewport(0, 0, @intCast(w), @intCast(h));
         }
     }
@@ -627,8 +679,6 @@ pub const Wayland = struct {
             self.primary_selection_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_primary_selection_device_manager_v1_interface, 1));
         } else if (std.mem.eql(u8, iface, "zwp_text_input_manager_v3")) {
             self.text_input_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_text_input_manager_v3_interface, 1));
-        } else if (std.mem.eql(u8, iface, "wp_linux_drm_syncobj_manager_v1")) {
-            self.drm_syncobj_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_linux_drm_syncobj_manager_v1_interface, 1));
         }
     }
 
@@ -661,91 +711,6 @@ pub const Wayland = struct {
         if (self.text_input) |ti| {
             _ = wl.zwp_text_input_v3_add_listener(ti, &text_input_listener, @ptrCast(self));
         }
-    }
-
-    /// Attach the explicit-sync surface extension once we have both a
-    /// wl_surface and the manager global. Idempotent. Returns null when
-    /// either side is missing (we then fall back to implicit fencing).
-    pub fn ensureDrmSyncobjSurface(self: *Wayland) ?*wl.wp_linux_drm_syncobj_surface_v1 {
-        if (self.drm_syncobj_surface) |s| return s;
-        const mgr = self.drm_syncobj_manager orelse return null;
-        const surf = self.surface orelse return null;
-        self.drm_syncobj_surface = wl.wp_linux_drm_syncobj_manager_v1_get_surface(mgr, surf);
-        return self.drm_syncobj_surface;
-    }
-
-    /// Tear down the per-surface extension so subsequent commits don't
-    /// need acquire/release points. Required before any commit that
-    /// won't carry sync points (e.g. a CPU-rendered SHM buffer) —
-    /// otherwise the compositor raises wp_linux_drm_syncobj_surface_v1
-    /// error 4 (`no_acquire_point`) and tears down the surface.
-    /// Idempotent.
-    pub fn clearDrmSyncobjSurface(self: *Wayland) void {
-        if (self.drm_syncobj_surface) |s| {
-            wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
-            self.drm_syncobj_surface = null;
-        }
-    }
-
-    /// Import a per-buffer DRM syncobj fd as a wayland timeline proxy
-    /// at `buffer_index`. The fd is consumed (closed by us after the
-    /// import call — the compositor dups internally). No-ops when the
-    /// slot is already populated, the buffer index is out of range,
-    /// or the manager isn't available. The provided fd is closed in
-    /// every case.
-    pub fn importDrmSyncobjTimeline(self: *Wayland, buffer_index: usize, syncobj_fd: c_int) void {
-        if (buffer_index >= self.drm_syncobj_timelines.len) {
-            _ = std.c.close(syncobj_fd);
-            return;
-        }
-        if (self.drm_syncobj_timelines[buffer_index] != null) {
-            _ = std.c.close(syncobj_fd);
-            return;
-        }
-        const mgr = self.drm_syncobj_manager orelse {
-            _ = std.c.close(syncobj_fd);
-            return;
-        };
-        const timeline = wl.wp_linux_drm_syncobj_manager_v1_import_timeline(mgr, syncobj_fd);
-        _ = std.c.close(syncobj_fd);
-        self.drm_syncobj_timelines[buffer_index] = timeline;
-    }
-
-    /// True iff the buffer at `buffer_index` has an imported timeline
-    /// (i.e. is wired for explicit sync). Callers use this to decide
-    /// whether to take the explicit-sync commit path or fall through.
-    pub fn drmSyncobjTimelineAvailable(self: *const Wayland, buffer_index: usize) bool {
-        if (buffer_index >= self.drm_syncobj_timelines.len) return false;
-        return self.drm_syncobj_timelines[buffer_index] != null;
-    }
-
-    /// Set explicit-sync acquire + release points on the surface for
-    /// the next commit, using the per-buffer timeline corresponding to
-    /// `buffer_index`. Returns true when the call was made, false if
-    /// any prerequisite was missing (no surface ext, no timeline,
-    /// buffer_index out of range).
-    pub fn setDrmSyncobjPoints(
-        self: *Wayland,
-        buffer_index: usize,
-        acquire_point: u64,
-        release_point: u64,
-    ) bool {
-        const surf = self.drm_syncobj_surface orelse return false;
-        if (buffer_index >= self.drm_syncobj_timelines.len) return false;
-        const timeline = self.drm_syncobj_timelines[buffer_index] orelse return false;
-        wl.wp_linux_drm_syncobj_surface_v1_set_acquire_point(
-            surf,
-            timeline,
-            @intCast(acquire_point >> 32),
-            @intCast(acquire_point & 0xFFFF_FFFF),
-        );
-        wl.wp_linux_drm_syncobj_surface_v1_set_release_point(
-            surf,
-            timeline,
-            @intCast(release_point >> 32),
-            @intCast(release_point & 0xFFFF_FFFF),
-        );
-        return true;
     }
 
     fn registryGlobalRemove(_: ?*anyopaque, _: ?*wl.wl_registry, _: u32) callconv(.c) void {}
@@ -865,8 +830,14 @@ pub const Wayland = struct {
         // Discard any prior parsed state and mapping; we'll parse the new
         // keymap on demand via ensureKeymapParsed when a key/modifier
         // event arrives.
-        if (self.xkb_state) |s| { xkb.xkb_state_unref(s); self.xkb_state = null; }
-        if (self.xkb_keymap) |k| { xkb.xkb_keymap_unref(k); self.xkb_keymap = null; }
+        if (self.xkb_state) |s| {
+            xkb.xkb_state_unref(s);
+            self.xkb_state = null;
+        }
+        if (self.xkb_keymap) |k| {
+            xkb.xkb_keymap_unref(k);
+            self.xkb_keymap = null;
+        }
         self.unmapKeymapBuf();
 
         const c_mmap = @cImport(@cInclude("sys/mman.h"));
@@ -878,7 +849,7 @@ pub const Wayland = struct {
     fn unmapKeymapBuf(self: *Wayland) void {
         const buf = self.keymap_buf orelse return;
         const c_mmap = @cImport(@cInclude("sys/mman.h"));
-        _ = c_mmap.munmap(@constCast(@ptrCast(buf.ptr)), buf.len);
+        _ = c_mmap.munmap(@ptrCast(@constCast(buf.ptr)), buf.len);
         self.keymap_buf = null;
     }
 

@@ -120,8 +120,8 @@ pub const Manager = struct {
             self.audio_thread.?.join();
             self.audio_thread = null;
         }
-        if (self.pipe_fds[0] >= 0) std.c.close(self.pipe_fds[0]);
-        if (self.pipe_fds[1] >= 0) std.c.close(self.pipe_fds[1]);
+        if (self.pipe_fds[0] >= 0) _ = std.c.close(self.pipe_fds[0]);
+        if (self.pipe_fds[1] >= 0) _ = std.c.close(self.pipe_fds[1]);
         self.pipe_fds = .{ -1, -1 };
         if (self.pcm.len != 0) {
             self.allocator.free(self.pcm);
@@ -222,7 +222,7 @@ pub const Manager = struct {
         while (!self.stop_requested.load(.acquire)) {
             var byte: u8 = 0;
             const file = std.Io.File{ .handle = self.pipe_fds[0], .flags = .{ .nonblocking = false } };
-            const n = file.readStreaming(self.io, &.{&.{byte}}) catch {
+            const n = file.readStreaming(self.io, &.{std.mem.asBytes(&byte)}) catch {
                 if (self.stop_requested.load(.acquire)) return;
                 continue;
             };

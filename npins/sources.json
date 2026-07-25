@@ -10,9 +10,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "549f2762aebeff29a2e5ece7a7dc0f955281a1d1",
-      "url": "https://git.lix.systems/lix-project/flake-compat/archive/549f2762aebeff29a2e5ece7a7dc0f955281a1d1.tar.gz",
-      "hash": "sha256-NKw96t+BgHIYzHUjkTK95FqYRVKB8DHpVhefWSz/kTw="
+      "revision": "382052b74656a369c5408822af3f2501e9b1af81",
+      "url": "https://git.lix.systems/lix-project/flake-compat/archive/382052b74656a369c5408822af3f2501e9b1af81.tar.gz",
+      "hash": "sha256-Eg9b/rq/ECYwNwEXs5i9wHyhxNI0JrYx2srdI2uZMaQ="
     },
     "ghostty": {
       "type": "Git",
@@ -23,15 +23,16 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "dcc39dcd401975ee77a642fa15ba7bb9f6d85b96",
-      "url": "https://github.com/ghostty-org/ghostty/archive/dcc39dcd401975ee77a642fa15ba7bb9f6d85b96.tar.gz",
-      "hash": "sha256-dnk4veKoZpWQPnwTaCtpfaE4WQi0tg1JSpM4/P/Rfe0="
+      "revision": "4c725242b7dbe8c77c6e227ef1f9540c5ef17921",
+      "url": "https://github.com/ghostty-org/ghostty/archive/4c725242b7dbe8c77c6e227ef1f9540c5ef17921.tar.gz",
+      "hash": "sha256-DvPf4hVaD8iEeSfqhPCfAtD9kWkBAODqvxp9rmEBgPo="
     },
     "nixpkgs-unstable": {
       "type": "Channel",
       "name": "nixpkgs-unstable",
-      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.05pre981196.b86751bc4085/nixexprs.tar.xz",
-      "hash": "sha256-mBqzkn7oJti2hqeO8iTbDxKw+1ifxpP53feQ0CEXies="
+      "artifact": "nixexprs.tar.xz",
+      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1040318.7525d999cd85/nixexprs.tar.xz",
+      "hash": "sha256-DyIgdST66pzDA+9KRFS2K3fGgskgCQ8UiBxueFC7CTw="
     },
     "snail": {
       "type": "Git",
@@ -42,9 +43,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "b063478b1efe475d32570644d0c1462eb43fa4cb",
-      "url": "https://github.com/psyclyx/snail/archive/b063478b1efe475d32570644d0c1462eb43fa4cb.tar.gz",
-      "hash": "sha256-LruG2093PHsV0v65miJE3H6ZR6a/H99fEz6k8hwO6Hc="
+      "revision": "02e23f9e99314dfc64f041d047975d2a944cf190",
+      "url": "https://github.com/psyclyx/snail/archive/02e23f9e99314dfc64f041d047975d2a944cf190.tar.gz",
+      "hash": "sha256-ePyWLohXp134LH9bm4Bd+YiKUKCTbKzkayNhAVddi2g="
     },
     "zig-overlay": {
       "type": "Git",
@@ -55,10 +56,10 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "85afd94c8dca42d229c7e9f59bc78dea6effa2ba",
-      "url": "https://github.com/mitchellh/zig-overlay/archive/85afd94c8dca42d229c7e9f59bc78dea6effa2ba.tar.gz",
-      "hash": "sha256-GZZ/NFERMnEsbJuRlBpoGprdrVFyDCaHjKlkgWPukTY="
+      "revision": "5663c09de974e5a62f30e46dd6930d22ebdffa2e",
+      "url": "https://github.com/mitchellh/zig-overlay/archive/5663c09de974e5a62f30e46dd6930d22ebdffa2e.tar.gz",
+      "hash": "sha256-sREhP9o/FnQ+QdzKFcOxsADtCQpzMhTYV36CPxNRoNQ="
     }
   },
-  "version": 7
+  "version": 8
 }

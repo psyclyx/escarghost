@@ -183,16 +183,16 @@ pub const Manager = struct {
         switch (kind) {
             .clipboard => {
                 const offer = self.clipboard_offer orelse {
-                    std.c.close(read_fd);
-                    std.c.close(write_fd);
+                    _ = std.c.close(read_fd);
+                    _ = std.c.close(write_fd);
                     return null;
                 };
                 wl.wl_data_offer_receive(offer, mime.ptr, write_fd);
             },
             .primary => {
                 const offer = self.primary_offer orelse {
-                    std.c.close(read_fd);
-                    std.c.close(write_fd);
+                    _ = std.c.close(read_fd);
+                    _ = std.c.close(write_fd);
                     return null;
                 };
                 wl.zwp_primary_selection_offer_v1_receive(offer, mime.ptr, write_fd);
@@ -202,7 +202,7 @@ pub const Manager = struct {
         // Close our copy of the write side — the source app already
         // received a duplicate via the Wayland socket. Once it
         // closes its end too, read_fd hits EOF.
-        std.c.close(write_fd);
+        _ = std.c.close(write_fd);
         _ = wl.wl_display_flush(self.display);
 
         var out: std.ArrayList(u8) = .empty;
@@ -227,7 +227,7 @@ pub const Manager = struct {
             // everything in a single burst.
             deadline_remaining = 20;
         }
-        std.c.close(read_fd);
+        _ = std.c.close(read_fd);
 
         if (out.items.len == 0) return null;
         return try out.toOwnedSlice(allocator);
@@ -375,7 +375,7 @@ pub const Manager = struct {
 /// other Wayland clients do — clients ignore EPIPE here because the
 /// destination may have closed early.
 fn writeAllAndClose(fd: c_int, io: std.Io, data: ?[]const u8) void {
-    defer std.c.close(fd);
+    defer _ = std.c.close(fd);
     const bytes = data orelse return;
     const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
     file.writeStreamingAll(io, bytes) catch {};

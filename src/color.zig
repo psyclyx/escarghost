@@ -26,7 +26,10 @@ pub const Rgb = struct {
         };
     }
 
-    /// Convert to float4 in LINEAR space (for GPU rendering with GL_FRAMEBUFFER_SRGB).
+    /// Convert to float4 in LINEAR light — the space snail's shape/emit/raster
+    /// pipeline expects for all colors. Blending happens in linear; the render
+    /// target (sRGB attachment on GPU, snail-raster `.srgb` encode on CPU) does
+    /// the sRGB store.
     pub fn toLinearFloat4(self: Rgb, alpha: f32) [4]f32 {
         return .{
             srgbToLinearF(@as(f32, @floatFromInt(self.r)) / 255.0),
@@ -36,11 +39,23 @@ pub const Rgb = struct {
         };
     }
 
-    fn srgbToLinearF(v: f32) f32 {
+    pub fn srgbToLinearF(v: f32) f32 {
         if (v <= 0.04045) return v / 12.92;
         return std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
     }
 };
+
+/// Linear light → sRGB code, single channel. Inverse of `Rgb.srgbToLinearF`.
+pub fn linearToSrgbF(v: f32) f32 {
+    if (v <= 0.0031308) return v * 12.92;
+    return 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+}
+
+/// Convert a linear-light straight-alpha color to sRGB straight-alpha (alpha
+/// unchanged). Used by the CPU rect fills to encode for the SHM byte buffer.
+pub fn linearToSrgbColor(c: [4]f32) [4]f32 {
+    return .{ linearToSrgbF(c[0]), linearToSrgbF(c[1]), linearToSrgbF(c[2]), c[3] };
+}
 
 pub const Lab = struct {
     l: f64,

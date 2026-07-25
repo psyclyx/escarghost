@@ -171,6 +171,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             s.metrics.cell_width,
             s.metrics.cell_height,
             s.metrics.baseline_offset,
+            s.metrics.descent,
             s.render.render_serial,
             s.input.selection.toSnapshot(),
             currentScrollbarOverlay(s),

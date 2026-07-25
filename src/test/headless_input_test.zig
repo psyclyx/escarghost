@@ -39,8 +39,8 @@ fn openPair() !PtyPair {
 }
 
 fn closePair(p: PtyPair) void {
-    std.c.close(p.master);
-    std.c.close(p.slave);
+    _ = std.c.close(p.master);
+    _ = std.c.close(p.slave);
 }
 
 fn writeAll(io: std.Io, fd: c_int, data: []const u8) !void {

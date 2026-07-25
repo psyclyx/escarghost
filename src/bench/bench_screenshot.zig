@@ -63,7 +63,7 @@ pub fn captureOne(io: std.Io, harness: *h.Harness, spec: spec_mod.TerminalSpec, 
 }
 
 fn writePpm(io: std.Io, path: [:0]const u8, frame: []const u8, width: u32, height: u32, stride: u32, fmt: h.PixelFmt) !void {
-    const file = std.Io.Dir.cwd.createFile(io, path, .{ .read = false, .truncate = true }) catch return error.OpenFailed;
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .read = false, .truncate = true }) catch return error.OpenFailed;
     defer file.close(io);
 
     var buf: [4096]u8 = undefined;

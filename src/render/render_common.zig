@@ -56,14 +56,16 @@ pub fn captureCursorCell(default_bg: Rgb, codepoint: u32, glyph_id: u16, has_tex
 /// renderer is active. Picks a fixed neutral blue (#4f8cff) on dark
 /// backgrounds and a darker version on light backgrounds so the
 /// highlight stays visible without obscuring the underlying glyph.
+/// Returned in LINEAR light (straight alpha), like every color the render
+/// pipeline consumes.
 pub fn selectionFillColor(default_bg: Rgb) [4]f32 {
     const luminance = (@as(u32, default_bg.r) * 30 + @as(u32, default_bg.g) * 59 + @as(u32, default_bg.b) * 11) / 100;
     if (luminance < 128) {
-        // Dark bg → light cool-blue tint.
-        return .{ 79.0 / 255.0, 140.0 / 255.0, 255.0 / 255.0, 0.45 };
+        // Dark bg → light cool-blue tint (#4f8cff).
+        return (Rgb{ .r = 79, .g = 140, .b = 255 }).toLinearFloat4(0.45);
     } else {
-        // Light bg → deeper blue so glyphs remain legible.
-        return .{ 31.0 / 255.0, 87.0 / 255.0, 184.0 / 255.0, 0.40 };
+        // Light bg → deeper blue so glyphs remain legible (#1f57b8).
+        return (Rgb{ .r = 31, .g = 87, .b = 184 }).toLinearFloat4(0.40);
     }
 }
 
@@ -99,14 +101,40 @@ pub fn scrollbarGeometry(viewport_w: f32, viewport_h: f32, thumb_offset: f32, th
     };
 }
 
-/// Scrollbar gutter and thumb fill colors. Gutter is the default fg
-/// at low alpha; thumb is fg at higher alpha. Both scale by the
+/// Scrollbar gutter and thumb fill colors (LINEAR light). Gutter is the
+/// default fg at low alpha; thumb is fg at higher alpha. Both scale by the
 /// snapshot's overlay alpha for fade-in / fade-out.
 pub fn scrollbarColors(default_fg: Rgb, alpha: f32) struct { gutter: [4]f32, thumb: [4]f32 } {
     const a = @max(0.0, @min(1.0, alpha));
-    const fg = default_fg.toFloat4(1.0);
+    const fg = default_fg.toLinearFloat4(1.0);
     return .{
         .gutter = .{ fg[0], fg[1], fg[2], 0.08 * a },
         .thumb = .{ fg[0], fg[1], fg[2], 0.55 * a },
+    };
+}
+
+/// Vertical extent (pixel-space y + height) of a bar/beam cursor within its
+/// cell. A full-cell bar looks too tall — glyphs only occupy the font's
+/// ascent-to-descent box, not the line leading. Anchor the bar to that box:
+/// top just below the ascent line (a small margin), bottom at the baseline
+/// plus the font `descent`.
+pub fn barCursorExtent(cell_top: f32, cell_height: f32, baseline_offset: f32, descent: f32) struct { y: f32, h: f32 } {
+    const top_margin = @round(cell_height * 0.07);
+    return .{
+        .y = cell_top + top_margin,
+        .h = @max(1.0, baseline_offset - top_margin + descent),
+    };
+}
+
+/// A thin underline cursor whose bottom sits exactly on the font's descent
+/// line (`baseline + descent`) — the bottom of the glyph text box — rather
+/// than the raw cell bottom, which floats below the glyphs in the line
+/// leading. Thickness scales with the cell.
+pub fn underlineCursorExtent(cell_top: f32, cell_height: f32, baseline_offset: f32, descent: f32) struct { y: f32, h: f32 } {
+    const thickness = @max(1.0, @round(cell_height / 12.0));
+    const box_bottom = cell_top + baseline_offset + descent;
+    return .{
+        .y = box_bottom - thickness,
+        .h = thickness,
     };
 }

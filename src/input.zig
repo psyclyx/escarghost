@@ -160,7 +160,7 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
         // triggers a wasted render of pre-keystroke state, costing one
         // vsync — measured as ~17ms of extra input latency.
         state.refs.term.scrollToBottom();
-        state.refs.pty.write(state.io, text) catch {};
+        state.refs.pty.write(text) catch {};
         return;
     }
 
@@ -174,7 +174,7 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
             null,
         );
         if (encoded) |data| {
-            state.refs.pty.write(state.io, data) catch {};
+            state.refs.pty.write(data) catch {};
         }
     }
 }
@@ -484,7 +484,7 @@ pub fn onFocus(focused: bool) void {
 pub fn onTextCommit(text: []const u8) void {
     if (text.len == 0) return;
     state.refs.term.scrollToBottom();
-    state.refs.pty.write(state.io, text) catch {};
+    state.refs.pty.write(text) catch {};
 }
 
 fn nowMs() i64 {
@@ -533,7 +533,7 @@ fn zoomReset() void {
 fn applyZoom() void {
     var atlas_lease = state.refs.atlas_ref.acquire();
     defer atlas_lease.release();
-    const cm = gpu_pipeline.computeCellMetrics(atlas_lease.get(), state.metrics.font_size) catch return;
+    const cm = gpu_pipeline.computeCellMetrics(state.refs.atlas_ref.faces.?, state.metrics.font_size) catch return;
     state.metrics.font_size = cm.em;
     state.metrics.cell_width = cm.cell_width;
     state.metrics.cell_height = cm.cell_height;
@@ -591,7 +591,7 @@ fn writePasteToPty(text: []const u8) void {
     const allocator = std.heap.smp_allocator;
     const encoded = state.refs.term.encodePaste(allocator, text) catch return orelse return;
     defer allocator.free(encoded);
-    state.refs.pty.write(state.io, encoded) catch {};
+    state.refs.pty.write(encoded) catch {};
     state.refs.term.scrollToBottom();
     render_loop.markRenderDirty(state);
 }
@@ -756,7 +756,7 @@ fn debugCycleHintMode() void {
     // reconfigure path so the worker picks up new metrics + redraws.
     var atlas_lease = state.refs.atlas_ref.acquire();
     defer atlas_lease.release();
-    const cm = gpu_pipeline.computeCellMetrics(atlas_lease.get(), state.metrics.font_size) catch return;
+    const cm = gpu_pipeline.computeCellMetrics(state.refs.atlas_ref.faces.?, state.metrics.font_size) catch return;
     state.metrics.font_size = cm.em;
     state.metrics.cell_width = cm.cell_width;
     state.metrics.cell_height = cm.cell_height;

@@ -109,7 +109,7 @@ fn bumpMax(slot: *std.atomic.Value(u64), v: u64) void {
 }
 
 fn readWhole(io: std.Io, path: [:0]const u8, buf: []u8) ?[]const u8 {
-    const file = std.Io.Dir.cwd.openFile(io, path, .{}) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
     var total: usize = 0;
     while (total < buf.len) {
