@@ -85,9 +85,14 @@ pub fn computeCellMetrics(faces: *const snail.Faces, font_size: f32) !CellMetric
 }
 
 pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h: u32) struct { cols: u16, rows: u16 } {
+    // Clamp to the renderer's snapshot capacity. The terminal is sized to what
+    // we can actually render, so columns/rows past the cap are never created
+    // (and so never silently dropped) — the window just pads on the far edge.
+    const cols_f = @max(1.0, @floor(@as(f32, @floatFromInt(pixel_w)) / cell_width));
+    const rows_f = @max(1.0, @floor(@as(f32, @floatFromInt(pixel_h)) / cell_height));
     return .{
-        .cols = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_w)) / cell_width))),
-        .rows = @intFromFloat(@max(1.0, @floor(@as(f32, @floatFromInt(pixel_h)) / cell_height))),
+        .cols = @intFromFloat(@min(cols_f, @as(f32, @floatFromInt(render_snapshot.MaxCols)))),
+        .rows = @intFromFloat(@min(rows_f, @as(f32, @floatFromInt(render_snapshot.MaxRows)))),
     };
 }
 
@@ -120,7 +125,7 @@ pub const GpuPipeline = struct {
     descent: f32 = 0,
 
     // Scratch buffers for row_build
-    scratch_rects: [row_build.MAX_RECTS_PER_ROW * render_snapshot.MaxRows]row_build.ColoredRect = undefined,
+    scratch_rects: [row_build.MAX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
     rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
     selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
     eph: row_build.EphemeralBlobs,

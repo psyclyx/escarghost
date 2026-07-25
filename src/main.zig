@@ -199,7 +199,11 @@ pub fn main(init: std.process.Init) !void {
         log.info(.gpu, "disabled", .{ .reason = "SCRGO_RENDERER=cpu" });
     }
 
-    var gpu: gpu_worker.GpuWorker = .{};
+    // Heap-allocated: the workers embed the per-slot snapshot cell buffers
+    // (MaxCols*MaxRows cells each), which are far too large for main's stack.
+    const gpu = try allocator.create(gpu_worker.GpuWorker);
+    defer allocator.destroy(gpu);
+    gpu.* = .{};
     state.render.gpu_restart = app_state.GpuRestartBackoff.init(
         cfg.gpu_restart_initial_delay_ms,
         cfg.gpu_restart_max_delay_ms,
@@ -209,7 +213,9 @@ pub fn main(init: std.process.Init) !void {
     // Spawn the CPU worker thread BEFORE anything pulls in NVIDIA EGL —
     // NVIDIA hooks pthread_create on load and every subsequent spawn costs
     // ~6 ms. The thread parks in cond_wait until start() assigns it work.
-    var cpu: cpu_renderer_worker.Frontend = .{};
+    const cpu = try allocator.create(cpu_renderer_worker.Frontend);
+    defer allocator.destroy(cpu);
+    cpu.* = .{};
     defer cpu.stop();
     cpu.spawnThread(io) catch |e| {
         log.err(.cpu, "thread spawn failed", .{ .err = e });
@@ -381,8 +387,8 @@ pub fn main(init: std.process.Init) !void {
     state.render.render_serial = 0;
 
     // ── Phase 5: early PTY drain + event loop ──
-    state.refs.gpu = &gpu;
-    state.refs.cpu = &cpu;
+    state.refs.gpu = gpu;
+    state.refs.cpu = cpu;
     state.refs.atlas_thread = &atlas_thread;
     state.render.active_render_path = .cpu;
 

@@ -142,7 +142,7 @@ pub const CpuPipeline = struct {
     descent: f32 = 0,
 
     // Scratch buffers for row_build
-    scratch_rects: [row_build.MAX_RECTS_PER_ROW * render_snapshot.MaxRows]row_build.ColoredRect = undefined,
+    scratch_rects: [row_build.MAX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
     rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
     selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
     eph: row_build.EphemeralBlobs,

@@ -6,8 +6,13 @@ const color = @import("color");
 const selection_mod = @import("../selection.zig");
 const Rgb = color.Rgb;
 
-pub const MaxCols: u16 = 400;
-pub const MaxRows: u16 = 200;
+// Upper bounds on the rendered grid. The terminal grid is clamped to these
+// (see computeGridSize), so a very wide / zoomed-out window pads on the right
+// rather than silently dropping columns past the limit. The snapshot cell
+// buffer is MaxCols*MaxRows cells (~5 MB each); the render workers that hold
+// them are heap-allocated so this doesn't blow main's stack.
+pub const MaxCols: u16 = 1024;
+pub const MaxRows: u16 = 320;
 pub const MaxCells: usize = @as(usize, MaxCols) * MaxRows;
 
 pub const CursorStyle = enum(u8) {

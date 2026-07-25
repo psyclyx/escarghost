@@ -70,9 +70,9 @@ pub const BuildResult = struct {
 /// Accumulates an entire row's renderable text in one HB-shapeable
 /// buffer along with per-cell source ranges for snail 0.13's Cell API.
 const RowAccumulator = struct {
-    text: [2048]u8 = undefined,
+    text: [render_snapshot.MaxCols * 4]u8 = undefined,
     text_len: usize = 0,
-    byte_to_col: [2048]u16 = undefined,
+    byte_to_col: [render_snapshot.MaxCols * 4]u16 = undefined,
     col_fg: [render_snapshot.MaxCols]Rgb = undefined,
     /// snail.Cell entries — source ranges + column numbers + colors.
     cells: [render_snapshot.MaxCols]snail.Cell = undefined,
