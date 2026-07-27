@@ -298,6 +298,14 @@ pub const GpuPipeline = struct {
         }
 
         // ── Layer 3: text glyphs ──
+        // A row whose shapes reference a glyph the atlas hasn't baked yet
+        // fails wholesale with MissingRecord (emit is all-or-nothing per
+        // call). That's transient — the extend loop keeps baking and the
+        // row fills in within a frame or two — but a pathological all-unique
+        // stream outruns the atlas every frame, so summarize instead of
+        // logging per row (which flooded the log).
+        var emit_fail_rows: u32 = 0;
+        var last_emit_err: ?anyerror = null;
         for (built.rows) |row| {
             if (row.shapes.len == 0) continue;
             const xform = snail.Transform2D.translate(0, row.row_y);
@@ -312,9 +320,17 @@ pub const GpuPipeline = struct {
                 xform,
                 white_tint,
             ) catch |err| {
-                log.warn(.gpu, "emit failed for row", .{ .err = err });
+                emit_fail_rows += 1;
+                last_emit_err = err;
                 continue;
             };
+        }
+        if (emit_fail_rows > 0) {
+            log.warn(.gpu, "rows skipped (glyphs not yet baked)", .{
+                .rows = emit_fail_rows,
+                .total_rows = built.rows.len,
+                .err = last_emit_err,
+            });
         }
 
         // ── Layer 4: cursor ──
