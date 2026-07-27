@@ -254,6 +254,19 @@ pub const Diagnostics = struct {
                 .buf_starvation_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_worker.bufferStarvationAccumNs)) / ms_f}),
                 .buf_starvation_count = gpu_worker.bufferStarvationCount,
             });
+            // Per-frame worker phase split (avg ms/frame). render = the
+            // submitAndWait draw; upload = atlas transfer (also submitAndWait).
+            if (gpu_worker.phaseFrameCount > 0) {
+                const fc: f64 = @floatFromInt(gpu_worker.phaseFrameCount);
+                log.info(.diag, "gpu frame phases", .{
+                    .frames = gpu_worker.phaseFrameCount,
+                    .build_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseBuildNs)) / ms_f / fc}),
+                    .prep_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phasePrepNs)) / ms_f / fc}),
+                    .upload_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseUploadNs)) / ms_f / fc}),
+                    .emit_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseEmitNs)) / ms_f / fc}),
+                    .render_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseRenderNs)) / ms_f / fc}),
+                });
+            }
             log.info(.diag, "memory", .{
                 .peak_rss_mib = self.peak_vmrss_kib / 1024,
                 .peak_anon_mib = self.peak_rss_anon_kib / 1024,

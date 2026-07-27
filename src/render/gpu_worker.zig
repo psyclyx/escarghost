@@ -51,6 +51,16 @@ fn monotonicNs() u64 {
 pub var snapshotPhaseAccumNs: u64 = 0;
 pub var snapshotPhaseCount: u64 = 0;
 pub var captureCellsAccumNs: u64 = 0;
+
+// Per-frame render phase timers (worker thread). Split the ~85ms flood
+// frame into shape / prep / upload / emit / render(submitAndWait) so we
+// can see what the async-pipelining rework must actually attack.
+pub var phaseBuildNs: u64 = 0;
+pub var phasePrepNs: u64 = 0;
+pub var phaseUploadNs: u64 = 0;
+pub var phaseEmitNs: u64 = 0;
+pub var phaseRenderNs: u64 = 0;
+pub var phaseFrameCount: u64 = 0;
 pub var workerWaitAccumNs: u64 = 0;
 pub var workerWaitCount: u64 = 0;
 pub var bufferStarvationAccumNs: u64 = 0;
@@ -551,11 +561,13 @@ pub const GpuWorker = struct {
                     defer if (extra_lease) |*l| l.release();
 
                     var render_ok = true;
+                    var phase_t = perf.Timer.now();
                     const had_misses = pipeline.?.buildShapes(cur_atlas, faces, &self.snapshots[snapshot_slot]) catch |e| blk: {
                         log.err(.gpu, "build failed", .{ .err = e });
                         render_ok = false;
                         break :blk false;
                     };
+                    phaseBuildNs += phase_t.elapsedNs();
                     // Prep at most one bounded batch of newly-seen glyphs, then
                     // present against the (possibly extended) atlas. We do NOT
                     // loop-until-prepped or re-shape: a full screen of novel
@@ -564,6 +576,7 @@ pub const GpuWorker = struct {
                     // frames as the atlas catches up. `faces` is re-read at the
                     // top of the next frame, so an auto-fallback face added by
                     // extend takes effect one frame later. See glyph_misses.MaxBytes.
+                    phase_t = perf.Timer.now();
                     if (render_ok and had_misses) {
                         const result = atlas_ref.extend(cur_atlas, pipeline.?.misses.text()) catch null;
                         if (result != null and result.? == .extended) {
@@ -572,8 +585,10 @@ pub const GpuWorker = struct {
                             cur_atlas = extra_lease.?.get();
                         }
                     }
+                    phasePrepNs += phase_t.elapsedNs();
 
                     // Upload the completed atlas (cached by generation), emit.
+                    phase_t = perf.Timer.now();
                     if (render_ok) {
                         const cur_gen = atlas_ref.loadGeneration();
                         if (atlas_binding == null or cur_gen != cached_atlas_gen) {
@@ -586,12 +601,15 @@ pub const GpuWorker = struct {
                             if (render_ok) cached_atlas_gen = cur_gen;
                         }
                     }
+                    phaseUploadNs += phase_t.elapsedNs();
+                    phase_t = perf.Timer.now();
                     if (render_ok) {
                         pipeline.?.emitBuilt(cur_atlas, atlas_binding.?, &self.snapshots[snapshot_slot]) catch |e| {
                             log.err(.gpu, "emit failed", .{ .err = e });
                             render_ok = false;
                         };
                     }
+                    phaseEmitNs += phase_t.elapsedNs();
                     if (!render_ok) {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
@@ -601,6 +619,7 @@ pub const GpuWorker = struct {
                     // light; the hardware encodes it to sRGB on store.
                     const clear_color = self.snapshots[snapshot_slot].header.default_bg.toLinearFloat4(1.0);
 
+                    phase_t = perf.Timer.now();
                     vk.renderToTarget(
                         &renderer.?,
                         &ctx,
@@ -615,6 +634,8 @@ pub const GpuWorker = struct {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
                     };
+                    phaseRenderNs += phase_t.elapsedNs();
+                    phaseFrameCount += 1;
                     frame_slot +%= 1;
 
                     writeResponse(self.response_fds[1], self.io, .{
