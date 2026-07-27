@@ -210,18 +210,25 @@ pub const GpuPipeline = struct {
             .baseline_offset = self.baseline_offset,
         };
 
-        self.built = try row_build.buildSnapshot(
-            snapshot,
-            self.allocator,
-            metrics,
-            atlas,
-            faces,
-            &self.scratch_rects,
-            &self.rows_out,
-            &self.selection_spans,
-            &self.eph,
-            &self.misses,
-        );
+        // Serialize shaping: the CPU and GPU workers share one HarfBuzz
+        // buffer via `Faces`, so concurrent shapes corrupt it. Scoped to
+        // just the shape — the caller's extend()/emit run outside it.
+        self.built = blk: {
+            self.atlas_ref.lockShaping();
+            defer self.atlas_ref.unlockShaping();
+            break :blk try row_build.buildSnapshot(
+                snapshot,
+                self.allocator,
+                metrics,
+                atlas,
+                faces,
+                &self.scratch_rects,
+                &self.rows_out,
+                &self.selection_spans,
+                &self.eph,
+                &self.misses,
+            );
+        };
         return !self.misses.isEmpty();
     }
 

@@ -111,6 +111,21 @@ pub const AtlasRef = struct {
         return self.generation.load(.acquire);
     }
 
+    /// Acquire/release the shape lock around a render-path shape. Every
+    /// caller of `snail.shape` (via `row_build.buildSnapshot`) must hold
+    /// this for the duration of the shape, exactly like `extend` does:
+    /// snail's `Faces` keeps one shared `hb_buffer_t`, so the CPU and GPU
+    /// render workers shaping concurrently (e.g. during the CPU→GPU path
+    /// handoff) would corrupt it and crash. Blocking (not spin): a shape
+    /// can take milliseconds and spinning would burn a core.
+    pub fn lockShaping(self: *AtlasRef) void {
+        _ = c.pthread_mutex_lock(&self.shape_lock);
+    }
+
+    pub fn unlockShaping(self: *AtlasRef) void {
+        _ = c.pthread_mutex_unlock(&self.shape_lock);
+    }
+
     pub const ExtendResult = enum {
         extended,
         missing,

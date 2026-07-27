@@ -252,29 +252,14 @@ pub const CpuPipeline = struct {
         var extra_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
         defer if (extra_lease) |*l| l.release();
 
-        var built = try row_build.buildSnapshot(
-            snapshot,
-            self.allocator,
-            metrics,
-            cur_atlas,
-            faces,
-            &self.scratch_rects,
-            &self.rows_out,
-            &self.selection_spans,
-            &self.eph,
-            &self.misses,
-        );
-
-        var extend_attempts: u32 = 0;
-        while (!self.misses.isEmpty() and extend_attempts < 4) : (extend_attempts += 1) {
-            const result = self.atlas_ref.extend(cur_atlas, faces, self.misses.text()) catch break;
-            if (result == .missing) break;
-            if (extra_lease) |*l| l.release();
-            extra_lease = self.atlas_ref.acquire();
-            cur_atlas = extra_lease.?.get();
-            self.eph.releaseAll();
-            self.misses.clear();
-            built = try row_build.buildSnapshot(
+        // Serialize shaping: the CPU and GPU workers share one HarfBuzz
+        // buffer via `Faces`, so concurrent shapes corrupt it. Scoped to
+        // just the shape — rasterization below and extend() (which locks
+        // internally) run outside it.
+        var built = blk: {
+            self.atlas_ref.lockShaping();
+            defer self.atlas_ref.unlockShaping();
+            break :blk try row_build.buildSnapshot(
                 snapshot,
                 self.allocator,
                 metrics,
@@ -286,6 +271,33 @@ pub const CpuPipeline = struct {
                 &self.eph,
                 &self.misses,
             );
+        };
+
+        var extend_attempts: u32 = 0;
+        while (!self.misses.isEmpty() and extend_attempts < 4) : (extend_attempts += 1) {
+            const result = self.atlas_ref.extend(cur_atlas, faces, self.misses.text()) catch break;
+            if (result == .missing) break;
+            if (extra_lease) |*l| l.release();
+            extra_lease = self.atlas_ref.acquire();
+            cur_atlas = extra_lease.?.get();
+            self.eph.releaseAll();
+            self.misses.clear();
+            built = blk: {
+                self.atlas_ref.lockShaping();
+                defer self.atlas_ref.unlockShaping();
+                break :blk try row_build.buildSnapshot(
+                    snapshot,
+                    self.allocator,
+                    metrics,
+                    cur_atlas,
+                    faces,
+                    &self.scratch_rects,
+                    &self.rows_out,
+                    &self.selection_spans,
+                    &self.eph,
+                    &self.misses,
+                );
+            };
         }
 
         // ── 3. Background spans + decoration rects (linear, row-local +row_y) ──
