@@ -298,7 +298,14 @@ pub const AtlasRef = struct {
         defer lease.release();
         var next = lease.get().extend(self.allocator, &.{}) catch return;
         snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch |err| {
-            if (err == error.OutOfLayers) prepFullCount += 1 else prepErrCount += 1;
+            if (err == error.OutOfLayers) {
+                // Pool exhausted: new glyphs can't be prepped and render as
+                // gaps. Warn once — sustained hits on a *real* workload (not
+                // the synthetic flood) are the signal that LRU eviction is
+                // worth building. See [[render_perf]].
+                if (prepFullCount == 0) log.warn(.atlas, "atlas full — new glyphs dropped (raise max_layers or add eviction)", .{});
+                prepFullCount += 1;
+            } else prepErrCount += 1;
             next.deinit();
             return;
         };
