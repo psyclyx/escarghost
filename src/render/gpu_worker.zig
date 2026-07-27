@@ -24,6 +24,7 @@ const row_build = @import("row_build.zig");
 const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 const vk = @import("vk/root.zig");
+const memtrack = @import("vk/memtrack.zig");
 
 const c = @cImport({
     // glibc's _FORTIFY_SOURCE inline wrappers (bits/fcntl2.h's variadic
@@ -628,6 +629,10 @@ pub const GpuWorker = struct {
                         log.info(.diag, "rss sample", .{
                             .frame = diag_frame_counter,
                             .rss_kib = readRssKb(self.io),
+                            .staging_out = memtrack.staging.outstanding(),
+                            .staging_mib = memtrack.staging.liveMib(),
+                            .host_buf_mib = memtrack.host_buffer.liveMib(),
+                            .cmd_out = memtrack.cmd_bufs.outstanding(),
                         });
                     }
                 },

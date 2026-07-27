@@ -3,6 +3,7 @@ const wayland_mod = @import("wayland.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const cpu_pipeline = @import("render/cpu_pipeline.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
+const memtrack = @import("render/vk/memtrack.zig");
 const row_build_mod = @import("render/row_build.zig");
 const snail = @import("snail");
 const log = @import("log.zig");
@@ -258,6 +259,20 @@ pub const Diagnostics = struct {
                 .peak_anon_mib = self.peak_rss_anon_kib / 1024,
                 .final_rss_mib = readProcStatus(io, "VmRSS:") / 1024,
                 .final_anon_mib = readProcStatus(io, "RssAnon:") / 1024,
+            });
+            // VkDeviceMemory / command-buffer leak counters. A category whose
+            // `_out` (outstanding = allocs − frees) or `_mib` climbs without
+            // bound is the leak. staging + host_buffer are the host-visible
+            // (RSS-counted) ones; atlas_image is device-local (VRAM, not RSS).
+            log.info(.diag, "vkmem", .{
+                .staging_out = memtrack.staging.outstanding(),
+                .staging_mib = memtrack.staging.liveMib(),
+                .host_buf_out = memtrack.host_buffer.outstanding(),
+                .host_buf_mib = memtrack.host_buffer.liveMib(),
+                .atlas_img_out = memtrack.atlas_image.outstanding(),
+                .atlas_img_mib = memtrack.atlas_image.liveMib(),
+                .cmd_out = memtrack.cmd_bufs.outstanding(),
+                .dmabuf_out = memtrack.dmabuf_mem.outstanding(),
             });
             if (cpu_pipeline.phase_frame_count > 0) {
                 log.info(.diag, "gpu pipeline", .{

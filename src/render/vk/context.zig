@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const log = @import("../../log.zig");
+const memtrack = @import("memtrack.zig");
 
 const vk = @import("vulkan.zig").vk;
 
@@ -225,11 +226,13 @@ pub const Context = struct {
         if (vk.vkAllocateCommandBuffers(self.device, &alloc_info, &cmd) != vk.VK_SUCCESS) {
             return error.CommandBufferAllocationFailed;
         }
+        memtrack.cmd_bufs.onAlloc(0);
         return cmd;
     }
 
     pub fn freeCommandBuffer(self: *const Context, cmd: vk.VkCommandBuffer) void {
         vk.vkFreeCommandBuffers(self.device, self.command_pool, 1, &cmd);
+        memtrack.cmd_bufs.onFree(0);
     }
 
     /// Submit a command buffer and wait for it to complete.

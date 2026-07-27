@@ -11,6 +11,7 @@ const std = @import("std");
 const gpu_buffer = @import("../gpu_buffer.zig");
 const log = @import("../../log.zig");
 const Context = @import("context.zig").Context;
+const memtrack = @import("memtrack.zig");
 
 const vk = @import("vulkan.zig").vk;
 
@@ -223,6 +224,7 @@ pub const DmabufTarget = struct {
             return error.MemoryAllocationFailed;
         }
         errdefer vk.vkFreeMemory(ctx.device, memory, null);
+        memtrack.dmabuf_mem.onAlloc(0); // count-only: resize-bounded, not a per-frame suspect
 
         if (vk.vkBindImageMemory(ctx.device, image, memory, 0) != vk.VK_SUCCESS) {
             return error.BindImageFailed;
@@ -346,6 +348,7 @@ pub const DmabufTarget = struct {
         vk.vkDestroyImageView(ctx.device, self.view, null);
         vk.vkDestroyImage(ctx.device, self.image, null);
         vk.vkFreeMemory(ctx.device, self.memory, null);
+        memtrack.dmabuf_mem.onFree(0);
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
     }

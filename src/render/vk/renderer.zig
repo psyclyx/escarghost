@@ -11,6 +11,7 @@ const shaders = @import("snail-shaders");
 const log = @import("../../log.zig");
 const Context = @import("context.zig").Context;
 const DmabufTarget = @import("dmabuf.zig").DmabufTarget;
+const memtrack = @import("memtrack.zig");
 
 const vk = @import("vulkan.zig").vk;
 
@@ -161,6 +162,7 @@ const HostBuffer = struct {
         if (vk.vkMapMemory(ctx.device, memory, 0, size, 0, @ptrCast(&mapped_ptr)) != vk.VK_SUCCESS) return error.MapFailed;
         errdefer vk.vkUnmapMemory(ctx.device, memory);
 
+        memtrack.host_buffer.onAlloc(size);
         return .{
             .buffer = buffer,
             .memory = memory,
@@ -177,6 +179,7 @@ const HostBuffer = struct {
         vk.vkUnmapMemory(device, self.memory);
         vk.vkDestroyBuffer(device, self.buffer, null);
         vk.vkFreeMemory(device, self.memory, null);
+        memtrack.host_buffer.onFree(self.size);
     }
 };
 

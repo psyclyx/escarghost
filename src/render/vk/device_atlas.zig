@@ -9,6 +9,7 @@ const std = @import("std");
 const snail = @import("snail");
 const log = @import("../../log.zig");
 const Context = @import("context.zig").Context;
+const memtrack = @import("memtrack.zig");
 
 const vk = @import("vulkan.zig").vk;
 
@@ -442,6 +443,7 @@ const StagingBuffer = struct {
     buffer: vk.VkBuffer,
     memory: vk.VkDeviceMemory,
     mapped: [*]u8,
+    alloc_bytes: usize,
 
     fn create(ctx: *const Context, size: usize) !StagingBuffer {
         const buffer_info = vk.VkBufferCreateInfo{
@@ -483,13 +485,15 @@ const StagingBuffer = struct {
         var mapped: ?*anyopaque = null;
         if (vk.vkMapMemory(ctx.device, memory, 0, @intCast(size), 0, &mapped) != vk.VK_SUCCESS) return error.MapFailed;
 
-        return .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?) };
+        memtrack.staging.onAlloc(mem_reqs.size);
+        return .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?), .alloc_bytes = mem_reqs.size };
     }
 
     fn destroy(self: *StagingBuffer, device: vk.VkDevice) void {
         vk.vkUnmapMemory(device, self.memory);
         vk.vkDestroyBuffer(device, self.buffer, null);
         vk.vkFreeMemory(device, self.memory, null);
+        memtrack.staging.onFree(self.alloc_bytes);
     }
 };
 
@@ -546,6 +550,7 @@ fn createImage(ctx: *const Context, format: vk.VkFormat, width: u32, height: u32
     };
     if (vk.vkAllocateMemory(ctx.device, &alloc_info, null, out_memory) != vk.VK_SUCCESS) return error.MemoryAllocationFailed;
     errdefer vk.vkFreeMemory(ctx.device, out_memory.*, null);
+    memtrack.atlas_image.onAlloc(mem_reqs.size);
 
     if (vk.vkBindImageMemory(ctx.device, image, out_memory.*, 0) != vk.VK_SUCCESS) return error.BindImageFailed;
     return image;
