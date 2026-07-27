@@ -182,9 +182,16 @@ pub const AtlasWorker = struct {
         faces.* = try snail.Faces.build(alloc, face_entries.items);
         errdefer faces.deinit();
 
-        // Create the page pool. Conservative defaults for a terminal.
+        // Create the page pool. `max_layers` is a *ceiling*, not a
+        // reservation: `smp_allocator` mmaps each page's ~1 MB buffers and
+        // they're never memset until a glyph is recorded, so RSS tracks the
+        // glyphs actually used, not the layer count. 256 (snail's max) holds
+        // ~65k glyphs — enough that even a 24k-distinct-glyph flood settles
+        // instead of hitting OutOfLayers and leaving permanent gaps. The GPU
+        // curve/band texture arrays, however, *are* sized to this up front
+        // (~0.77 MB VRAM/layer ≈ 197 MB at 256); grown-on-demand next.
         const pool = try snail.PagePool.init(alloc, .{
-            .max_layers = 64,
+            .max_layers = 256,
             .curve_words_per_page = 256 * 1024,
             .band_words_per_page = 128 * 1024,
         });
