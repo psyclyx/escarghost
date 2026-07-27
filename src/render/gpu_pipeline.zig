@@ -131,6 +131,10 @@ pub const GpuPipeline = struct {
     selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
     eph: row_build.EphemeralBlobs,
     misses: glyph_misses.Set = .{},
+    /// Scratch for the graceful-skip path: a row's shapes filtered to those
+    /// whose glyph is already prepped in the atlas. Sized to the per-row shape
+    /// cap. Only touched when a row references a not-yet-prepped glyph.
+    filtered_shapes: [render_snapshot.MaxCols * 4]snail.Shape = undefined,
 
     // Result of the last `buildShapes` — consumed by `emitBuilt`. Its slices
     // point into rows_out / selection_spans / the eph stash, valid until the
@@ -298,14 +302,13 @@ pub const GpuPipeline = struct {
         }
 
         // ── Layer 3: text glyphs ──
-        // A row whose shapes reference a glyph the atlas hasn't baked yet
-        // fails wholesale with MissingRecord (emit is all-or-nothing per
-        // call). That's transient — the extend loop keeps baking and the
-        // row fills in within a frame or two — but a pathological all-unique
-        // stream outruns the atlas every frame, so summarize instead of
-        // logging per row (which flooded the log).
-        var emit_fail_rows: u32 = 0;
-        var last_emit_err: ?anyerror = null;
+        // emit is all-or-nothing per call: one glyph not yet prepped in the
+        // atlas fails the whole row with MissingRecord. Rather than drop the
+        // row, retry with only the prepped glyphs so the row still renders;
+        // the not-yet-prepped cells stay blank this frame and fill in on a
+        // later sampled frame as the atlas catches up. Summarize the partials
+        // once per frame instead of logging per row (which flooded the log).
+        var partial_rows: u32 = 0;
         for (built.rows) |row| {
             if (row.shapes.len == 0) continue;
             const xform = snail.Transform2D.translate(0, row.row_y);
@@ -319,17 +322,37 @@ pub const GpuPipeline = struct {
                 row.shapes,
                 xform,
                 white_tint,
-            ) catch |err| {
-                emit_fail_rows += 1;
-                last_emit_err = err;
-                continue;
+            ) catch {
+                // Emit stages into the buffer tails and only commits on full
+                // success, so the failed call left il/bl untouched. Re-emit
+                // the prepped subset.
+                partial_rows += 1;
+                var n: usize = 0;
+                for (row.shapes) |s| {
+                    if (atlas.contains(s.key)) {
+                        self.filtered_shapes[n] = s;
+                        n += 1;
+                    }
+                }
+                if (n > 0) {
+                    _ = snail.emit.emit(
+                        self.instances.items,
+                        self.batches.items,
+                        &il,
+                        &bl,
+                        binding,
+                        atlas,
+                        self.filtered_shapes[0..n],
+                        xform,
+                        white_tint,
+                    ) catch {};
+                }
             };
         }
-        if (emit_fail_rows > 0) {
-            log.warn(.gpu, "rows skipped (glyphs not yet baked)", .{
-                .rows = emit_fail_rows,
+        if (partial_rows > 0) {
+            log.warn(.gpu, "rows partially drawn (glyphs not yet prepped)", .{
+                .rows = partial_rows,
                 .total_rows = built.rows.len,
-                .err = last_emit_err,
             });
         }
 

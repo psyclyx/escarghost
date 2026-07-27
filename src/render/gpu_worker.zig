@@ -533,9 +533,10 @@ pub const GpuWorker = struct {
                     const atlas_ref = self.atlas_ref.?;
                     var lease = atlas_ref.acquire();
                     defer lease.release();
-                    // Re-read across the extend loop: auto-fallback can swap
-                    // the shared `Faces` when a miss run needs a new font.
-                    var faces = atlas_ref.faces orelse {
+                    // Re-read each frame: auto-fallback (in extend) can swap
+                    // the shared `Faces` when a miss run needs a new font, and
+                    // it takes effect on the next frame's build.
+                    const faces = atlas_ref.faces orelse {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
                     };
@@ -549,24 +550,26 @@ pub const GpuWorker = struct {
                     defer if (extra_lease) |*l| l.release();
 
                     var render_ok = true;
-                    var had_misses = pipeline.?.buildShapes(cur_atlas, faces, &self.snapshots[snapshot_slot]) catch |e| blk: {
+                    const had_misses = pipeline.?.buildShapes(cur_atlas, faces, &self.snapshots[snapshot_slot]) catch |e| blk: {
                         log.err(.gpu, "build failed", .{ .err = e });
                         render_ok = false;
                         break :blk false;
                     };
-                    var attempt: u32 = 0;
-                    while (render_ok and had_misses and attempt < 4) : (attempt += 1) {
-                        const result = atlas_ref.extend(cur_atlas, pipeline.?.misses.text()) catch break;
-                        if (result == .missing) break;
-                        if (extra_lease) |*l| l.release();
-                        extra_lease = atlas_ref.acquire();
-                        cur_atlas = extra_lease.?.get();
-                        faces = atlas_ref.faces orelse faces;
-                        had_misses = pipeline.?.buildShapes(cur_atlas, faces, &self.snapshots[snapshot_slot]) catch |e| blk: {
-                            log.err(.gpu, "build failed", .{ .err = e });
-                            render_ok = false;
-                            break :blk false;
-                        };
+                    // Prep at most one bounded batch of newly-seen glyphs, then
+                    // present against the (possibly extended) atlas. We do NOT
+                    // loop-until-prepped or re-shape: a full screen of novel
+                    // glyphs would stall the frame ~1s. Glyphs not yet prepped
+                    // are skipped per-glyph by emit and fill in on later sampled
+                    // frames as the atlas catches up. `faces` is re-read at the
+                    // top of the next frame, so an auto-fallback face added by
+                    // extend takes effect one frame later. See glyph_misses.MaxBytes.
+                    if (render_ok and had_misses) {
+                        const result = atlas_ref.extend(cur_atlas, pipeline.?.misses.text()) catch null;
+                        if (result != null and result.? == .extended) {
+                            if (extra_lease) |*l| l.release();
+                            extra_lease = atlas_ref.acquire();
+                            cur_atlas = extra_lease.?.get();
+                        }
                     }
 
                     // Upload the completed atlas (cached by generation), emit.

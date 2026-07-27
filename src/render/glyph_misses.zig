@@ -3,14 +3,14 @@
 /// extension (`TextAtlas.ensureText`) to discover all needed glyphs
 /// — including ligature substitutions.
 ///
-/// Sized to hold a full screen's worth of never-before-seen glyphs in
-/// one batch (~16k 4-byte codepoints), so a burst of novel text (e.g.
-/// the first screen of a CJK document, or many auto-fallback glyphs at
-/// once) bakes into the atlas in a single extend pass instead of
-/// dribbling in a few thousand glyphs per frame and leaving the rest as
-/// `MissingRecord` boxes. The pipelines that embed a `Set` are heap
-/// allocated, so this is not a stack concern.
-pub const MaxBytes = 64 * 1024;
+/// Bounds one bake step: `AtlasRef.extend` shapes + rasterizes this whole
+/// buffer in a single uninterruptible call, and the render worker time-boxes
+/// how many such steps it runs per frame (see gpu_worker). Keep it small
+/// enough that one step stays well under a frame budget — a burst of novel
+/// text bakes over a few sampled frames rather than freezing one frame to
+/// bake it all. ~4k codepoints per step. The pipelines that embed a `Set`
+/// are heap allocated, so this is not a stack concern.
+pub const MaxBytes = 16 * 1024;
 
 pub const Set = struct {
     len: usize = 0,
