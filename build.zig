@@ -97,54 +97,6 @@ fn createColorModule(b: *std.Build, deps: Deps) *std.Build.Module {
     });
 }
 
-fn createSnailModule(b: *std.Build, deps: Deps) *std.Build.Module {
-    const snail_dep = b.dependency("snail", .{});
-    const snail_mod = b.createModule(.{
-        .root_source_file = snail_dep.path("src/snail/root.zig"),
-        .target = deps.target,
-        .optimize = deps.optimize,
-        .link_libc = true,
-    });
-    snail_mod.linkSystemLibrary("harfbuzz", .{});
-    return snail_mod;
-}
-
-/// snail-raster: the CPU rasterizer module. Requires a render-state
-/// sub-module (which re-exports DrawState, TargetSurface, etc.) and
-/// the snail-raster-support module. Both are created from snail's
-/// source tree — no vendoring, just module wiring matching snail's
-/// own build.zig createRasterModule().
-fn createSnailRasterModule(b: *std.Build, deps: Deps, snail_mod: *std.Build.Module) *std.Build.Module {
-    const snail_dep = b.dependency("snail", .{});
-
-    // render-state module — shared DrawState/TargetSurface/etc.
-    const render_state_mod = b.createModule(.{
-        .root_source_file = snail_dep.path("src/render_state.zig"),
-        .target = deps.target,
-        .optimize = deps.optimize,
-        .imports = &.{.{ .name = "snail", .module = snail_mod }},
-    });
-
-    // snail-raster-support module
-    const raster_support_mod = b.createModule(.{
-        .root_source_file = snail_dep.path("src/snail/raster_support.zig"),
-        .target = deps.target,
-        .optimize = deps.optimize,
-        .imports = &.{.{ .name = "snail", .module = snail_mod }},
-    });
-
-    const raster_mod = b.createModule(.{
-        .root_source_file = snail_dep.path("src/snail-raster/root.zig"),
-        .target = deps.target,
-        .optimize = deps.optimize,
-        .link_libc = true,
-    });
-    raster_mod.addImport("snail", snail_mod);
-    raster_mod.addImport("render-state", render_state_mod);
-    raster_mod.addImport("snail-raster-support", raster_support_mod);
-    return raster_mod;
-}
-
 const MainOptions = struct {
     vt_include: []const u8,
     vt_static_lib: []const u8,
@@ -163,10 +115,13 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     });
     mod.addIncludePath(.{ .cwd_relative = opts.vt_include });
     mod.addObjectFile(.{ .cwd_relative = opts.vt_static_lib });
-    const snail_mod = createSnailModule(b, deps);
+    const snail_dep = b.dependency("snail", .{
+        .target = deps.target,
+        .optimize = deps.optimize,
+    });
+    const snail_mod = snail_dep.module("snail");
     mod.addImport("snail", snail_mod);
-    mod.addImport("snail-raster", createSnailRasterModule(b, deps, snail_mod));
-    const snail_dep = b.dependency("snail", .{});
+    mod.addImport("snail-raster", snail_dep.module("snail-raster"));
     // We render Vulkan-only, so import snail's SPIR-V-only shader scope: it
     // exposes the same `snail-shaders` accessor API (the *Spv fns + reflection)
     // but depends only on SPIR-V generation, keeping naga WGSL validation and

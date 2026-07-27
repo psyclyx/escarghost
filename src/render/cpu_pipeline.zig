@@ -247,19 +247,13 @@ pub const CpuPipeline = struct {
             .font_size = self.font_size,
             .baseline_offset = self.baseline_offset,
         };
-        // Re-read across the extend loop: auto-fallback can swap the shared
-        // `Faces` for a rebuilt chain when a miss run needs a new font.
-        var faces = self.atlas_ref.faces orelse return error.NoFaces;
-
-        var cur_atlas = atlas;
-        var extra_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
-        defer if (extra_lease) |*l| l.release();
+        const faces = self.atlas_ref.faces orelse return error.NoFaces;
+        const cur_atlas = atlas;
 
         // Serialize shaping: the CPU and GPU workers share one HarfBuzz
         // buffer via `Faces`, so concurrent shapes corrupt it. Scoped to
-        // just the shape — rasterization below and extend() (which locks
-        // internally) run outside it.
-        var built = blk: {
+        // just the shape.
+        const built = blk: {
             self.atlas_ref.lockShaping();
             defer self.atlas_ref.unlockShaping();
             break :blk try row_build.buildSnapshot(
@@ -278,35 +272,9 @@ pub const CpuPipeline = struct {
             );
         };
 
-        var extend_attempts: u32 = 0;
-        while (!self.misses.isEmpty() and extend_attempts < 4) : (extend_attempts += 1) {
-            const result = self.atlas_ref.extend(cur_atlas, self.misses.text()) catch break;
-            if (result == .missing) break;
-            if (extra_lease) |*l| l.release();
-            extra_lease = self.atlas_ref.acquire();
-            cur_atlas = extra_lease.?.get();
-            faces = self.atlas_ref.faces orelse faces;
-            self.eph.releaseAll();
-            self.misses.clear();
-            built = blk: {
-                self.atlas_ref.lockShaping();
-                defer self.atlas_ref.unlockShaping();
-                break :blk try row_build.buildSnapshot(
-                    snapshot,
-                    self.allocator,
-                    metrics,
-                    cur_atlas,
-                    self.atlas_ref,
-                    faces,
-                    &self.scratch_rects,
-                    &self.scratch_box_rects,
-                    &self.rows_out,
-                    &self.selection_spans,
-                    &self.eph,
-                    &self.misses,
-                );
-            };
-        }
+        // Hand misses to the async prep thread; don't block the frame. The
+        // glyphs appear on a later frame once prep publishes an extended atlas.
+        if (!self.misses.isEmpty()) self.atlas_ref.requestPrep(self.misses.text());
 
         // ── 3. Background spans + decoration rects (linear, row-local +row_y) ──
         for (built.rows) |row| {

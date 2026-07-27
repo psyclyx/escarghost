@@ -213,6 +213,10 @@ pub const AtlasWorker = struct {
         resolver.* = .{ .allocator = alloc, .io = self.io };
         try atlas_ref.registerFallback(face_entries.items, resolver, FallbackResolver.resolveThunk);
 
+        // Start the async glyph-prep thread: render workers post misses and
+        // never block on shape/record. See AtlasRef prep-thread machinery.
+        try atlas_ref.startPrep();
+
         self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
         self.page_pool = pool;

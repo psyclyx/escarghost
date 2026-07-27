@@ -1,6 +1,8 @@
 const std = @import("std");
 const snail = @import("snail");
 const powerline = @import("powerline_glyphs.zig");
+const glyph_misses = @import("glyph_misses.zig");
+const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
@@ -71,6 +73,26 @@ pub const AtlasRef = struct {
     fallback_ctx: ?*anyopaque = null,
     fallback_resolve: ?*const fn (*anyopaque, u32) ?*const snail.Font = null,
 
+    // ── Async glyph prep ──
+    //
+    // Glyph prep (shape + `recordUnhintedRun` curve extraction) is the bulk
+    // of a flood frame (~60ms). It runs on a dedicated thread so the render
+    // workers never block on it: they post miss text via `requestPrep` and
+    // render the current atlas; newly-prepped glyphs appear a frame or two
+    // later (sample-and-present, see [[render_perf]]). Only the shape step
+    // needs `shape_lock` (shared hb_buffer); the heavy record step reads
+    // immutable font data and runs unlocked, in parallel with render-side
+    // shaping. A single-slot mailbox (latest misses win) is enough: misses
+    // are re-detected every frame, so a dropped batch just reappears.
+    prep_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
+    prep_cond: c.pthread_cond_t = std.mem.zeroes(c.pthread_cond_t),
+    prep_thread: ?std.Thread = null,
+    prep_active: bool = false,
+    prep_pending: bool = false,
+    prep_stop: bool = false,
+    prep_len: usize = 0,
+    prep_text: [glyph_misses.MaxBytes]u8 = undefined,
+
     /// A unit filled-rectangle path record (namespace `path_fill`) baked into
     /// the atlas at bootstrap. Renderers instance it — varying `local_transform`
     /// (position/size) per shape and `world_tint` (color/alpha) per emit call —
@@ -94,6 +116,11 @@ pub const AtlasRef = struct {
 
     const Snapshot = struct {
         atlas: *snail.Atlas,
+        /// Generation this snapshot's atlas represents. Captured with the
+        /// snapshot so a lease-holder uploads/caches by the atlas it actually
+        /// leased, not the global counter (which the async prep thread may
+        /// have advanced past since the lease was taken).
+        generation: u64 = 0,
         readers: usize = 0,
         retired: bool = false,
         next_retired: ?*Snapshot = null,
@@ -105,6 +132,11 @@ pub const AtlasRef = struct {
 
         pub fn get(self: *const Lease) *snail.Atlas {
             return self.snapshot.?.atlas;
+        }
+
+        /// Generation of the leased atlas (stable for the lease's lifetime).
+        pub fn generation(self: *const Lease) u64 {
+            return self.snapshot.?.generation;
         }
 
         pub fn clone(self: *const Lease) Lease {
@@ -127,7 +159,7 @@ pub const AtlasRef = struct {
 
         const snapshot = try allocator.create(Snapshot);
         errdefer allocator.destroy(snapshot);
-        snapshot.* = .{ .atlas = atlas_ptr };
+        snapshot.* = .{ .atlas = atlas_ptr, .generation = 1 };
 
         var ref: AtlasRef = .{
             .current = snapshot,
@@ -137,6 +169,8 @@ pub const AtlasRef = struct {
             .faces = faces,
         };
         if (c.pthread_mutex_init(&ref.shape_lock, null) != 0) return error.MutexInitFailed;
+        if (c.pthread_mutex_init(&ref.prep_mutex, null) != 0) return error.MutexInitFailed;
+        if (c.pthread_cond_init(&ref.prep_cond, null) != 0) return error.MutexInitFailed;
         return ref;
     }
 
@@ -171,60 +205,103 @@ pub const AtlasRef = struct {
         _ = c.pthread_mutex_unlock(&self.shape_lock);
     }
 
-    pub const ExtendResult = enum {
-        extended,
-        missing,
-    };
-
-    /// Synchronously extend the atlas snapshot to cover `miss_text`.
-    /// Shapes the text, records missing glyphs into a new atlas, and
-    /// publishes the new snapshot. Holds `shape_lock` across the
-    /// shape + record + publish to keep concurrent extenders safe.
-    ///
-    /// Before shaping, any codepoint in `miss_text` that no current face
-    /// covers triggers an auto-fallback font load (see
-    /// `ensureFallbackCoverage`), which may swap `self.faces`. Callers
-    /// should re-read `atlas_ref.faces` after a successful extend so their
-    /// next build shapes against the extended chain.
-    pub fn extend(
-        self: *AtlasRef,
-        baseline: *const snail.Atlas,
-        miss_text: []const u8,
-    ) !ExtendResult {
-        _ = c.pthread_mutex_lock(&self.shape_lock);
-        defer _ = c.pthread_mutex_unlock(&self.shape_lock);
-
-        // Pull in a covering font for any uncovered codepoint before we
-        // shape, so the glyphs below actually resolve instead of recording
-        // .notdef boxes.
-        _ = self.ensureFallbackCoverage(miss_text);
-        const faces = self.faces orelse return .missing;
-
-        // Shape the miss text
-        var shaped = snail.shape(self.allocator, faces, miss_text, .{}) catch return .missing;
-        defer shaped.deinit();
-
-        // Clone the baseline atlas (shares unchanged pages via persistent-map)
-        var next = try baseline.extend(self.allocator, &.{});
-
-        // Record unhinted glyphs from the shaped text (in-place on the clone)
-        snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch {
-            next.deinit();
-            return .missing;
-        };
-
-        // Publish the new snapshot
-        const heap = self.allocator.create(snail.Atlas) catch {
-            next.deinit();
-            return error.OutOfMemory;
-        };
-        heap.* = next;
-        self.publish(heap) catch |err| {
-            heap.deinit();
-            self.allocator.destroy(heap);
+    /// Start the async glyph-prep thread. Call once, after `faces` and the
+    /// fallback resolver are set (i.e. after bootstrap).
+    pub fn startPrep(self: *AtlasRef) !void {
+        if (self.prep_active) return;
+        self.prep_active = true;
+        self.prep_thread = std.Thread.spawn(.{}, prepLoop, .{self}) catch |err| {
+            self.prep_active = false;
             return err;
         };
-        return .extended;
+    }
+
+    /// Signal the prep thread to exit and join it. Call before `deinit`.
+    pub fn stopPrep(self: *AtlasRef) void {
+        if (!self.prep_active) return;
+        _ = c.pthread_mutex_lock(&self.prep_mutex);
+        self.prep_stop = true;
+        _ = c.pthread_cond_signal(&self.prep_cond);
+        _ = c.pthread_mutex_unlock(&self.prep_mutex);
+        if (self.prep_thread) |t| t.join();
+        self.prep_thread = null;
+        self.prep_active = false;
+    }
+
+    /// Hand `miss_text` to the prep thread and return immediately. Single-slot
+    /// mailbox: a pending batch not yet picked up is overwritten (misses are
+    /// re-detected every frame, so nothing is permanently lost). No-op before
+    /// `startPrep` — callers on that path get glyphs prepped once prep runs.
+    pub fn requestPrep(self: *AtlasRef, miss_text: []const u8) void {
+        if (!self.prep_active or miss_text.len == 0) return;
+        const n = @min(miss_text.len, self.prep_text.len);
+        _ = c.pthread_mutex_lock(&self.prep_mutex);
+        @memcpy(self.prep_text[0..n], miss_text[0..n]);
+        self.prep_len = n;
+        self.prep_pending = true;
+        _ = c.pthread_cond_signal(&self.prep_cond);
+        _ = c.pthread_mutex_unlock(&self.prep_mutex);
+    }
+
+    fn prepLoop(self: *AtlasRef) void {
+        log.info(.atlas, "prep thread running", .{});
+        var work: [glyph_misses.MaxBytes]u8 = undefined;
+        while (true) {
+            _ = c.pthread_mutex_lock(&self.prep_mutex);
+            while (!self.prep_pending and !self.prep_stop) {
+                _ = c.pthread_cond_wait(&self.prep_cond, &self.prep_mutex);
+            }
+            if (self.prep_stop) {
+                _ = c.pthread_mutex_unlock(&self.prep_mutex);
+                return;
+            }
+            const n = self.prep_len;
+            @memcpy(work[0..n], self.prep_text[0..n]);
+            self.prep_pending = false;
+            _ = c.pthread_mutex_unlock(&self.prep_mutex);
+            self.runPrep(work[0..n]);
+        }
+    }
+
+    /// Extend the current atlas to cover `miss_text`, then publish it.
+    /// Runs on the prep thread. Phase A (fallback + shape) holds `shape_lock`
+    /// because it touches the shared HarfBuzz buffer; Phase B (`recordUnhinted`
+    /// curve extraction) reads only immutable font data, so it runs unlocked —
+    /// in parallel with render-side shaping. Only the prep thread extends, so
+    /// there is no concurrent page-pool mutation.
+    fn runPrep(self: *AtlasRef, miss_text: []const u8) void {
+        // Phase A — fallback coverage + shape, under shape_lock.
+        _ = c.pthread_mutex_lock(&self.shape_lock);
+        _ = self.ensureFallbackCoverage(miss_text);
+        const faces = self.faces orelse {
+            _ = c.pthread_mutex_unlock(&self.shape_lock);
+            return;
+        };
+        var shaped = snail.shape(self.allocator, faces, miss_text, .{}) catch {
+            _ = c.pthread_mutex_unlock(&self.shape_lock);
+            return;
+        };
+        _ = c.pthread_mutex_unlock(&self.shape_lock);
+        defer shaped.deinit();
+
+        // Phase B — clone the current atlas + record, no lock.
+        var lease = self.acquire();
+        defer lease.release();
+        var next = lease.get().extend(self.allocator, &.{}) catch return;
+        snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch {
+            next.deinit();
+            return;
+        };
+
+        const heap = self.allocator.create(snail.Atlas) catch {
+            next.deinit();
+            return;
+        };
+        heap.* = next;
+        self.publish(heap) catch {
+            heap.deinit();
+            self.allocator.destroy(heap);
+        };
     }
 
     /// Seed the auto-fallback machinery with the bootstrap chain and the
@@ -351,7 +428,7 @@ pub const AtlasRef = struct {
         self.rect_key = key;
         self.rect_xform = prep.design_to_source;
         self.has_rect = true;
-        _ = self.generation.fetchAdd(1, .release);
+        self.current.?.generation = self.generation.fetchAdd(1, .release) + 1;
     }
 
     /// Bake the filled Powerline separators (U+E0B0–E0BF) as unit-space
@@ -391,7 +468,7 @@ pub const AtlasRef = struct {
                 self.lock();
                 defer self.unlock();
                 try self.current.?.atlas.extendInPlace(alloc, &.{entry});
-                _ = self.generation.fetchAdd(1, .release);
+                self.current.?.generation = self.generation.fetchAdd(1, .release) + 1;
             }
             self.powerline.set(cp, .{ .key = key, .xform = prep.design_to_source });
         }
@@ -401,19 +478,23 @@ pub const AtlasRef = struct {
     pub fn publish(self: *AtlasRef, next: *snail.Atlas) !void {
         const next_snapshot = try self.allocator.create(Snapshot);
         errdefer self.allocator.destroy(next_snapshot);
-        next_snapshot.* = .{ .atlas = next };
 
         self.lock();
         defer self.unlock();
 
+        // fetchAdd returns the prior value; the new generation is +1.
+        const new_gen = self.generation.fetchAdd(1, .release) + 1;
+        next_snapshot.* = .{ .atlas = next, .generation = new_gen };
         const old = self.current;
         self.current = next_snapshot;
         if (old) |snapshot| self.retireLocked(snapshot);
-        _ = self.generation.fetchAdd(1, .release);
     }
 
     /// Clean up all held snapshots. Call only when no threads are reading.
     pub fn deinit(self: *AtlasRef) void {
+        // Stop the prep thread first — it publishes/retires snapshots and
+        // must not race the teardown below.
+        self.stopPrep();
         {
             self.lock();
             defer self.unlock();
@@ -440,6 +521,8 @@ pub const AtlasRef = struct {
         self.face_specs.deinit(self.allocator);
         self.fallback_tried.deinit(self.allocator);
         _ = c.pthread_mutex_destroy(&self.shape_lock);
+        _ = c.pthread_cond_destroy(&self.prep_cond);
+        _ = c.pthread_mutex_destroy(&self.prep_mutex);
     }
 
     fn retain(self: *AtlasRef, snapshot: *Snapshot) Lease {

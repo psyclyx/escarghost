@@ -556,9 +556,7 @@ pub const GpuWorker = struct {
                     // emit happens during the miss→extend cycle (that would
                     // fail per row and spam warnings); we upload + emit once,
                     // below, against the completed atlas.
-                    var cur_atlas = lease.get();
-                    var extra_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
-                    defer if (extra_lease) |*l| l.release();
+                    const cur_atlas = lease.get();
 
                     var render_ok = true;
                     var phase_t = perf.Timer.now();
@@ -568,29 +566,22 @@ pub const GpuWorker = struct {
                         break :blk false;
                     };
                     phaseBuildNs += phase_t.elapsedNs();
-                    // Prep at most one bounded batch of newly-seen glyphs, then
-                    // present against the (possibly extended) atlas. We do NOT
-                    // loop-until-prepped or re-shape: a full screen of novel
-                    // glyphs would stall the frame ~1s. Glyphs not yet prepped
-                    // are skipped per-glyph by emit and fill in on later sampled
-                    // frames as the atlas catches up. `faces` is re-read at the
-                    // top of the next frame, so an auto-fallback face added by
-                    // extend takes effect one frame later. See glyph_misses.MaxBytes.
+                    // Hand any newly-seen glyphs to the async prep thread and
+                    // move on — the frame does NOT block on prep. Glyphs not yet
+                    // prepped are skipped per-glyph by emit and appear on a later
+                    // sampled frame once prep publishes an extended atlas. `faces`
+                    // is re-read at the top of the next frame, so an auto-fallback
+                    // face added during prep takes effect a frame later.
                     phase_t = perf.Timer.now();
-                    if (render_ok and had_misses) {
-                        const result = atlas_ref.extend(cur_atlas, pipeline.?.misses.text()) catch null;
-                        if (result != null and result.? == .extended) {
-                            if (extra_lease) |*l| l.release();
-                            extra_lease = atlas_ref.acquire();
-                            cur_atlas = extra_lease.?.get();
-                        }
-                    }
+                    if (render_ok and had_misses) atlas_ref.requestPrep(pipeline.?.misses.text());
                     phasePrepNs += phase_t.elapsedNs();
 
-                    // Upload the completed atlas (cached by generation), emit.
+                    // Upload the atlas we actually leased (cached by that
+                    // snapshot's generation, not the global counter — the prep
+                    // thread may have published newer snapshots since we leased).
                     phase_t = perf.Timer.now();
                     if (render_ok) {
-                        const cur_gen = atlas_ref.loadGeneration();
+                        const cur_gen = lease.generation();
                         if (atlas_binding == null or cur_gen != cached_atlas_gen) {
                             if (atlas_binding) |b| device_atlas.?.releaseBinding(b);
                             atlas_binding = device_atlas.?.upload(atlas_ref.pool, cur_atlas) catch |e| blk: {
