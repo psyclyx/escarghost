@@ -19,6 +19,12 @@ const cli = @import("cli.zig");
 const bell_mod = @import("bell.zig");
 
 const c = @cImport({
+    // Disable glibc fortify: its inline _chk wrappers (bits/poll2.h,
+    // bits/fcntl2.h, …) don't survive Zig 0.16 translate-c under ReleaseSafe.
+    // Must precede any header that pulls in <features.h> (which latches
+    // __USE_FORTIFY_LEVEL).
+    @cUndef("_FORTIFY_SOURCE");
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("poll.h");
     @cInclude("stdlib.h");
     @cInclude("unistd.h");

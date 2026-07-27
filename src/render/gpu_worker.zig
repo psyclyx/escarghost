@@ -26,6 +26,12 @@ const log = @import("../log.zig");
 const vk = @import("vk/root.zig");
 
 const c = @cImport({
+    // glibc's _FORTIFY_SOURCE inline wrappers (bits/fcntl2.h's variadic
+    // open/openat checks) don't survive Zig 0.16's translate-c under
+    // ReleaseSafe. Disable fortify for this import — must come before any
+    // header pulls in <features.h>, which latches __USE_FORTIFY_LEVEL.
+    @cUndef("_FORTIFY_SOURCE");
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("pthread.h");
     @cInclude("stdlib.h");
     @cInclude("fcntl.h");
