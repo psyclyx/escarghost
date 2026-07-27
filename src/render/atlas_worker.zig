@@ -193,10 +193,15 @@ pub const AtlasWorker = struct {
         // set can't fit in any bounded atlas; that's out of scope (see
         // [[render_perf]]). Long sessions that accumulate many glyphs with a
         // small working set are handled by LRU eviction, not more layers.
+        // snail 0.15: `max_pages` (logical pages, banked into 256-layer GPU
+        // windows) replaces the old hard 256-`max_layers` ceiling — pages are
+        // lazily allocated, so this is a ceiling, not a reservation. Curve
+        // pages are 2x wider than before (1<<19) because CJK outlines are
+        // curve-heavy (snail 90fce76: ~4x denser records).
         const pool = try snail.PagePool.init(alloc, .{
-            .max_layers = 128,
-            .curve_words_per_page = 256 * 1024,
-            .band_words_per_page = 128 * 1024,
+            .max_pages = 256,
+            .curve_words_per_page = 1 << 19,
+            .band_words_per_page = 1 << 15,
         });
         errdefer pool.deinit();
 
