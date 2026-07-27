@@ -314,6 +314,12 @@ pub const FallbackResolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     loaded: std.StringHashMapUnmanaged(*snail.Font) = .empty,
+    /// Paths fontconfig returned but snail could not parse (e.g. Noto Color
+    /// Emoji's bitmap format). Negative-cached so an unparseable font is
+    /// mmap'd at most once instead of being re-mapped for every uncovered
+    /// codepoint that resolves to it — that leaked ~10 MB per emoji glyph
+    /// (~6.5 GB of NotoColorEmoji.ttf mappings across a full emoji sweep).
+    failed: std.StringHashMapUnmanaged(void) = .empty,
 
     /// Type-erased entry point handed to `AtlasRef.registerFallback`.
     pub fn resolveThunk(ctx: *anyopaque, codepoint: u32) ?*const snail.Font {
@@ -325,31 +331,45 @@ pub const FallbackResolver = struct {
         const path = resolveCoveringFontPath(self.allocator, codepoint) orelse return null;
         defer self.allocator.free(path);
 
+        const font = self.fontForPath(path) orelse return null;
+        // Fontconfig returns a best charset match even when nothing truly
+        // covers the codepoint. The font parsed fine (and stays cached for
+        // codepoints it does cover), but it isn't the covering face here.
+        if ((font.glyphIndex(codepoint) catch 0) == 0) return null;
+        return font;
+    }
+
+    /// Map + parse `path` at most once, caching the outcome — positive in
+    /// `loaded`, negative in `failed` — so repeated lookups never re-mmap it.
+    fn fontForPath(self: *FallbackResolver, path: []const u8) ?*const snail.Font {
         if (self.loaded.get(path)) |existing| return existing;
+        if (self.failed.contains(path)) return null;
 
         const data = mmapFontFile(self.io, path) catch |err| {
-            log.warn(.atlas, "auto-fallback mmap failed", .{ .codepoint = codepoint, .path = path, .err = err });
+            log.warn(.atlas, "auto-fallback mmap failed", .{ .path = path, .err = err });
+            self.markFailed(path);
             return null;
         };
         const font = self.allocator.create(snail.Font) catch return null;
         font.* = snail.Font.init(data) catch {
+            log.warn(.atlas, "auto-fallback parse failed", .{ .path = path });
             self.allocator.destroy(font);
+            self.markFailed(path);
             return null;
         };
-        // Fontconfig returns a best charset match even when nothing truly
-        // covers the codepoint; reject rather than append a useless face.
-        if ((font.glyphIndex(codepoint) catch 0) == 0) {
-            self.allocator.destroy(font);
-            return null;
-        }
 
         const key = self.allocator.dupe(u8, path) catch return font;
         self.loaded.put(self.allocator, key, font) catch {
             self.allocator.free(key);
             return font;
         };
-        log.info(.atlas, "auto-fallback loaded", .{ .codepoint = codepoint, .path = path });
+        log.info(.atlas, "auto-fallback loaded", .{ .path = path });
         return font;
+    }
+
+    fn markFailed(self: *FallbackResolver, path: []const u8) void {
+        const key = self.allocator.dupe(u8, path) catch return;
+        self.failed.put(self.allocator, key, {}) catch self.allocator.free(key);
     }
 };
 
