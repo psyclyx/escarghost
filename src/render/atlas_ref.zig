@@ -35,7 +35,41 @@ pub const AtlasRef = struct {
     /// The shared Faces collection. Outlives all atlas snapshots.
     /// Shape operations need this; it's stored here so render threads
     /// can access it through the AtlasRef without a separate pointer.
+    ///
+    /// Auto-fallback (see `ensureFallbackCoverage`) may swap this pointer
+    /// for a rebuilt `Faces` that appends a newly loaded font. The swap
+    /// happens under `shape_lock`; the superseded `Faces` is moved to
+    /// `retired_faces` (never freed until deinit) rather than destroyed,
+    /// so a render worker still holding a stale pointer can't dangle.
     faces: ?*snail.Faces = null,
+
+    // ── Automatic per-glyph font fallback ──
+    //
+    // The configured chain (primary + user `fallback_fonts`) only covers
+    // the scripts those fonts carry. When shaping a miss run turns up a
+    // codepoint no current face covers, we ask `fallback_resolve` (a
+    // fontconfig-backed lookup installed at bootstrap) for a font that
+    // does, load it, and rebuild `Faces` with it appended. All of this
+    // runs inside `extend`, under `shape_lock`, so it's serialized with
+    // every other shape.
+
+    /// Live face specs backing `faces`. Seeded with the bootstrap chain
+    /// via `registerFallback`; grown as auto-fallback loads fonts. The
+    /// `*const Font` pointers live for the process lifetime.
+    face_specs: std.ArrayListUnmanaged(snail.Face) = .empty,
+    /// Superseded `Faces` values, kept alive so stale reader pointers stay
+    /// valid. Freed only in `deinit`.
+    retired_faces: std.ArrayListUnmanaged(*snail.Faces) = .empty,
+    /// Codepoints we've already run through the resolver (covered or not),
+    /// so a permanently-uncovered glyph doesn't re-query fontconfig every
+    /// frame.
+    fallback_tried: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Next stable `font_id` to assign to an auto-loaded fallback face.
+    next_font_id: u32 = 0,
+    /// Type-erased resolver context + fn (installed by `atlas_worker`).
+    /// `resolve` returns a covering `*const Font` for a codepoint, or null.
+    fallback_ctx: ?*anyopaque = null,
+    fallback_resolve: ?*const fn (*anyopaque, u32) ?*const snail.Font = null,
 
     /// A unit filled-rectangle path record (namespace `path_fill`) baked into
     /// the atlas at bootstrap. Renderers instance it — varying `local_transform`
@@ -146,14 +180,25 @@ pub const AtlasRef = struct {
     /// Shapes the text, records missing glyphs into a new atlas, and
     /// publishes the new snapshot. Holds `shape_lock` across the
     /// shape + record + publish to keep concurrent extenders safe.
+    ///
+    /// Before shaping, any codepoint in `miss_text` that no current face
+    /// covers triggers an auto-fallback font load (see
+    /// `ensureFallbackCoverage`), which may swap `self.faces`. Callers
+    /// should re-read `atlas_ref.faces` after a successful extend so their
+    /// next build shapes against the extended chain.
     pub fn extend(
         self: *AtlasRef,
         baseline: *const snail.Atlas,
-        faces: *snail.Faces,
         miss_text: []const u8,
     ) !ExtendResult {
         _ = c.pthread_mutex_lock(&self.shape_lock);
         defer _ = c.pthread_mutex_unlock(&self.shape_lock);
+
+        // Pull in a covering font for any uncovered codepoint before we
+        // shape, so the glyphs below actually resolve instead of recording
+        // .notdef boxes.
+        _ = self.ensureFallbackCoverage(miss_text);
+        const faces = self.faces orelse return .missing;
 
         // Shape the miss text
         var shaped = snail.shape(self.allocator, faces, miss_text, .{}) catch return .missing;
@@ -180,6 +225,95 @@ pub const AtlasRef = struct {
             return err;
         };
         return .extended;
+    }
+
+    /// Seed the auto-fallback machinery with the bootstrap chain and the
+    /// resolver used to load covering fonts on demand. `specs` is copied
+    /// (the borrowed `*const Font` pointers must outlive the process, as
+    /// they already do). Call once, at bootstrap, before any rendering.
+    pub fn registerFallback(
+        self: *AtlasRef,
+        specs: []const snail.Face,
+        ctx: *anyopaque,
+        resolve: *const fn (*anyopaque, u32) ?*const snail.Font,
+    ) !void {
+        try self.face_specs.appendSlice(self.allocator, specs);
+        var max_id: u32 = 0;
+        for (specs) |s| max_id = @max(max_id, s.font_id);
+        self.next_font_id = if (specs.len == 0) 0 else max_id + 1;
+        self.fallback_ctx = ctx;
+        self.fallback_resolve = resolve;
+    }
+
+    /// True if any live face has a real glyph for `cp`. Checked against
+    /// `face_specs` (not `faces`) so fonts appended earlier in the same
+    /// `ensureFallbackCoverage` pass count immediately.
+    fn coversCodepoint(self: *const AtlasRef, cp: u21) bool {
+        for (self.face_specs.items) |s| {
+            const gid = s.font.glyphIndex(cp) catch continue;
+            if (gid != 0) return true;
+        }
+        return false;
+    }
+
+    /// Load covering fonts for any uncovered codepoint in `miss_text` and,
+    /// if at least one was added, rebuild `faces`. Runs under `shape_lock`
+    /// (held by `extend`). Best-effort: resolver / build failures leave the
+    /// existing chain intact. Returns true when `faces` was swapped.
+    fn ensureFallbackCoverage(self: *AtlasRef, miss_text: []const u8) bool {
+        const resolve = self.fallback_resolve orelse return false;
+        const ctx = self.fallback_ctx.?;
+
+        const base_len = self.face_specs.items.len;
+        const base_next = self.next_font_id;
+
+        var view = std.unicode.Utf8View.init(miss_text) catch return false;
+        var it = view.iterator();
+        while (it.nextCodepoint()) |cp| {
+            if (cp <= 0x20) continue; // run separators / control
+            if (self.fallback_tried.contains(cp)) continue;
+            if (self.coversCodepoint(cp)) continue;
+            // Attempt exactly once, whatever the outcome, so a glyph no
+            // installed font carries doesn't re-hit fontconfig each frame.
+            self.fallback_tried.put(self.allocator, cp, {}) catch {};
+
+            const font = resolve(ctx, cp) orelse continue;
+            // The resolver returns a shared pointer per file; guard against
+            // appending the same font twice within one pass.
+            var dup = false;
+            for (self.face_specs.items) |s| {
+                if (s.font == font) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+
+            self.face_specs.append(self.allocator, .{
+                .font = font,
+                .font_id = self.next_font_id,
+                .fallback = true,
+            }) catch continue;
+            self.next_font_id += 1;
+        }
+
+        if (self.face_specs.items.len == base_len) return false;
+
+        const new_faces = self.allocator.create(snail.Faces) catch {
+            self.face_specs.items.len = base_len;
+            self.next_font_id = base_next;
+            return false;
+        };
+        new_faces.* = snail.Faces.build(self.allocator, self.face_specs.items) catch {
+            self.allocator.destroy(new_faces);
+            self.face_specs.items.len = base_len;
+            self.next_font_id = base_next;
+            return false;
+        };
+
+        if (self.faces) |old| self.retired_faces.append(self.allocator, old) catch {};
+        self.faces = new_faces;
+        return true;
     }
 
     /// Record the unit filled-rectangle primitive into the current atlas.
@@ -294,6 +428,17 @@ pub const AtlasRef = struct {
                 self.current = null;
             }
         }
+        // Free the auto-fallback bookkeeping. Retired `Faces` are ours to
+        // destroy (the bootstrap `Faces`, once superseded, lands here too);
+        // the current `faces` and every borrowed `Font` leak by design, as
+        // the process exits via `_exit`.
+        for (self.retired_faces.items) |f| {
+            f.deinit();
+            self.allocator.destroy(f);
+        }
+        self.retired_faces.deinit(self.allocator);
+        self.face_specs.deinit(self.allocator);
+        self.fallback_tried.deinit(self.allocator);
         _ = c.pthread_mutex_destroy(&self.shape_lock);
     }
 

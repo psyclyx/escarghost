@@ -247,7 +247,9 @@ pub const CpuPipeline = struct {
             .font_size = self.font_size,
             .baseline_offset = self.baseline_offset,
         };
-        const faces = self.atlas_ref.faces orelse return error.NoFaces;
+        // Re-read across the extend loop: auto-fallback can swap the shared
+        // `Faces` for a rebuilt chain when a miss run needs a new font.
+        var faces = self.atlas_ref.faces orelse return error.NoFaces;
 
         var cur_atlas = atlas;
         var extra_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
@@ -278,11 +280,12 @@ pub const CpuPipeline = struct {
 
         var extend_attempts: u32 = 0;
         while (!self.misses.isEmpty() and extend_attempts < 4) : (extend_attempts += 1) {
-            const result = self.atlas_ref.extend(cur_atlas, faces, self.misses.text()) catch break;
+            const result = self.atlas_ref.extend(cur_atlas, self.misses.text()) catch break;
             if (result == .missing) break;
             if (extra_lease) |*l| l.release();
             extra_lease = self.atlas_ref.acquire();
             cur_atlas = extra_lease.?.get();
+            faces = self.atlas_ref.faces orelse faces;
             self.eph.releaseAll();
             self.misses.clear();
             built = blk: {

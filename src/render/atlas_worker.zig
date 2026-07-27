@@ -205,6 +205,14 @@ pub const AtlasWorker = struct {
         // path records so the render path can draw them itself.
         try atlas_ref.ensurePowerlineGlyphs();
 
+        // Install automatic per-glyph fallback. Seeded with the bootstrap
+        // chain so its font_ids stay stable; uncovered codepoints found at
+        // render time get a covering font resolved via fontconfig and
+        // appended. The resolver outlives this frame (process lifetime).
+        const resolver = try alloc.create(FallbackResolver);
+        resolver.* = .{ .allocator = alloc, .io = self.io };
+        try atlas_ref.registerFallback(face_entries.items, resolver, FallbackResolver.resolveThunk);
+
         self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
         self.page_pool = pool;
@@ -292,6 +300,82 @@ fn resolveFontByQuery(allocator: std.mem.Allocator, io: std.Io, query: []const u
     const path = std.mem.sliceTo(file_ptr, 0);
     writeFontPathCache(io, query, path);
     return try allocator.dupe(u8, path);
+}
+
+// ── Automatic per-glyph fallback ─────────────────────────────────────────────
+//
+// `AtlasRef.ensureFallbackCoverage` calls back here when a codepoint that no
+// configured face covers turns up at render time. We ask fontconfig for a font
+// whose charset includes the codepoint, mmap + parse it, and hand back a
+// `*const snail.Font`. Fonts are cached by path (one parse per file) and, like
+// every other font here, live for the process lifetime.
+
+pub const FallbackResolver = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    loaded: std.StringHashMapUnmanaged(*snail.Font) = .empty,
+
+    /// Type-erased entry point handed to `AtlasRef.registerFallback`.
+    pub fn resolveThunk(ctx: *anyopaque, codepoint: u32) ?*const snail.Font {
+        const self: *FallbackResolver = @ptrCast(@alignCast(ctx));
+        return self.resolve(codepoint);
+    }
+
+    fn resolve(self: *FallbackResolver, codepoint: u32) ?*const snail.Font {
+        const path = resolveCoveringFontPath(self.allocator, codepoint) orelse return null;
+        defer self.allocator.free(path);
+
+        if (self.loaded.get(path)) |existing| return existing;
+
+        const data = mmapFontFile(self.io, path) catch |err| {
+            log.warn(.atlas, "auto-fallback mmap failed", .{ .codepoint = codepoint, .path = path, .err = err });
+            return null;
+        };
+        const font = self.allocator.create(snail.Font) catch return null;
+        font.* = snail.Font.init(data) catch {
+            self.allocator.destroy(font);
+            return null;
+        };
+        // Fontconfig returns a best charset match even when nothing truly
+        // covers the codepoint; reject rather than append a useless face.
+        if ((font.glyphIndex(codepoint) catch 0) == 0) {
+            self.allocator.destroy(font);
+            return null;
+        }
+
+        const key = self.allocator.dupe(u8, path) catch return font;
+        self.loaded.put(self.allocator, key, font) catch {
+            self.allocator.free(key);
+            return font;
+        };
+        log.info(.atlas, "auto-fallback loaded", .{ .codepoint = codepoint, .path = path });
+        return font;
+    }
+};
+
+/// Ask fontconfig for a font file whose charset covers `codepoint`.
+/// `FcFontMatch` always returns *some* font, so the caller must verify actual
+/// glyph coverage (the resolver does, via `glyphIndex`). Returns an owned path.
+fn resolveCoveringFontPath(allocator: std.mem.Allocator, codepoint: u32) ?[]const u8 {
+    const charset = c.FcCharSetCreate() orelse return null;
+    defer c.FcCharSetDestroy(charset);
+    if (c.FcCharSetAddChar(charset, codepoint) == 0) return null;
+
+    const pattern = c.FcPatternCreate() orelse return null;
+    defer c.FcPatternDestroy(pattern);
+    if (c.FcPatternAddCharSet(pattern, c.FC_CHARSET, charset) == 0) return null;
+
+    _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
+    c.FcDefaultSubstitute(pattern);
+
+    var result: c.FcResult = undefined;
+    const match = c.FcFontMatch(null, pattern, &result) orelse return null;
+    defer c.FcPatternDestroy(match);
+
+    var file_ptr: [*c]u8 = undefined;
+    if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) return null;
+
+    return allocator.dupe(u8, std.mem.sliceTo(file_ptr, 0)) catch null;
 }
 
 // ── Font path cache ────────────────────────────────────────────────────────

@@ -513,7 +513,9 @@ pub const GpuWorker = struct {
                     const atlas_ref = self.atlas_ref.?;
                     var lease = atlas_ref.acquire();
                     defer lease.release();
-                    const faces = atlas_ref.faces orelse {
+                    // Re-read across the extend loop: auto-fallback can swap
+                    // the shared `Faces` when a miss run needs a new font.
+                    var faces = atlas_ref.faces orelse {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
                     };
@@ -534,11 +536,12 @@ pub const GpuWorker = struct {
                     };
                     var attempt: u32 = 0;
                     while (render_ok and had_misses and attempt < 4) : (attempt += 1) {
-                        const result = atlas_ref.extend(cur_atlas, faces, pipeline.?.misses.text()) catch break;
+                        const result = atlas_ref.extend(cur_atlas, pipeline.?.misses.text()) catch break;
                         if (result == .missing) break;
                         if (extra_lease) |*l| l.release();
                         extra_lease = atlas_ref.acquire();
                         cur_atlas = extra_lease.?.get();
+                        faces = atlas_ref.faces orelse faces;
                         had_misses = pipeline.?.buildShapes(cur_atlas, faces, &self.snapshots[snapshot_slot]) catch |e| blk: {
                             log.err(.gpu, "build failed", .{ .err = e });
                             render_ok = false;
