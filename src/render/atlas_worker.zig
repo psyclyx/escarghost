@@ -201,6 +201,10 @@ pub const AtlasWorker = struct {
         // the path pipeline.
         try atlas_ref.ensureRectPrimitive();
 
+        // Bake the filled Powerline separators (U+E0B0–E0BF) as unit-space
+        // path records so the render path can draw them itself.
+        try atlas_ref.ensurePowerlineGlyphs();
+
         self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
         self.page_pool = pool;

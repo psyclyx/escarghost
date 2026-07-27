@@ -109,6 +109,11 @@ is not an error unless `-c` names it explicitly. All keys are optional.
     // ...
   },
 
+  // Draw Powerline separators (U+E0B0–E0BF) and box-drawing / block
+  // elements (U+2500–259F) directly, sized to the cell, instead of using
+  // the font's glyphs — seam-free lines and separators. false = use font.
+  "custom_glyphs": true,
+
   "bell": {
     "mode": "visual",           // none | visual | audible | both
     "visual_duration_ms": 150,

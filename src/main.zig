@@ -301,6 +301,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer allocator.free(atlas_thread.bootstrap_font_path);
     const atlas_ref_ptr = atlas_thread.atlas_ref;
+    atlas_ref_ptr.custom_glyphs = cfg.custom_glyphs;
     state.refs.atlas_ref = atlas_ref_ptr;
     log.info(.atlas, "font ready", .{});
 

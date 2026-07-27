@@ -20,6 +20,8 @@ const glyph_misses = @import("glyph_misses.zig");
 const color = @import("color");
 const selection_mod = @import("../selection.zig");
 const atlas_ref_mod = @import("atlas_ref.zig");
+const powerline_glyphs = @import("powerline_glyphs.zig");
+const box_glyphs = @import("box_glyphs.zig");
 const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 const Rgb = color.Rgb;
@@ -49,6 +51,31 @@ pub const ColoredRect = struct {
     w: f32,
     h: f32,
     color: [4]f32,
+};
+
+/// Up to 4 rects per box-drawing cell (cross arms / quadrants).
+pub const MAX_BOX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 4;
+
+/// Rect sink handed to `box_glyphs.emit`. Appends into a caller-provided
+/// buffer, applying the glyph's foreground color (with a per-rect alpha for
+/// the shade characters). Silently drops rects past the buffer's capacity.
+const BoxRectSink = struct {
+    buf: []ColoredRect,
+    n: *usize,
+    color: [4]f32,
+
+    pub fn rect(self: BoxRectSink, x: f32, y: f32, w: f32, h: f32, alpha: f32) void {
+        if (w <= 0 or h <= 0 or alpha <= 0) return;
+        if (self.n.* >= self.buf.len) return;
+        self.buf[self.n.*] = .{
+            .x = x,
+            .y = y,
+            .w = w,
+            .h = h,
+            .color = .{ self.color[0], self.color[1], self.color[2], self.color[3] * alpha },
+        };
+        self.n.* += 1;
+    }
 };
 
 pub const Metrics = struct {
@@ -120,14 +147,23 @@ fn buildRow(
     row_y: f32,
     scratch_rects: []ColoredRect,
     atlas: *const snail.Atlas,
+    atlas_ref: *const atlas_ref_mod.AtlasRef,
     faces: *snail.Faces,
     allocator: std.mem.Allocator,
     metrics: Metrics,
     misses: *glyph_misses.Set,
     shapes_out: []snail.Shape,
-) !struct { rect_count: usize, shape_count: usize, had_misses: bool } {
+    box_rects_out: []ColoredRect,
+) !struct { rect_count: usize, shape_count: usize, box_rect_count: usize, had_misses: bool } {
     var rect_count: usize = 0;
     var had_misses = false;
+
+    // Terminal-drawn glyphs written ahead of the shaped text. `pl_n`
+    // Powerline separator shapes occupy shapes_out[0..pl_n]; `box_n`
+    // box-drawing/block rects occupy box_rects_out[0..box_n].
+    var pl_n: usize = 0;
+    var box_n: usize = 0;
+    const custom = atlas_ref.custom_glyphs;
 
     const default_fg = snapshot.header.default_fg;
     const default_bg = snapshot.header.default_bg;
@@ -188,9 +224,38 @@ fn buildRow(
             }
         }
 
-        const has_renderable_text = flags.has_text and isRenderableCodepoint(cell.codepoint);
+        const cp = cell.codepoint;
+        const has_renderable_text = flags.has_text and isRenderableCodepoint(cp);
         if (has_renderable_text) {
-            row.appendCell(cell.codepoint, col_idx, fg);
+            const pl_prim = if (custom) atlas_ref.powerline.get(cp) else null;
+            if (pl_prim) |prim| {
+                // Powerline separator: instance the baked filled record over
+                // the exact cell, tinted with the cell fg. Row-local (row_y is
+                // added by the emit-time world transform).
+                if (pl_n < shapes_out.len) {
+                    const col_x = @as(f32, @floatFromInt(col_idx)) * metrics.cell_width;
+                    const outer = snail.Transform2D{
+                        .xx = metrics.cell_width,
+                        .yy = metrics.cell_height,
+                        .tx = col_x,
+                        .ty = row_y,
+                    };
+                    shapes_out[pl_n] = .{
+                        .key = prim.key,
+                        .local_transform = outer.multiply(prim.xform),
+                        .local_color = fg.toLinearFloat4(1.0),
+                    };
+                    pl_n += 1;
+                }
+            } else if (custom and box_glyphs.isHandled(cp)) {
+                // Box-drawing / block element: emit device-space rects sized
+                // to the cell with pixel-consistent line thickness.
+                const col_x = @as(f32, @floatFromInt(col_idx)) * metrics.cell_width;
+                const sink = BoxRectSink{ .buf = box_rects_out, .n = &box_n, .color = fg.toLinearFloat4(1.0) };
+                box_glyphs.emit(cp, col_x, row_y, metrics.cell_width, metrics.cell_height, sink);
+            } else {
+                row.appendCell(cp, col_idx, fg);
+            }
         }
 
         if (flags.underline and rect_count < scratch_rects.len) {
@@ -215,8 +280,9 @@ fn buildRow(
         }
     }
 
-    // Shape + record + place
-    var shape_count: usize = 0;
+    // Shape + record + place. Text shapes go after any Powerline shapes we
+    // already wrote at shapes_out[0..pl_n].
+    var shape_count: usize = pl_n;
     if (!row.isEmpty()) {
         var shaped = snail.shape(allocator, faces, row.text[0..row.text_len], .{}) catch {
             row.reset();
@@ -231,7 +297,7 @@ fn buildRow(
                 };
                 rect_count += 1;
             }
-            return .{ .rect_count = rect_count, .shape_count = 0, .had_misses = false };
+            return .{ .rect_count = rect_count, .shape_count = shape_count, .box_rect_count = box_n, .had_misses = false };
         };
         defer shaped.deinit();
 
@@ -261,9 +327,10 @@ fn buildRow(
                 .colr = true,
             };
 
+            const avail = shapes_out[pl_n..];
             const expected_count = snail.placedCellRunShapeCount(&shaped, faces, row.cells[0..row.cell_count], placement) catch 0;
-            if (expected_count > 0 and expected_count <= shapes_out.len) {
-                const placed = snail.placeCellRun(shapes_out[0..expected_count], &shaped, faces, row.cells[0..row.cell_count], placement) catch {
+            if (expected_count > 0 and expected_count <= avail.len) {
+                const placed = snail.placeCellRun(avail[0..expected_count], &shaped, faces, row.cells[0..row.cell_count], placement) catch {
                     row.reset();
                     if (bg_span_len > 0 and bg_span_color != null and rect_count < scratch_rects.len) {
                         scratch_rects[rect_count] = .{
@@ -275,9 +342,9 @@ fn buildRow(
                         };
                         rect_count += 1;
                     }
-                    return .{ .rect_count = rect_count, .shape_count = 0, .had_misses = had_misses };
+                    return .{ .rect_count = rect_count, .shape_count = shape_count, .box_rect_count = box_n, .had_misses = had_misses };
                 };
-                shape_count = placed.len;
+                shape_count = pl_n + placed.len;
             }
 
             if (had_misses) misses.addRun(row.text[0..row.text_len]);
@@ -297,7 +364,7 @@ fn buildRow(
         rect_count += 1;
     }
 
-    return .{ .rect_count = rect_count, .shape_count = shape_count, .had_misses = had_misses };
+    return .{ .rect_count = rect_count, .shape_count = shape_count, .box_rect_count = box_n, .had_misses = had_misses };
 }
 
 fn isRenderableCodepoint(cp: u32) bool {
@@ -342,6 +409,9 @@ pub const EphemeralBlobs = struct {
 pub const RowDraw = struct {
     shapes: []const snail.Shape,
     rects: []ColoredRect,
+    /// Terminal-drawn box-drawing / block-element rects, in device space.
+    /// Emitted above the background rects but below text (over the cell bg).
+    box_rects: []ColoredRect,
     row_y: f32,
 };
 
@@ -378,8 +448,10 @@ pub fn buildSnapshot(
     allocator: std.mem.Allocator,
     metrics: Metrics,
     atlas: *const snail.Atlas,
+    atlas_ref: *const atlas_ref_mod.AtlasRef,
     faces: *snail.Faces,
     scratch_rects: []ColoredRect,
+    box_rects_scratch: []ColoredRect,
     rows_out: []RowDraw,
     selection_spans_out: []SelectionSpan,
     rect_stash: *EphemeralBlobs,
@@ -432,11 +504,13 @@ pub fn buildSnapshot(
             0,
             scratch_rects,
             atlas,
+            atlas_ref,
             faces,
             allocator,
             metrics,
             misses,
             &row_shapes,
+            box_rects_scratch,
         );
         phase_row_shape_ns += shape_t0.elapsedNs();
 
@@ -445,13 +519,15 @@ pub fn buildSnapshot(
         try rect_stash.stashShapes(shapes);
         const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
         try rect_stash.stashRects(rects);
+        const box_rects = try allocator.dupe(ColoredRect, box_rects_scratch[0..built.box_rect_count]);
+        try rect_stash.stashRects(box_rects);
 
         phase_row_finish_ns += perf.Timer.now().elapsedNs();
         phase_row_rebuild_ns += rebuild_t0.elapsedNs();
         phase_row_count += 1;
         cell_index = next_index;
 
-        rows_out[row_count] = .{ .shapes = shapes, .rects = rects, .row_y = row_y };
+        rows_out[row_count] = .{ .shapes = shapes, .rects = rects, .box_rects = box_rects, .row_y = row_y };
         row_count += 1;
     }
 

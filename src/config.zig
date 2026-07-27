@@ -67,6 +67,12 @@ pub const Config = struct {
     /// have promoted it to select.
     touch_drift_px: f32 = 8.0,
 
+    // Draw Powerline separators (U+E0B0–E0BF) and box-drawing/block
+    // elements (U+2500–259F) ourselves instead of shaping them from the
+    // font — seam-free cell-aligned lines and separators. Set false to use
+    // the font's glyphs.
+    custom_glyphs: bool = true,
+
     // Bell behavior. mode=visual matches what users get without
     // touching config.
     bell: bell_mod.Config = .{},
@@ -351,6 +357,9 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
         }
     }
 
+    if (obj.get("custom_glyphs")) |v| {
+        if (v == .bool) cfg.custom_glyphs = v.bool;
+    }
     if (obj.get("touch_momentum")) |v| {
         if (v == .bool) cfg.touch_momentum = v.bool;
     }

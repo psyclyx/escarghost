@@ -1,5 +1,6 @@
 const std = @import("std");
 const snail = @import("snail");
+const powerline = @import("powerline_glyphs.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
@@ -46,6 +47,16 @@ pub const AtlasRef = struct {
     rect_key: snail.record_key.RecordKey = .{ .namespace = 0, .a = 0, .b = 0, .c = 0 },
     rect_xform: snail.Transform2D = .identity,
     has_rect: bool = false,
+
+    /// Baked Powerline separator primitives (U+E0B0–E0BF filled shapes),
+    /// keyed like `rect_key` but one record per glyph. Populated by
+    /// `ensurePowerlineGlyphs` at bootstrap; read-only afterwards.
+    powerline: powerline.Table = .{},
+
+    /// When true, the render path draws Powerline separators and
+    /// box-drawing/block glyphs itself instead of shaping them from the font.
+    /// Set once from config before the first frame. See [[custom_glyphs]].
+    custom_glyphs: bool = true,
 
     const Snapshot = struct {
         atlas: *snail.Atlas,
@@ -207,6 +218,49 @@ pub const AtlasRef = struct {
         self.rect_xform = prep.design_to_source;
         self.has_rect = true;
         _ = self.generation.fetchAdd(1, .release);
+    }
+
+    /// Bake the filled Powerline separators (U+E0B0–E0BF) as unit-space
+    /// `path_fill` records, one per glyph, keyed by codepoint. Idempotent-ish:
+    /// call once during bootstrap after `ensureRectPrimitive`. Each record's
+    /// key + design→source placement is stashed in `self.powerline` for the
+    /// render path to instance per cell. See [[powerline_glyphs]].
+    pub fn ensurePowerlineGlyphs(self: *AtlasRef) !void {
+        const alloc = self.allocator;
+        var cp: u32 = powerline.first;
+        while (cp <= powerline.last) : (cp += 1) {
+            if (!powerline.isHandled(cp)) continue;
+            if (self.powerline.get(cp) != null) continue;
+
+            var path = (try powerline.buildPath(alloc, cp)) orelse continue;
+            defer path.deinit();
+
+            var prep = try path.prepare(alloc);
+            defer prep.deinit();
+
+            var curves = try prep.fillCurves(alloc, alloc);
+            defer curves.deinit();
+
+            const key = snail.record_key.RecordKey{
+                .namespace = snail.record_key.ns.path_fill,
+                .a = cp,
+                .b = 0,
+                .c = 0,
+            };
+            const entry = snail.AtlasEntry{
+                .key = key,
+                .curves = curves,
+                .paint = try prep.paintForDesign(.{ .solid = .{ 1, 1, 1, 1 } }),
+            };
+
+            {
+                self.lock();
+                defer self.unlock();
+                try self.current.?.atlas.extendInPlace(alloc, &.{entry});
+                _ = self.generation.fetchAdd(1, .release);
+            }
+            self.powerline.set(cp, .{ .key = key, .xform = prep.design_to_source });
+        }
     }
 
     /// Publish a new snapshot, retiring the old one.

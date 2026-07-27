@@ -126,6 +126,7 @@ pub const GpuPipeline = struct {
 
     // Scratch buffers for row_build
     scratch_rects: [row_build.MAX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
+    scratch_box_rects: [row_build.MAX_BOX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
     rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
     selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
     eph: row_build.EphemeralBlobs,
@@ -221,8 +222,10 @@ pub const GpuPipeline = struct {
                 self.allocator,
                 metrics,
                 atlas,
+                self.atlas_ref,
                 faces,
                 &self.scratch_rects,
+                &self.scratch_box_rects,
                 &self.rows_out,
                 &self.selection_spans,
                 &self.eph,
@@ -284,6 +287,13 @@ pub const GpuPipeline = struct {
                 const w = @as(f32, @floatFromInt(span.end_col - span.start_col + 1)) * self.cell_width;
                 const y = @as(f32, @floatFromInt(span.row)) * self.cell_height;
                 self.emitRect(&il, &bl, binding, atlas, x, y, w, self.cell_height, sel);
+            }
+        }
+
+        // ── Layer 2.5: box-drawing / block glyphs (over bg, under text) ──
+        for (built.rows) |row| {
+            for (row.box_rects) |rect| {
+                self.emitRect(&il, &bl, binding, atlas, rect.x, rect.y + row.row_y, rect.w, rect.h, rect.color);
             }
         }
 
