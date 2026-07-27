@@ -260,6 +260,36 @@ pub const Renderer = struct {
         self.vbo.deinit(self.device);
     }
 
+    /// Worst-case per-slot vertex-ring bytes for a `cols`×`rows` grid. Each
+    /// cell can emit at most: a background fill, two decoration rects
+    /// (underline + strike), a selection overlay, and *either* a glyph *or*
+    /// up to four box-drawing rects — eight instances (glyph and box rects
+    /// are mutually exclusive per cell). Sized to the actual grid, not the
+    /// 1024×320 maximum, so the ring scales with the window instead of
+    /// reserving ~380 MB up front. A floor keeps tiny windows workable.
+    pub fn slotBytesForGrid(cols: usize, rows: usize) usize {
+        const per_cell_worst: usize = 8;
+        const overlay_slack: usize = 256; // cursor + scrollbar + bell + headroom
+        const instances = cols * rows * per_cell_worst + overlay_slack;
+        const min_bytes: usize = 256 * 1024;
+        return @max(instances * BYTES_PER_INSTANCE, min_bytes);
+    }
+
+    /// Grow the vertex ring so each slot holds at least `slot_bytes`. No-op
+    /// when already large enough (grow-only: an interactive resize settles at
+    /// the largest grid seen rather than thrashing the allocation). Waits for
+    /// the device to idle first — the old buffer may still be referenced by an
+    /// in-flight frame — so call only from the (infrequent) configure path.
+    pub fn ensureSlotCapacity(self: *Renderer, ctx: *const Context, slot_bytes: usize) !void {
+        if (slot_bytes <= self.slot_bytes) return;
+        _ = vk.vkDeviceWaitIdle(self.device);
+        var new_vbo = try HostBuffer.init(ctx, slot_bytes * self.num_slots, vk.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        errdefer new_vbo.deinit(self.device);
+        self.vbo.deinit(self.device);
+        self.vbo = new_vbo;
+        self.slot_bytes = slot_bytes;
+    }
+
     pub fn beginFrame(self: *Renderer, frame_slot: u32) void {
         self.cur_slot_base = (frame_slot % self.num_slots) * self.slot_bytes;
         self.cursor = 0;

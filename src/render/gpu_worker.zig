@@ -439,8 +439,22 @@ pub const GpuWorker = struct {
                         };
                     }
 
+                    // Size the vertex ring to this window's grid: one frame can
+                    // emit up to ~8 instances per cell, so a fixed 1 MB ring
+                    // dropped whole frames ("VertexBufferFull") once a dense
+                    // screen (e.g. tmatrix) outgrew ~14.5k instances. Derive
+                    // the grid from the surface + cell metrics and grow to fit.
+                    const grid_cols: usize = if (request.cell_width > 0)
+                        @intFromFloat(@as(f32, @floatFromInt(request.width)) / request.cell_width)
+                    else
+                        0;
+                    const grid_rows: usize = if (request.cell_height > 0)
+                        @intFromFloat(@as(f32, @floatFromInt(request.height)) / request.cell_height)
+                    else
+                        0;
+                    const slot_bytes = vk.Renderer.slotBytesForGrid(grid_cols, grid_rows);
+
                     if (renderer == null) {
-                        const slot_bytes: usize = 1024 * 1024; // 1 MB vertex ring per slot
                         renderer = vk.Renderer.init(
                             &ctx,
                             device_atlas.?.descriptorSetLayout(),
@@ -448,6 +462,12 @@ pub const GpuWorker = struct {
                             2, // double-buffered
                         ) catch |e| {
                             log.err(.gpu, "renderer init failed", .{ .err = e });
+                            writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
+                            continue;
+                        };
+                    } else {
+                        renderer.?.ensureSlotCapacity(&ctx, slot_bytes) catch |e| {
+                            log.err(.gpu, "vertex ring resize failed", .{ .err = e });
                             writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                             continue;
                         };
