@@ -4,6 +4,7 @@ const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const cpu_pipeline = @import("render/cpu_pipeline.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
 const memtrack = @import("render/vk/memtrack.zig");
+const atlas_ref_mod = @import("render/atlas_ref.zig");
 const row_build_mod = @import("render/row_build.zig");
 const snail = @import("snail");
 const log = @import("log.zig");
@@ -253,6 +254,15 @@ pub const Diagnostics = struct {
                 .worker_wait_count = gpu_worker.workerWaitCount,
                 .buf_starvation_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(gpu_worker.bufferStarvationAccumNs)) / ms_f}),
                 .buf_starvation_count = gpu_worker.bufferStarvationCount,
+            });
+            // Atlas prep-thread stats. prep_full > 0 means the page pool ran
+            // out of layers (atlas can't hold all distinct glyphs → needs
+            // eviction or more layers); records = live glyphs in the atlas.
+            log.info(.diag, "atlas prep", .{
+                .records = atlas_ref_mod.atlasRecords,
+                .prep_ok = atlas_ref_mod.prepOkCount,
+                .prep_full = atlas_ref_mod.prepFullCount,
+                .prep_err = atlas_ref_mod.prepErrCount,
             });
             // Per-frame worker phase split (avg ms/frame). render = the
             // submitAndWait draw; upload = atlas transfer (also submitAndWait).

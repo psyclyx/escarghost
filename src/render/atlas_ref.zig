@@ -8,6 +8,15 @@ const c = @cImport({
     @cInclude("pthread.h");
 });
 
+// Prep-thread diagnostics (globals: one AtlasRef per process). `prep_full`
+// counts records dropped because the page pool is out of layers — the
+// "atlas can't hold all distinct glyphs, needs eviction" signal. `records`
+// is the live glyph count in the latest published atlas.
+pub var prepOkCount: u64 = 0;
+pub var prepFullCount: u64 = 0;
+pub var prepErrCount: u64 = 0;
+pub var atlasRecords: u64 = 0;
+
 /// Thread-safe snail.Atlas snapshot reference.
 ///
 /// The atlas thread publishes new (immutable) snapshots by calling `publish()`.
@@ -288,10 +297,13 @@ pub const AtlasRef = struct {
         var lease = self.acquire();
         defer lease.release();
         var next = lease.get().extend(self.allocator, &.{}) catch return;
-        snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch {
+        snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch |err| {
+            if (err == error.OutOfLayers) prepFullCount += 1 else prepErrCount += 1;
             next.deinit();
             return;
         };
+        prepOkCount += 1;
+        atlasRecords = next.recordCount();
 
         const heap = self.allocator.create(snail.Atlas) catch {
             next.deinit();
