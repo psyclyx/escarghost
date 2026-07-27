@@ -4,6 +4,7 @@ const wayland_mod = @import("wayland.zig");
 const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
+const headless = @import("render/headless.zig");
 const cpu_pipeline = @import("render/cpu_pipeline.zig");
 const render_env = @import("render/render_env.zig");
 const atlas_worker = @import("render/atlas_worker.zig");
@@ -182,6 +183,23 @@ pub fn main(init: std.process.Init) !void {
     // ── Phase 0: config + spawn GPU thread ──
     var cfg = try config_mod.load(allocator, io, cli_args.config_path);
     defer cfg.deinit(allocator);
+
+    // Headless offscreen screenshot mode (no Wayland): render one frame of
+    // SCRGO_SCREENSHOT_TEXT to the PPM at SCRGO_SCREENSHOT and exit. Used to
+    // verify the render pipeline end-to-end without a display.
+    if (getenv("SCRGO_SCREENSHOT")) |shot_path| {
+        const text = getenv("SCRGO_SCREENSHOT_TEXT") orelse
+            "scrgo headless  ABCabc 0123  ┌─┬─┐ ▚▞ █▓▒░\n" ++
+                "日本語 中文 한국어  ﾊﾛｰ  αβγ Привет  😀🎉🌙\n";
+        const w: u32 = if (getenv("SCRGO_SCREENSHOT_W")) |s| std.fmt.parseInt(u32, s, 10) catch 1000 else 1000;
+        const h: u32 = if (getenv("SCRGO_SCREENSHOT_H")) |s| std.fmt.parseInt(u32, s, 10) catch 600 else 600;
+        headless.screenshot(allocator, io, &cfg, .{ .text = text, .out_path = shot_path, .width = w, .height = h }) catch |err| {
+            log.err(.main, "headless screenshot failed", .{ .err = err });
+            return err;
+        };
+        return;
+    }
+
     state.debug.warn_slow_budget_ms = render_env.parseWarnSlowMs(getenv("SCRGO_WARN_SLOW_MS"));
     state.diag.trace_commits = render_env.parseTraceCommits(getenv("SCRGO_TRACE"));
     // Background memory poller (SCRGO_TRACE=commits). Mirrors what the
