@@ -71,10 +71,10 @@ pub const Frontend = struct {
         return self.response_fds[0];
     }
 
-    // Spawn the worker thread eagerly, before anything that might install
-    // pthread_create wrappers (the NVIDIA EGL stack hooks libpthread when
-    // it loads, costing every later spawn ~6 ms). The thread parks in
-    // cond_wait until start() assigns it real work.
+    // Spawn the worker thread eagerly, before the GPU worker is started —
+    // the GPU driver hooks pthread_create when it loads, making every later
+    // spawn cost ~6 ms. The thread parks in cond_wait until start() assigns
+    // it real work.
     pub fn spawnThread(self: *Frontend, io: std.Io) !void {
         if (self.thread != null) return;
         self.io = io;

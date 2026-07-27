@@ -216,9 +216,19 @@ pub fn main(init: std.process.Init) !void {
         cfg.gpu_restart_jitter_percent,
     );
 
-    // Spawn the CPU worker thread BEFORE anything pulls in NVIDIA EGL —
-    // NVIDIA hooks pthread_create on load and every subsequent spawn costs
-    // ~6 ms. The thread parks in cond_wait until start() assigns it work.
+    // ── Spawn the worker threads: cheap spawns first, GPU last ──
+    //
+    // gpu.start() only *spawns* the worker, but that worker then loads the
+    // Vulkan driver on its own thread — and NVIDIA's driver hooks
+    // pthread_create when it loads, making every spawn after that cost
+    // ~6 ms. So spawn the CPU and atlas workers first, while pthread_create
+    // is still cheap, and start the GPU worker LAST. It's still started
+    // before the Wayland connect + PTY fork below, so its long context init
+    // (tens of ms) overlaps the rest of startup — it just mustn't slow down
+    // the other threads' spawns by loading the driver ahead of them.
+
+    // CPU worker — the initial (and fallback) render path. Parks in
+    // cond_wait until start() assigns it work.
     const cpu = try allocator.create(cpu_renderer_worker.Frontend);
     defer allocator.destroy(cpu);
     cpu.* = .{};
@@ -228,16 +238,9 @@ pub fn main(init: std.process.Init) !void {
     };
     log.info(.cpu, "thread spawned", .{});
 
-    // Start GPU thread early — it begins EGL init immediately, no deps needed
-    if (gpu_allowed) {
-        gpu.start(io) catch |e| {
-            log.err(.gpu, "thread start failed", .{ .err = e });
-            state.render.gpu_restart.scheduleRetry();
-        };
-        log.info(.gpu, "thread started", .{});
-    }
-
-    // Start atlas thread with font+atlas bootstrap — overlaps with Wayland init
+    // Atlas worker — font+atlas bootstrap on its own thread. On the path to
+    // first paint (the CPU renderer needs the atlas), so keep its spawn in
+    // the cheap-pthread window too, before the GPU driver loads.
     var atlas_thread: atlas_worker.AtlasWorker = .{};
     try atlas_thread.startWithBootstrap(io, .{
         .allocator = allocator,
@@ -246,6 +249,18 @@ pub fn main(init: std.process.Init) !void {
         .font_size = cfg.font_size,
     });
     defer atlas_thread.stop();
+
+    // GPU worker LAST — starting it triggers the driver load (and its
+    // pthread_create hook) on the worker thread, so every spawn above must
+    // already be done. Begins Vulkan context init immediately (no deps), so
+    // it still comes up concurrently with Wayland init and the PTY fork.
+    if (gpu_allowed) {
+        gpu.start(io) catch |e| {
+            log.err(.gpu, "thread start failed", .{ .err = e });
+            state.render.gpu_restart.scheduleRetry();
+        };
+        log.info(.gpu, "thread started", .{});
+    }
 
     // ── Phase 1: Wayland connect + 1px background ──
     var wl: wayland_mod.Wayland = undefined;
