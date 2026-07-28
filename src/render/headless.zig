@@ -63,7 +63,7 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
     // ── Vulkan resources ──
     var ctx = try vk.Context.init(allocator);
     defer ctx.deinit();
-    var device_atlas = try vk.DeviceAtlas.init(&ctx, std.heap.smp_allocator, .{});
+    var device_atlas = try vk.DeviceAtlas.init(&ctx, std.heap.smp_allocator, atlas_ref.pool, .{});
     defer device_atlas.deinit();
     const slot_bytes = vk.Renderer.slotBytesForGrid(grid.cols, grid.rows);
     var renderer = try vk.Renderer.init(&ctx, device_atlas.descriptorSetLayout(), slot_bytes, 2);
@@ -100,9 +100,9 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
         };
         if (had_misses) atlas_ref.requestPrep(pl.misses.text());
 
-        const binding = try device_atlas.upload(atlas_ref.pool, atlas);
+        const binding = try device_atlas.upload(atlas);
         try pl.emitBuilt(atlas, binding, snap);
-        try vk.renderToTarget(&renderer, &ctx, &target, device_atlas.descriptorSet(), frame_slot, clear, pl.emittedInstances(), pl.emittedBatches());
+        try vk.renderToTarget(&renderer, &ctx, &target, device_atlas.descriptorSet(), frame_slot, clear, device_atlas.atlasPageTexels(), pl.emittedInstances(), pl.emittedBatches());
         device_atlas.releaseBinding(binding);
         lease.release();
         frame_slot +%= 1;

@@ -41,28 +41,41 @@ const PipelineRecipe = struct {
     requires_dual_src: bool = false,
 };
 
+/// 4-byte-aligned SPIR-V for a *flat* (uniform-texel-buffer) fragment family.
+/// snail 0.15 ships both image-sampled and flat fragment variants; we store
+/// the atlas in flat texel buffers (device_atlas.zig), so the fragment shaders
+/// must be the flat ones — `textSpv(.fragment)` etc. are the image-sampled
+/// variants and mismatch the descriptor layout. `flatFragSpvRaw` returns an
+/// unaligned slice, so re-materialize it into a static aligned array.
+fn flatFrag(comptime fam: shaders.FlatFamily) []align(4) const u8 {
+    const holder = struct {
+        const aligned: [shaders.flatFragSpvRaw(fam).len]u8 align(4) = blk: {
+            var a: [shaders.flatFragSpvRaw(fam).len]u8 align(4) = undefined;
+            @memcpy(a[0..], shaders.flatFragSpvRaw(fam));
+            break :blk a;
+        };
+    };
+    return &holder.aligned;
+}
+
 fn recipe(family: Family) PipelineRecipe {
     return switch (family) {
-        .text => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.textSpv(.fragment), .blend = .premultiplied },
-        .colr => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.colrFragSpv(), .blend = .premultiplied },
-        .path_quadratic => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.pathQuadraticFragSpv(), .blend = .premultiplied },
-        .path_conic => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.pathConicFragSpv(), .blend = .premultiplied },
-        .path => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.pathFragSpv(), .blend = .premultiplied },
-        .tt_hinted_text => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.ttHintedFragSpv(), .blend = .premultiplied },
-        .autohint => .{ .vert = shaders.autohintSpv(.vertex), .frag = shaders.autohintSpv(.fragment), .blend = .premultiplied },
-        .subpixel => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.subpixelFragSpv(), .blend = .dual_source, .requires_dual_src = true },
-        .tt_hinted_subpixel => .{ .vert = shaders.textSpv(.vertex), .frag = shaders.ttHintedSubpixelFragSpv(), .blend = .dual_source, .requires_dual_src = true },
-        .autohint_subpixel => .{ .vert = shaders.autohintSpv(.vertex), .frag = shaders.autohintSubpixelFragSpv(), .blend = .dual_source, .requires_dual_src = true },
+        .text => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.text), .blend = .premultiplied },
+        .colr => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.colr), .blend = .premultiplied },
+        .path_quadratic => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.path_quadratic), .blend = .premultiplied },
+        .path_conic => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.path_conic), .blend = .premultiplied },
+        .path => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.path), .blend = .premultiplied },
+        .tt_hinted_text => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.tt_hinted_text), .blend = .premultiplied },
+        .autohint => .{ .vert = shaders.autohintSpv(.vertex), .frag = flatFrag(.autohint), .blend = .premultiplied },
+        .subpixel => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.text_subpixel), .blend = .dual_source, .requires_dual_src = true },
+        .tt_hinted_subpixel => .{ .vert = shaders.textSpv(.vertex), .frag = flatFrag(.tt_hinted_text_subpixel), .blend = .dual_source, .requires_dual_src = true },
+        .autohint_subpixel => .{ .vert = shaders.autohintSpv(.vertex), .frag = flatFrag(.autohint_subpixel), .blend = .dual_source, .requires_dual_src = true },
     };
 }
 
 // ── Push constants (from snail-shaders reflection) ──
 
 pub const PushConstants = shaders.reflection.PushConstants;
-
-comptime {
-    if (@sizeOf(PushConstants) != 96) @compileError("PushConstants must be 96 bytes");
-}
 
 const PUSH_CONSTANT_SIZE: u32 = @sizeOf(PushConstants);
 const PUSH_CONSTANT_STAGES = vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -309,6 +322,7 @@ pub const Renderer = struct {
         cmd: vk.VkCommandBuffer,
         desc_set: vk.VkDescriptorSet,
         draw_state: anytype,
+        atlas_page_texels: [2]i32,
         instances: []const snail.render.records.Instance,
         batches: []const snail.render.records.DrawBatch,
     ) RenderError!void {
@@ -354,16 +368,18 @@ pub const Renderer = struct {
 
             vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-            // Build push constants
+            // Build push constants. page_base selects the batch's 256-layer
+            // bank (snail 0.15 flat page storage).
             const pc = PushConstants{
                 .mvp = draw_state.mvp.data,
                 .viewport = .{ w, h },
-                .subpixel_order = draw_state.raster.subpixel_order_int,
+                .subpixel_order = @intCast(draw_state.raster.subpixel_order_int),
                 .output_srgb = if (draw_state.surface.encoding.shader_encodes_srgb) 1 else 0,
-                .layer_base = 0,
+                .page_base = @intCast(batch.page_base),
                 .coverage_exponent = draw_state.raster.coverage_exponent,
                 .dither_scale = draw_state.surface.format.dither_amplitude,
                 .mask_output = if (draw_state.surface.format.has_color) 0 else 1,
+                .atlas_page_texels = atlas_page_texels,
             };
             vk.vkCmdPushConstants(cmd, self.pipeline_layout, PUSH_CONSTANT_STAGES, 0, PUSH_CONSTANT_SIZE, &pc);
 
@@ -575,6 +591,7 @@ pub fn renderToTarget(
     desc_set: vk.VkDescriptorSet,
     frame_slot: u32,
     clear_color: [4]f32,
+    atlas_page_texels: [2]i32,
     instances: []const snail.render.records.Instance,
     batches: []const snail.render.records.DrawBatch,
 ) !void {
@@ -618,7 +635,7 @@ pub fn renderToTarget(
     if (std.c.getenv("SCRGO_GPU_CLEAR_ONLY") == null) {
         self.beginFrame(frame_slot);
         const draw_state = makeDrawState(w, h);
-        self.render(cmd, desc_set, draw_state, instances, batches) catch |err| {
+        self.render(cmd, desc_set, draw_state, atlas_page_texels, instances, batches) catch |err| {
             log.warn(.gpu, "draw record failed", .{ .err = err });
         };
     }

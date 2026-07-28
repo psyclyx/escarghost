@@ -1,9 +1,16 @@
-//! GPU atlas cache: creates and manages the four atlas textures
-//! (curve, band, layer-info, image array) and the descriptor set
-//! that the renderer binds.
+//! GPU atlas cache for snail 0.15's flat page storage.
 //!
-//! Uses snail's atlas_upload.Planner for region planning. The actual
-//! GPU texture creation, staging, and upload is Vulkan-specific.
+//! Curve and band pages live in flat uniform *texel buffers* (curve =
+//! R16G16B16A16_SFLOAT, band = R16G16_UINT) sized by snail's `FlatLayout`;
+//! layer-info and color-image data stay in sampled 2D images. Logical pages
+//! are banked into 256-layer windows — the fragment shader selects a bank via
+//! the per-draw `page_base` push constant (see renderer.zig).
+//!
+//! `upload(atlas)` is synchronous (submitAndWait): it runs snail's
+//! `atlas_upload.Planner` to produce the dirty `Region`s, stages them into one
+//! host buffer, records the copies, submits, waits, and frees the staging.
+//! The planner is persistent, so a binding reuses pages unchanged since the
+//! last upload.
 
 const std = @import("std");
 const snail = @import("snail");
@@ -12,16 +19,15 @@ const Context = @import("context.zig").Context;
 const memtrack = @import("memtrack.zig");
 
 const vk = @import("vulkan.zig").vk;
+const upload_plan = snail.atlas_upload;
 
-const Binding = snail.render.records.Binding;
-const Region = snail.atlas_upload.Region;
+pub const Binding = snail.render.records.Binding;
 
-// Atlas texture dimensions (from snail's format/abi.zig and atlas config)
-const CURVE_TEX_WIDTH: u32 = 4096;
-const BAND_TEX_WIDTH: u32 = 4096;
-const INFO_WIDTH: u32 = 4096;
-const CURVE_WORDS_PER_ROW: u32 = CURVE_TEX_WIDTH * 4; // R16G16B16A16 = 4 u16 words
-const BAND_WORDS_PER_ROW: u32 = BAND_TEX_WIDTH * 2; // R16G16 = 2 u16 words
+const CURVE_FMT = vk.VK_FORMAT_R16G16B16A16_SFLOAT;
+const BAND_FMT = vk.VK_FORMAT_R16G16_UINT;
+const INFO_FMT = vk.VK_FORMAT_R32G32B32A32_SFLOAT;
+const IMAGE_FMT = vk.VK_FORMAT_R8G8B8A8_SRGB;
+const INFO_WIDTH: u32 = upload_plan.INFO_WIDTH;
 
 pub const DeviceAtlasOptions = struct {
     max_bindings: u32 = 16,
@@ -31,485 +37,421 @@ pub const DeviceAtlasOptions = struct {
     max_image_height: u32 = 1024,
 };
 
-pub const DeviceAtlas = struct {
-    ctx: *const Context,
-    options: DeviceAtlasOptions,
-    pool: ?*snail.PagePool = null,
+// ── Descriptor bindings (must match renderer.zig / snail's shader ABI) ──
+pub const CURVE_BINDING: u32 = 0;
+pub const BAND_BINDING: u32 = 1;
+pub const LAYER_INFO_BINDING: u32 = 2;
+pub const IMAGE_BINDING: u32 = 3;
 
-    // GPU images
-    curve_image: vk.VkImage = null,
+pub const DeviceAtlas = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    ctx: *const Context,
+    pool: *snail.PagePool,
+    options: DeviceAtlasOptions,
+
+    sampler_nearest: vk.VkSampler = null,
+    sampler_linear: vk.VkSampler = null,
+    desc_set_layout: vk.VkDescriptorSetLayout = null,
+
+    flat: upload_plan.FlatLayout,
+
+    curve_buffer: vk.VkBuffer = null,
     curve_memory: vk.VkDeviceMemory = null,
-    curve_view: vk.VkImageView = null,
-    band_image: vk.VkImage = null,
+    curve_view: vk.VkBufferView = null,
+    band_buffer: vk.VkBuffer = null,
     band_memory: vk.VkDeviceMemory = null,
-    band_view: vk.VkImageView = null,
+    band_view: vk.VkBufferView = null,
+
     layer_info_image: vk.VkImage = null,
     layer_info_memory: vk.VkDeviceMemory = null,
     layer_info_view: vk.VkImageView = null,
+    layer_info_layout: vk.VkImageLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+
     image_array_image: vk.VkImage = null,
     image_array_memory: vk.VkDeviceMemory = null,
     image_array_view: vk.VkImageView = null,
+    image_array_layout: vk.VkImageLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
 
-    // Descriptor set
     desc_pool: vk.VkDescriptorPool = null,
     desc_set: vk.VkDescriptorSet = null,
-    desc_set_layout: vk.VkDescriptorSetLayout = null,
 
-    // Samplers
-    sampler_nearest: vk.VkSampler = null,
-    sampler_linear: vk.VkSampler = null,
+    // Planner (region/delta computation) — cache-owned backing slices.
+    planner: upload_plan.Planner,
+    plan_gen: []u64,
+    plan_curve: []u32,
+    plan_band: []u32,
+    plan_slots: []upload_plan.Slot,
+    plan_info_free: []upload_plan.Range,
+    plan_image_free: []upload_plan.Range,
+    plan_regions: []upload_plan.Region,
+    plan_info_scratch: []f32,
+    info_scratch_stride: usize,
 
-    // Layout dimensions (set when pool is known)
-    layer_count: u32 = 0,
-    curve_height: u32 = 0,
-    band_height: u32 = 0,
-
-    // Atlas upload planner (created lazily on first upload)
-    planner: ?snail.atlas_upload.OwnedPlanner = null,
-    allocator: std.mem.Allocator = undefined,
-
-    initialized: bool = false,
-
-    pub fn init(ctx: *const Context, allocator: std.mem.Allocator, options: DeviceAtlasOptions) !DeviceAtlas {
-        var self = DeviceAtlas{
-            .ctx = ctx,
-            .options = options,
-            .allocator = allocator,
+    pub fn init(ctx: *const Context, allocator: std.mem.Allocator, pool: *snail.PagePool, options: DeviceAtlasOptions) !Self {
+        const opts: upload_plan.Options = .{
+            .max_bindings = options.max_bindings,
+            .layer_info_height = options.layer_info_height,
+            .max_images = options.max_images,
+            .max_image_width = options.max_image_width,
+            .max_image_height = options.max_image_height,
         };
+        const sz = try upload_plan.sizes(pool, opts);
+        const info_scratch_len = std.math.mul(usize, sz.layer_info_scratch, options.max_bindings) catch return error.InvalidOptions;
 
-        try self.createSamplers();
-        try self.createDescriptorSetLayout();
-        try self.createDescriptorPool();
+        const gen = try allocator.alloc(u64, sz.generation);
+        errdefer allocator.free(gen);
+        const curve_words = try allocator.alloc(u32, sz.curve_words);
+        errdefer allocator.free(curve_words);
+        const band_words = try allocator.alloc(u32, sz.band_words);
+        errdefer allocator.free(band_words);
+        const slots = try allocator.alloc(upload_plan.Slot, sz.bindings);
+        errdefer allocator.free(slots);
+        const info_free = try allocator.alloc(upload_plan.Range, sz.info_free);
+        errdefer allocator.free(info_free);
+        const image_free = try allocator.alloc(upload_plan.Range, sz.image_free);
+        errdefer allocator.free(image_free);
+        const regions = try allocator.alloc(upload_plan.Region, sz.regions);
+        errdefer allocator.free(regions);
+        const info_scratch = try allocator.alloc(f32, info_scratch_len);
+        errdefer allocator.free(info_scratch);
+
+        var self: Self = .{
+            .allocator = allocator,
+            .ctx = ctx,
+            .pool = pool,
+            .options = options,
+            .flat = try upload_plan.FlatLayout.init(pool),
+            .planner = try upload_plan.Planner.init(pool, opts, gen, curve_words, band_words, slots, info_free, image_free),
+            .plan_gen = gen,
+            .plan_curve = curve_words,
+            .plan_band = band_words,
+            .plan_slots = slots,
+            .plan_info_free = info_free,
+            .plan_image_free = image_free,
+            .plan_regions = regions,
+            .plan_info_scratch = info_scratch,
+            .info_scratch_stride = sz.layer_info_scratch,
+        };
+        errdefer self.destroyGpuResources();
+        try self.initSamplersAndLayout();
         return self;
     }
 
-    pub fn deinit(self: *DeviceAtlas) void {
-        if (self.planner) |*p| p.deinit();
+    pub fn deinit(self: *Self) void {
+        self.destroyGpuResources();
         const dev = self.ctx.device;
-        if (self.image_array_view != null) vk.vkDestroyImageView(dev, self.image_array_view, null);
-        if (self.image_array_image != null) vk.vkDestroyImage(dev, self.image_array_image, null);
-        if (self.image_array_memory != null) vk.vkFreeMemory(dev, self.image_array_memory, null);
-        if (self.layer_info_view != null) vk.vkDestroyImageView(dev, self.layer_info_view, null);
-        if (self.layer_info_image != null) vk.vkDestroyImage(dev, self.layer_info_image, null);
-        if (self.layer_info_memory != null) vk.vkFreeMemory(dev, self.layer_info_memory, null);
-        if (self.band_view != null) vk.vkDestroyImageView(dev, self.band_view, null);
-        if (self.band_image != null) vk.vkDestroyImage(dev, self.band_image, null);
-        if (self.band_memory != null) vk.vkFreeMemory(dev, self.band_memory, null);
-        if (self.curve_view != null) vk.vkDestroyImageView(dev, self.curve_view, null);
-        if (self.curve_image != null) vk.vkDestroyImage(dev, self.curve_image, null);
-        if (self.curve_memory != null) vk.vkFreeMemory(dev, self.curve_memory, null);
-        if (self.desc_pool != null) vk.vkDestroyDescriptorPool(dev, self.desc_pool, null);
         if (self.desc_set_layout != null) vk.vkDestroyDescriptorSetLayout(dev, self.desc_set_layout, null);
-        if (self.sampler_nearest != null) vk.vkDestroySampler(dev, self.sampler_nearest, null);
         if (self.sampler_linear != null) vk.vkDestroySampler(dev, self.sampler_linear, null);
+        if (self.sampler_nearest != null) vk.vkDestroySampler(dev, self.sampler_nearest, null);
+        self.allocator.free(self.plan_gen);
+        self.allocator.free(self.plan_curve);
+        self.allocator.free(self.plan_band);
+        self.allocator.free(self.plan_slots);
+        self.allocator.free(self.plan_info_free);
+        self.allocator.free(self.plan_image_free);
+        self.allocator.free(self.plan_regions);
+        self.allocator.free(self.plan_info_scratch);
     }
 
-    fn createSamplers(self: *DeviceAtlas) !void {
-        const nearest_info = vk.VkSamplerCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-            .magFilter = vk.VK_FILTER_NEAREST,
-            .minFilter = vk.VK_FILTER_NEAREST,
-            .mipmapMode = vk.VK_SAMPLER_MIPMAP_MODE_NEAREST,
-            .addressModeU = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .addressModeV = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .addressModeW = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        };
-        if (vk.vkCreateSampler(self.ctx.device, &nearest_info, null, &self.sampler_nearest) != vk.VK_SUCCESS) return error.SamplerCreationFailed;
-
-        const linear_info = vk.VkSamplerCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-            .magFilter = vk.VK_FILTER_LINEAR,
-            .minFilter = vk.VK_FILTER_LINEAR,
-            .mipmapMode = vk.VK_SAMPLER_MIPMAP_MODE_LINEAR,
-            .addressModeU = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .addressModeV = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .addressModeW = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        };
-        if (vk.vkCreateSampler(self.ctx.device, &linear_info, null, &self.sampler_linear) != vk.VK_SUCCESS) return error.SamplerCreationFailed;
-    }
-
-    fn createDescriptorSetLayout(self: *DeviceAtlas) !void {
-        const bindings = [_]vk.VkDescriptorSetLayoutBinding{
-            .{ .binding = 0, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &self.sampler_nearest },
-            .{ .binding = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &self.sampler_nearest },
-            .{ .binding = 2, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &self.sampler_nearest },
-            .{ .binding = 3, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &self.sampler_linear },
-        };
-
-        const layout_info = vk.VkDescriptorSetLayoutCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .bindingCount = bindings.len,
-            .pBindings = &bindings,
-        };
-        if (vk.vkCreateDescriptorSetLayout(self.ctx.device, &layout_info, null, &self.desc_set_layout) != vk.VK_SUCCESS) return error.DescSetLayoutCreationFailed;
-    }
-
-    fn createDescriptorPool(self: *DeviceAtlas) !void {
-        const pool_size = vk.VkDescriptorPoolSize{
-            .type = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 4,
-        };
-        const pool_info = vk.VkDescriptorPoolCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = 1,
-            .poolSizeCount = 1,
-            .pPoolSizes = &pool_size,
-        };
-        if (vk.vkCreateDescriptorPool(self.ctx.device, &pool_info, null, &self.desc_pool) != vk.VK_SUCCESS) return error.DescPoolCreationFailed;
-
-        const alloc_info = vk.VkDescriptorSetAllocateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &self.desc_set_layout,
-        };
-        if (vk.vkAllocateDescriptorSets(self.ctx.device, &alloc_info, &self.desc_set) != vk.VK_SUCCESS) return error.DescSetAllocationFailed;
-    }
-
-    pub fn descriptorSet(self: *const DeviceAtlas) vk.VkDescriptorSet {
+    pub fn descriptorSet(self: *const Self) vk.VkDescriptorSet {
         return self.desc_set;
     }
 
-    pub fn descriptorSetLayout(self: *const DeviceAtlas) vk.VkDescriptorSetLayout {
+    pub fn descriptorSetLayout(self: *const Self) vk.VkDescriptorSetLayout {
         return self.desc_set_layout;
     }
 
-    /// Ensure GPU resources are created for the given page pool config.
-    /// Called lazily on first upload. Idempotent.
-    pub fn ensureGpuResources(self: *DeviceAtlas, pool: *snail.PagePool) !void {
-        if (self.initialized) return;
-
-        self.pool = pool;
-        self.planner = try snail.atlas_upload.OwnedPlanner.init(self.allocator, pool, .{
-            .max_bindings = self.options.max_bindings,
-            .layer_info_height = self.options.layer_info_height,
-            .max_images = self.options.max_images,
-            .max_image_width = self.options.max_image_width,
-            .max_image_height = self.options.max_image_height,
-        });
-        errdefer {
-            self.planner.?.deinit();
-            self.planner = null;
-        }
-
-        const config = pool.config();
-        self.layer_count = config.max_layers;
-        self.curve_height = config.curve_words_per_page / CURVE_WORDS_PER_ROW;
-        self.band_height = config.band_words_per_page / BAND_WORDS_PER_ROW;
-
-        // Curve image: R16G16B16A16_SFLOAT, 2D array
-        self.curve_image = try createImage2DArray(self.ctx, vk.VK_FORMAT_R16G16B16A16_SFLOAT, CURVE_TEX_WIDTH, self.curve_height, self.layer_count, &self.curve_memory);
-        self.curve_view = try createImageView2DArray(self.ctx, self.curve_image, vk.VK_FORMAT_R16G16B16A16_SFLOAT);
-
-        // Band image: R16G16_UINT, 2D array
-        self.band_image = try createImage2DArray(self.ctx, vk.VK_FORMAT_R16G16_UINT, BAND_TEX_WIDTH, self.band_height, self.layer_count, &self.band_memory);
-        self.band_view = try createImageView2DArray(self.ctx, self.band_image, vk.VK_FORMAT_R16G16_UINT);
-
-        // Layer info image: R32G32B32A32_SFLOAT, 2D
-        self.layer_info_image = try createImage2D(self.ctx, vk.VK_FORMAT_R32G32B32A32_SFLOAT, INFO_WIDTH, self.options.layer_info_height, &self.layer_info_memory);
-        self.layer_info_view = try createImageView2D(self.ctx, self.layer_info_image, vk.VK_FORMAT_R32G32B32A32_SFLOAT);
-
-        // Image array: R8G8B8A8_SRGB, 2D array (only if max_images > 0)
-        if (self.options.max_images > 0) {
-            self.image_array_image = try createImage2DArray(self.ctx, vk.VK_FORMAT_R8G8B8A8_SRGB, self.options.max_image_width, self.options.max_image_height, self.options.max_images, &self.image_array_memory);
-            self.image_array_view = try createImageView2DArray(self.ctx, self.image_array_image, vk.VK_FORMAT_R8G8B8A8_SRGB);
-        }
-
-        // Transition all images to SHADER_READ_ONLY_OPTIMAL
-        try self.transitionInitialLayouts();
-
-        // Update descriptor set
-        try self.updateDescriptorSet();
-
-        self.initialized = true;
-        log.info(.gpu, "atlas gpu resources ready", .{
-            .layers = self.layer_count,
-            .curve_h = self.curve_height,
-            .band_h = self.band_height,
-        });
+    /// Fixed curve/band page strides (texels) for the flat-buffer shader ABI.
+    pub fn atlasPageTexels(self: *const Self) [2]i32 {
+        return .{ @intCast(self.flat.curve_page_texels), @intCast(self.flat.band_page_texels) };
     }
 
-    fn transitionInitialLayouts(self: *DeviceAtlas) !void {
-        const cmd = try self.ctx.allocCommandBuffer();
-        defer self.ctx.freeCommandBuffer(cmd);
+    /// Plan + upload `atlas` synchronously; returns the binding to emit with.
+    pub fn upload(self: *Self, atlas: *const snail.Atlas) !Binding {
+        try self.ensureGpuResources();
 
-        const begin_info = vk.VkCommandBufferBeginInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        };
-        if (vk.vkBeginCommandBuffer(cmd, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandFailed;
+        var len: usize = 0;
+        const info_scratch = self.plan_info_scratch[0..self.info_scratch_stride];
+        const binding = try self.planner.plan(atlas, self.plan_regions, &len, info_scratch);
+        errdefer _ = self.planner.release(binding);
+        const regions = self.plan_regions[0..len];
 
-        const images = [_]vk.VkImage{ self.curve_image, self.band_image, self.layer_info_image };
-        for (images) |img| {
-            if (img == null) continue;
-            const barrier = vk.VkImageMemoryBarrier{
-                .sType = vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .oldLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
-                .newLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-                .image = img,
-                .subresourceRange = .{
-                    .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = vk.VK_REMAINING_ARRAY_LAYERS,
-                },
-                .srcAccessMask = 0,
-                .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
-            };
-            vk.vkCmdPipelineBarrier(cmd, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
-        }
-
-        if (self.image_array_image != null) {
-            const barrier = vk.VkImageMemoryBarrier{
-                .sType = vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .oldLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
-                .newLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-                .image = self.image_array_image,
-                .subresourceRange = .{
-                    .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = vk.VK_REMAINING_ARRAY_LAYERS,
-                },
-                .srcAccessMask = 0,
-                .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
-            };
-            vk.vkCmdPipelineBarrier(cmd, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
-        }
-
-        _ = vk.vkEndCommandBuffer(cmd);
-        try self.ctx.submitAndWait(cmd);
-    }
-
-    fn updateDescriptorSet(self: *DeviceAtlas) !void {
-        var image_infos: [4]vk.VkDescriptorImageInfo = undefined;
-        image_infos[0] = .{ .sampler = self.sampler_nearest, .imageView = self.curve_view, .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        image_infos[1] = .{ .sampler = self.sampler_nearest, .imageView = self.band_view, .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        image_infos[2] = .{ .sampler = self.sampler_nearest, .imageView = self.layer_info_view, .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        image_infos[3] = .{
-            .sampler = self.sampler_linear,
-            .imageView = if (self.image_array_view != null) self.image_array_view else self.curve_view,
-            .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        };
-
-        var writes: [4]vk.VkWriteDescriptorSet = undefined;
-        for (&writes, 0..) |*w, i| {
-            w.* = .{
-                .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = self.desc_set,
-                .dstBinding = @intCast(i),
-                .descriptorCount = 1,
-                .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .pImageInfo = &image_infos[i],
-            };
-        }
-        vk.vkUpdateDescriptorSets(self.ctx.device, writes.len, &writes, 0, null);
-    }
-
-    /// Plan and upload `atlas` into the GPU textures, returning the binding
-    /// `emit` must reference. Lazily creates GPU resources. Caller owns the
-    /// returned binding's lifetime (release via `releaseBinding`).
-    pub fn upload(self: *DeviceAtlas, pool: *snail.PagePool, atlas: *const snail.Atlas) !Binding {
-        try self.ensureGpuResources(pool);
-        const planner = &self.planner.?;
-        const plan = try planner.plan(atlas);
-        errdefer _ = planner.release(plan.binding);
-        try self.applyRegions(plan.regions);
-        return plan.binding;
-    }
-
-    /// Release a binding previously returned by `upload`.
-    pub fn releaseBinding(self: *DeviceAtlas, binding: Binding) void {
-        if (self.planner) |*p| _ = p.release(binding);
-    }
-
-    /// Stage every planned region into one host-visible buffer and copy it
-    /// into the four atlas textures in a single transfer submit.
-    fn applyRegions(self: *DeviceAtlas, regions: []const Region) !void {
-        if (regions.len == 0) return;
         var total: usize = 0;
-        for (regions) |r| total += r.src.len;
-        if (total == 0) return;
+        for (regions) |r| total = std.math.add(usize, total, r.src.len) catch return error.UploadSizeOverflow;
+        if (total == 0) return binding; // everything already resident
 
-        var staging = try StagingBuffer.create(self.ctx, total);
-        defer staging.destroy(self.ctx.device);
-
+        // Stage every region source into one host-visible buffer.
+        var staging_buf: vk.VkBuffer = null;
+        var staging_mem: vk.VkDeviceMemory = null;
+        try createBuffer(self.ctx, total, vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &staging_buf, &staging_mem);
+        defer {
+            vk.vkDestroyBuffer(self.ctx.device, staging_buf, null);
+            vk.vkFreeMemory(self.ctx.device, staging_mem, null);
+        }
+        var mapped: ?*anyopaque = null;
+        if (vk.vkMapMemory(self.ctx.device, staging_mem, 0, total, 0, &mapped) != vk.VK_SUCCESS) {
+            self.planner.invalidateUploads();
+            return error.VulkanError;
+        }
+        const dst: [*]u8 = @ptrCast(mapped.?);
         const offsets = try self.allocator.alloc(usize, regions.len);
         defer self.allocator.free(offsets);
-
-        var cursor: usize = 0;
-        for (regions, 0..) |r, i| {
-            @memcpy(staging.mapped[cursor..][0..r.src.len], r.src);
-            offsets[i] = cursor;
-            cursor += r.src.len;
+        {
+            var cursor: usize = 0;
+            for (regions, 0..) |r, i| {
+                @memcpy(dst[cursor..][0..r.src.len], r.src);
+                offsets[i] = cursor;
+                cursor += r.src.len;
+            }
         }
+        vk.vkUnmapMemory(self.ctx.device, staging_mem);
 
+        // Record copies.
         const cmd = try self.ctx.allocCommandBuffer();
         defer self.ctx.freeCommandBuffer(cmd);
-
-        const begin_info = vk.VkCommandBufferBeginInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        };
-        if (vk.vkBeginCommandBuffer(cmd, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandFailed;
+        const begin = vk.VkCommandBufferBeginInfo{ .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (vk.vkBeginCommandBuffer(cmd, &begin) != vk.VK_SUCCESS) return error.VulkanError;
 
         var has_curve = false;
         var has_band = false;
-        var has_info = false;
         var has_image = false;
+        var has_info = false;
         for (regions) |r| switch (r.target) {
             .curve => has_curve = true,
             .band => has_band = true,
-            .layer_info => has_info = true,
             .image => has_image = true,
+            .layer_info => has_info = true,
         };
 
-        if (has_curve) transitionAtlasImage(cmd, self.curve_image, self.layer_count, .to_transfer);
-        if (has_band) transitionAtlasImage(cmd, self.band_image, self.layer_count, .to_transfer);
-        if (has_info) transitionAtlasImage(cmd, self.layer_info_image, 1, .to_transfer);
-        if (has_image) transitionAtlasImage(cmd, self.image_array_image, self.options.max_images, .to_transfer);
+        if (has_image) transitionImageLayout(cmd, self.image_array_image, @max(1, self.options.max_images), self.image_array_layout, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        if (has_info) transitionImageLayout(cmd, self.layer_info_image, 1, self.layer_info_layout, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
         for (regions, 0..) |r, i| {
-            const dst_image = switch (r.target) {
-                .curve => self.curve_image,
-                .band => self.band_image,
-                .layer_info => self.layer_info_image,
-                .image => self.image_array_image,
-            };
-            if (dst_image == null) continue;
-            const layer: u32 = if (r.target == .layer_info) 0 else r.layer;
-            const copy = vk.VkBufferImageCopy{
-                .bufferOffset = @intCast(offsets[i]),
-                .bufferRowLength = 0,
-                .bufferImageHeight = 0,
-                .imageSubresource = .{
-                    .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT,
-                    .mipLevel = 0,
-                    .baseArrayLayer = layer,
-                    .layerCount = 1,
+            switch (r.target) {
+                .curve, .band => {
+                    const copy = (try self.flat.translate(r)).?;
+                    const region = vk.VkBufferCopy{ .srcOffset = @intCast(offsets[i]), .dstOffset = copy.byte_offset, .size = @intCast(r.src.len) };
+                    const dst_buf = if (r.target == .curve) self.curve_buffer else self.band_buffer;
+                    vk.vkCmdCopyBuffer(cmd, staging_buf, dst_buf, 1, &region);
                 },
-                .imageOffset = .{ .x = @intCast(r.col_base), .y = @intCast(r.row_base), .z = 0 },
-                .imageExtent = .{ .width = r.width, .height = r.height, .depth = 1 },
-            };
-            vk.vkCmdCopyBufferToImage(cmd, staging.buffer, dst_image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        }
-
-        if (has_curve) transitionAtlasImage(cmd, self.curve_image, self.layer_count, .to_shader);
-        if (has_band) transitionAtlasImage(cmd, self.band_image, self.layer_count, .to_shader);
-        if (has_info) transitionAtlasImage(cmd, self.layer_info_image, 1, .to_shader);
-        if (has_image) transitionAtlasImage(cmd, self.image_array_image, self.options.max_images, .to_shader);
-
-        if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.EndCommandFailed;
-        try self.ctx.submitAndWait(cmd);
-    }
-};
-
-const TransitionDir = enum { to_transfer, to_shader };
-
-fn transitionAtlasImage(cmd: vk.VkCommandBuffer, image: vk.VkImage, layers: u32, dir: TransitionDir) void {
-    if (image == null) return;
-    const to_transfer = dir == .to_transfer;
-    const barrier = vk.VkImageMemoryBarrier{
-        .sType = vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .oldLayout = if (to_transfer) vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL else vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .newLayout = if (to_transfer) vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL else vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-        .image = image,
-        .subresourceRange = .{
-            .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = layers,
-        },
-        .srcAccessMask = if (to_transfer) vk.VK_ACCESS_SHADER_READ_BIT else vk.VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = if (to_transfer) vk.VK_ACCESS_TRANSFER_WRITE_BIT else vk.VK_ACCESS_SHADER_READ_BIT,
-    };
-    const src_stage: vk.VkPipelineStageFlags = if (to_transfer) vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT else vk.VK_PIPELINE_STAGE_TRANSFER_BIT;
-    const dst_stage: vk.VkPipelineStageFlags = if (to_transfer) vk.VK_PIPELINE_STAGE_TRANSFER_BIT else vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    vk.vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, null, 0, null, 1, &barrier);
-}
-
-/// Transient host-visible upload buffer, mapped for the duration of one
-/// atlas upload.
-const StagingBuffer = struct {
-    buffer: vk.VkBuffer,
-    memory: vk.VkDeviceMemory,
-    mapped: [*]u8,
-    alloc_bytes: usize,
-
-    fn create(ctx: *const Context, size: usize) !StagingBuffer {
-        const buffer_info = vk.VkBufferCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = @intCast(size),
-            .usage = vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
-        };
-        var buffer: vk.VkBuffer = null;
-        if (vk.vkCreateBuffer(ctx.device, &buffer_info, null, &buffer) != vk.VK_SUCCESS) return error.BufferCreationFailed;
-        errdefer vk.vkDestroyBuffer(ctx.device, buffer, null);
-
-        var mem_reqs: vk.VkMemoryRequirements = undefined;
-        vk.vkGetBufferMemoryRequirements(ctx.device, buffer, &mem_reqs);
-
-        var mem_props: vk.VkPhysicalDeviceMemoryProperties = undefined;
-        vk.vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
-        var mem_type: u32 = 0;
-        for (0..mem_props.memoryTypeCount) |i| {
-            if (mem_reqs.memoryTypeBits & (@as(u32, 1) << @intCast(i)) != 0 and
-                mem_props.memoryTypes[i].propertyFlags & (vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == (vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-            {
-                mem_type = @intCast(i);
-                break;
+                .image => {
+                    const region = std.mem.zeroInit(vk.VkBufferImageCopy, .{
+                        .bufferOffset = @as(vk.VkDeviceSize, @intCast(offsets[i])),
+                        .imageSubresource = vk.VkImageSubresourceLayers{ .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = r.layer, .layerCount = 1 },
+                        .imageExtent = vk.VkExtent3D{ .width = r.width, .height = r.height, .depth = 1 },
+                    });
+                    vk.vkCmdCopyBufferToImage(cmd, staging_buf, self.image_array_image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                },
+                .layer_info => {
+                    const region = std.mem.zeroInit(vk.VkBufferImageCopy, .{
+                        .bufferOffset = @as(vk.VkDeviceSize, @intCast(offsets[i])),
+                        .imageSubresource = vk.VkImageSubresourceLayers{ .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+                        .imageOffset = vk.VkOffset3D{ .x = @intCast(r.col_base), .y = @intCast(r.row_base), .z = 0 },
+                        .imageExtent = vk.VkExtent3D{ .width = r.width, .height = r.height, .depth = 1 },
+                    });
+                    vk.vkCmdCopyBufferToImage(cmd, staging_buf, self.layer_info_image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                },
             }
         }
 
-        const alloc_info = vk.VkMemoryAllocateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = mem_reqs.size,
-            .memoryTypeIndex = mem_type,
-        };
-        var memory: vk.VkDeviceMemory = null;
-        if (vk.vkAllocateMemory(ctx.device, &alloc_info, null, &memory) != vk.VK_SUCCESS) return error.MemoryAllocationFailed;
-        errdefer vk.vkFreeMemory(ctx.device, memory, null);
+        // Barrier the texel buffers transfer→shader; images back to sampled.
+        var bb: [2]vk.VkBufferMemoryBarrier = undefined;
+        var bbn: u32 = 0;
+        if (has_curve) {
+            bb[bbn] = bufBarrier(self.curve_buffer);
+            bbn += 1;
+        }
+        if (has_band) {
+            bb[bbn] = bufBarrier(self.band_buffer);
+            bbn += 1;
+        }
+        if (bbn > 0) vk.vkCmdPipelineBarrier(cmd, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, bbn, &bb, 0, null);
+        if (has_image) {
+            transitionImageLayout(cmd, self.image_array_image, @max(1, self.options.max_images), vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            self.image_array_layout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        if (has_info) {
+            transitionImageLayout(cmd, self.layer_info_image, 1, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            self.layer_info_layout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
 
-        if (vk.vkBindBufferMemory(ctx.device, buffer, memory, 0) != vk.VK_SUCCESS) return error.BindBufferFailed;
-
-        var mapped: ?*anyopaque = null;
-        if (vk.vkMapMemory(ctx.device, memory, 0, @intCast(size), 0, &mapped) != vk.VK_SUCCESS) return error.MapFailed;
-
-        memtrack.staging.onAlloc(mem_reqs.size);
-        return .{ .buffer = buffer, .memory = memory, .mapped = @ptrCast(mapped.?), .alloc_bytes = mem_reqs.size };
+        if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.VulkanError;
+        try self.ctx.submitAndWait(cmd);
+        return binding;
     }
 
-    fn destroy(self: *StagingBuffer, device: vk.VkDevice) void {
-        vk.vkUnmapMemory(device, self.memory);
-        vk.vkDestroyBuffer(device, self.buffer, null);
-        vk.vkFreeMemory(device, self.memory, null);
-        memtrack.staging.onFree(self.alloc_bytes);
+    pub fn releaseBinding(self: *Self, binding: Binding) void {
+        _ = self.planner.release(binding);
+    }
+
+    // ── Resident resources ──
+
+    fn ensureGpuResources(self: *Self) !void {
+        if (self.desc_set != null) return;
+        errdefer self.destroyGpuResources();
+        try self.createPoolBuffers();
+        try self.createSampledImages();
+        try self.createDescriptorSet();
+    }
+
+    fn createPoolBuffers(self: *Self) !void {
+        const usage = vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+        try createBuffer(self.ctx, self.flat.curveByteSize(), usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.curve_buffer, &self.curve_memory);
+        try createBuffer(self.ctx, self.flat.bandByteSize(), usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.band_buffer, &self.band_memory);
+        self.curve_view = try createBufferView(self.ctx, self.curve_buffer, CURVE_FMT, self.flat.curveByteSize());
+        self.band_view = try createBufferView(self.ctx, self.band_buffer, BAND_FMT, self.flat.bandByteSize());
+        memtrack.atlas_image.onAlloc(self.flat.curveByteSize() + self.flat.bandByteSize());
+    }
+
+    fn createSampledImages(self: *Self) !void {
+        self.layer_info_image = try createImage2D(self.ctx, INFO_WIDTH, @max(1, self.options.layer_info_height), INFO_FMT);
+        self.layer_info_memory = try allocateImageMemory(self.ctx, self.layer_info_image);
+        if (vk.vkBindImageMemory(self.ctx.device, self.layer_info_image, self.layer_info_memory, 0) != vk.VK_SUCCESS) return error.VulkanError;
+        self.layer_info_view = try createImageView2D(self.ctx, self.layer_info_image, INFO_FMT);
+
+        self.image_array_image = try createImage2DArray(self.ctx, @max(1, self.options.max_image_width), @max(1, self.options.max_image_height), @max(1, self.options.max_images), IMAGE_FMT);
+        self.image_array_memory = try allocateImageMemory(self.ctx, self.image_array_image);
+        if (vk.vkBindImageMemory(self.ctx.device, self.image_array_image, self.image_array_memory, 0) != vk.VK_SUCCESS) return error.VulkanError;
+        self.image_array_view = try createImageView(self.ctx, self.image_array_image, IMAGE_FMT, @max(1, self.options.max_images));
+    }
+
+    fn createDescriptorSet(self: *Self) !void {
+        const dev = self.ctx.device;
+        const sizes = [2]vk.VkDescriptorPoolSize{
+            .{ .type = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .descriptorCount = 2 },
+            .{ .type = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 2 },
+        };
+        const dp = std.mem.zeroInit(vk.VkDescriptorPoolCreateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = sizes.len, .pPoolSizes = &sizes });
+        if (vk.vkCreateDescriptorPool(dev, &dp, null, &self.desc_pool) != vk.VK_SUCCESS) return error.VulkanError;
+
+        var ds = std.mem.zeroes(vk.VkDescriptorSetAllocateInfo);
+        ds.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ds.descriptorPool = self.desc_pool;
+        ds.descriptorSetCount = 1;
+        ds.pSetLayouts = @ptrCast(&self.desc_set_layout);
+        if (vk.vkAllocateDescriptorSets(dev, &ds, &self.desc_set) != vk.VK_SUCCESS) return error.VulkanError;
+
+        const image_infos = [2]vk.VkDescriptorImageInfo{
+            .{ .sampler = self.sampler_nearest, .imageView = self.layer_info_view, .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+            .{ .sampler = self.sampler_linear, .imageView = self.image_array_view, .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        };
+        var texel_views = [2]vk.VkBufferView{ self.curve_view, self.band_view };
+        var writes = [4]vk.VkWriteDescriptorSet{
+            std.mem.zeroInit(vk.VkWriteDescriptorSet, .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = self.desc_set, .dstBinding = CURVE_BINDING, .descriptorCount = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &texel_views[0] }),
+            std.mem.zeroInit(vk.VkWriteDescriptorSet, .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = self.desc_set, .dstBinding = BAND_BINDING, .descriptorCount = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &texel_views[1] }),
+            std.mem.zeroInit(vk.VkWriteDescriptorSet, .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = self.desc_set, .dstBinding = LAYER_INFO_BINDING, .descriptorCount = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image_infos[0] }),
+            std.mem.zeroInit(vk.VkWriteDescriptorSet, .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = self.desc_set, .dstBinding = IMAGE_BINDING, .descriptorCount = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image_infos[1] }),
+        };
+        vk.vkUpdateDescriptorSets(dev, 4, &writes, 0, null);
+    }
+
+    fn initSamplersAndLayout(self: *Self) !void {
+        self.sampler_nearest = try createSampler(self.ctx, vk.VK_FILTER_NEAREST);
+        self.sampler_linear = try createSampler(self.ctx, vk.VK_FILTER_LINEAR);
+
+        var bindings: [4]vk.VkDescriptorSetLayoutBinding = undefined;
+        bindings[CURVE_BINDING] = std.mem.zeroInit(vk.VkDescriptorSetLayoutBinding, .{ .binding = CURVE_BINDING, .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT });
+        bindings[BAND_BINDING] = std.mem.zeroInit(vk.VkDescriptorSetLayoutBinding, .{ .binding = BAND_BINDING, .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT });
+        bindings[LAYER_INFO_BINDING] = std.mem.zeroInit(vk.VkDescriptorSetLayoutBinding, .{ .binding = LAYER_INFO_BINDING, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &self.sampler_nearest });
+        bindings[IMAGE_BINDING] = std.mem.zeroInit(vk.VkDescriptorSetLayoutBinding, .{ .binding = IMAGE_BINDING, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &self.sampler_linear });
+        const dsl = std.mem.zeroInit(vk.VkDescriptorSetLayoutCreateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = &bindings });
+        if (vk.vkCreateDescriptorSetLayout(self.ctx.device, &dsl, null, &self.desc_set_layout) != vk.VK_SUCCESS) return error.VulkanError;
+    }
+
+    fn destroyGpuResources(self: *Self) void {
+        const dev = self.ctx.device;
+        if (dev == null) return;
+        if (self.desc_pool != null) vk.vkDestroyDescriptorPool(dev, self.desc_pool, null);
+        self.desc_pool = null;
+        self.desc_set = null;
+        if (self.curve_view != null) vk.vkDestroyBufferView(dev, self.curve_view, null);
+        if (self.curve_buffer != null) vk.vkDestroyBuffer(dev, self.curve_buffer, null);
+        if (self.curve_memory != null) vk.vkFreeMemory(dev, self.curve_memory, null);
+        if (self.band_view != null) vk.vkDestroyBufferView(dev, self.band_view, null);
+        if (self.band_buffer != null) vk.vkDestroyBuffer(dev, self.band_buffer, null);
+        if (self.band_memory != null) vk.vkFreeMemory(dev, self.band_memory, null);
+        self.curve_view = null;
+        self.curve_buffer = null;
+        self.curve_memory = null;
+        self.band_view = null;
+        self.band_buffer = null;
+        self.band_memory = null;
+        if (self.layer_info_view != null) vk.vkDestroyImageView(dev, self.layer_info_view, null);
+        if (self.layer_info_image != null) vk.vkDestroyImage(dev, self.layer_info_image, null);
+        if (self.layer_info_memory != null) vk.vkFreeMemory(dev, self.layer_info_memory, null);
+        if (self.image_array_view != null) vk.vkDestroyImageView(dev, self.image_array_view, null);
+        if (self.image_array_image != null) vk.vkDestroyImage(dev, self.image_array_image, null);
+        if (self.image_array_memory != null) vk.vkFreeMemory(dev, self.image_array_memory, null);
+        self.layer_info_view = null;
+        self.layer_info_image = null;
+        self.layer_info_memory = null;
+        self.image_array_view = null;
+        self.image_array_image = null;
+        self.image_array_memory = null;
+        self.layer_info_layout = vk.VK_IMAGE_LAYOUT_UNDEFINED;
+        self.image_array_layout = vk.VK_IMAGE_LAYOUT_UNDEFINED;
     }
 };
 
-// ── Image creation helpers ──
-
-fn createImage2DArray(ctx: *const Context, format: vk.VkFormat, width: u32, height: u32, layers: u32, out_memory: *vk.VkDeviceMemory) !vk.VkImage {
-    return createImage(ctx, format, width, height, layers, true, out_memory);
+fn bufBarrier(buffer: vk.VkBuffer) vk.VkBufferMemoryBarrier {
+    return std.mem.zeroInit(vk.VkBufferMemoryBarrier, .{
+        .sType = vk.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+        .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer,
+        .offset = 0,
+        .size = vk.VK_WHOLE_SIZE,
+    });
 }
 
-fn createImage2D(ctx: *const Context, format: vk.VkFormat, width: u32, height: u32, out_memory: *vk.VkDeviceMemory) !vk.VkImage {
-    return createImage(ctx, format, width, height, 1, false, out_memory);
+// ── Vulkan helpers (adapted from snail's demo device.zig, on our Context) ──
+
+fn findMemoryType(ctx: *const Context, type_filter: u32, properties: vk.VkMemoryPropertyFlags) ?u32 {
+    var mp: vk.VkPhysicalDeviceMemoryProperties = undefined;
+    vk.vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mp);
+    for (0..mp.memoryTypeCount) |i| {
+        if (type_filter & (@as(u32, 1) << @intCast(i)) != 0 and (mp.memoryTypes[i].propertyFlags & properties) == properties) return @intCast(i);
+    }
+    return null;
 }
 
-fn createImage(ctx: *const Context, format: vk.VkFormat, width: u32, height: u32, layers: u32, _: bool, out_memory: *vk.VkDeviceMemory) !vk.VkImage {
-    const usage = vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT | vk.VK_IMAGE_USAGE_SAMPLED_BIT;
-    const create_info = vk.VkImageCreateInfo{
+fn createBuffer(ctx: *const Context, size: vk.VkDeviceSize, usage: vk.VkBufferUsageFlags, properties: vk.VkMemoryPropertyFlags, buffer: *vk.VkBuffer, memory: *vk.VkDeviceMemory) !void {
+    const ci = std.mem.zeroInit(vk.VkBufferCreateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage, .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE });
+    var buf: vk.VkBuffer = null;
+    if (vk.vkCreateBuffer(ctx.device, &ci, null, &buf) != vk.VK_SUCCESS) return error.VulkanError;
+    errdefer vk.vkDestroyBuffer(ctx.device, buf, null);
+    var req: vk.VkMemoryRequirements = undefined;
+    vk.vkGetBufferMemoryRequirements(ctx.device, buf, &req);
+    const ai = std.mem.zeroInit(vk.VkMemoryAllocateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = findMemoryType(ctx, req.memoryTypeBits, properties) orelse return error.NoSuitableMemory });
+    var mem: vk.VkDeviceMemory = null;
+    if (vk.vkAllocateMemory(ctx.device, &ai, null, &mem) != vk.VK_SUCCESS) return error.VulkanError;
+    errdefer vk.vkFreeMemory(ctx.device, mem, null);
+    if (vk.vkBindBufferMemory(ctx.device, buf, mem, 0) != vk.VK_SUCCESS) return error.VulkanError;
+    buffer.* = buf;
+    memory.* = mem;
+}
+
+fn createBufferView(ctx: *const Context, buffer: vk.VkBuffer, format: vk.VkFormat, range: vk.VkDeviceSize) !vk.VkBufferView {
+    const ci = std.mem.zeroInit(vk.VkBufferViewCreateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buffer, .format = format, .offset = 0, .range = range });
+    var view: vk.VkBufferView = null;
+    if (vk.vkCreateBufferView(ctx.device, &ci, null, &view) != vk.VK_SUCCESS) return error.VulkanError;
+    return view;
+}
+
+fn createImage2D(ctx: *const Context, width: u32, height: u32, format: vk.VkFormat) !vk.VkImage {
+    return createImageInner(ctx, width, height, 1, format);
+}
+
+fn createImage2DArray(ctx: *const Context, width: u32, height: u32, layers: u32, format: vk.VkFormat) !vk.VkImage {
+    return createImageInner(ctx, width, height, layers, format);
+}
+
+fn createImageInner(ctx: *const Context, width: u32, height: u32, layers: u32, format: vk.VkFormat) !vk.VkImage {
+    const ci = std.mem.zeroInit(vk.VkImageCreateInfo, .{
         .sType = vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = vk.VK_IMAGE_TYPE_2D,
         .format = format,
@@ -518,73 +460,73 @@ fn createImage(ctx: *const Context, format: vk.VkFormat, width: u32, height: u32
         .arrayLayers = layers,
         .samples = vk.VK_SAMPLE_COUNT_1_BIT,
         .tiling = vk.VK_IMAGE_TILING_OPTIMAL,
-        .usage = usage,
+        .usage = vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT | vk.VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-
+    });
     var image: vk.VkImage = null;
-    if (vk.vkCreateImage(ctx.device, &create_info, null, &image) != vk.VK_SUCCESS) return error.ImageCreationFailed;
-    errdefer vk.vkDestroyImage(ctx.device, image, null);
-
-    var mem_reqs: vk.VkMemoryRequirements = undefined;
-    vk.vkGetImageMemoryRequirements(ctx.device, image, &mem_reqs);
-
-    // Find DEVICE_LOCAL memory type
-    var mem_props: vk.VkPhysicalDeviceMemoryProperties = undefined;
-    vk.vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
-    var memory_type_index: u32 = 0;
-    for (0..mem_props.memoryTypeCount) |i| {
-        if (mem_reqs.memoryTypeBits & (@as(u32, 1) << @intCast(i)) != 0 and
-            mem_props.memoryTypes[i].propertyFlags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0)
-        {
-            memory_type_index = @intCast(i);
-            break;
-        }
-    }
-
-    const alloc_info = vk.VkMemoryAllocateInfo{
-        .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = mem_reqs.size,
-        .memoryTypeIndex = memory_type_index,
-    };
-    if (vk.vkAllocateMemory(ctx.device, &alloc_info, null, out_memory) != vk.VK_SUCCESS) return error.MemoryAllocationFailed;
-    errdefer vk.vkFreeMemory(ctx.device, out_memory.*, null);
-    memtrack.atlas_image.onAlloc(mem_reqs.size);
-
-    if (vk.vkBindImageMemory(ctx.device, image, out_memory.*, 0) != vk.VK_SUCCESS) return error.BindImageFailed;
+    if (vk.vkCreateImage(ctx.device, &ci, null, &image) != vk.VK_SUCCESS) return error.VulkanError;
     return image;
 }
 
-fn createImageView2DArray(ctx: *const Context, image: vk.VkImage, format: vk.VkFormat) !vk.VkImageView {
-    return createImageView(ctx, image, format, vk.VK_IMAGE_VIEW_TYPE_2D_ARRAY, vk.VK_REMAINING_ARRAY_LAYERS);
+fn allocateImageMemory(ctx: *const Context, image: vk.VkImage) !vk.VkDeviceMemory {
+    var req: vk.VkMemoryRequirements = undefined;
+    vk.vkGetImageMemoryRequirements(ctx.device, image, &req);
+    const ai = std.mem.zeroInit(vk.VkMemoryAllocateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = findMemoryType(ctx, req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) orelse return error.NoSuitableMemory });
+    var mem: vk.VkDeviceMemory = null;
+    if (vk.vkAllocateMemory(ctx.device, &ai, null, &mem) != vk.VK_SUCCESS) return error.VulkanError;
+    return mem;
+}
+
+fn createImageView(ctx: *const Context, image: vk.VkImage, format: vk.VkFormat, layer_count: u32) !vk.VkImageView {
+    const ci = std.mem.zeroInit(vk.VkImageViewCreateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = vk.VK_IMAGE_VIEW_TYPE_2D_ARRAY, .format = format, .subresourceRange = .{ .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = layer_count } });
+    var view: vk.VkImageView = null;
+    if (vk.vkCreateImageView(ctx.device, &ci, null, &view) != vk.VK_SUCCESS) return error.VulkanError;
+    return view;
 }
 
 fn createImageView2D(ctx: *const Context, image: vk.VkImage, format: vk.VkFormat) !vk.VkImageView {
-    return createImageView(ctx, image, format, vk.VK_IMAGE_VIEW_TYPE_2D, 1);
+    const ci = std.mem.zeroInit(vk.VkImageViewCreateInfo, .{ .sType = vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = vk.VK_IMAGE_VIEW_TYPE_2D, .format = format, .subresourceRange = .{ .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 } });
+    var view: vk.VkImageView = null;
+    if (vk.vkCreateImageView(ctx.device, &ci, null, &view) != vk.VK_SUCCESS) return error.VulkanError;
+    return view;
 }
 
-fn createImageView(ctx: *const Context, image: vk.VkImage, format: vk.VkFormat, view_type: vk.VkImageViewType, layer_count: u32) !vk.VkImageView {
-    const view_info = vk.VkImageViewCreateInfo{
-        .sType = vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = image,
-        .viewType = view_type,
-        .format = format,
-        .components = .{
-            .r = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
-            .g = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
-            .b = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
-            .a = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
-        },
-        .subresourceRange = .{
-            .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = layer_count,
-        },
-    };
-    var view: vk.VkImageView = null;
-    if (vk.vkCreateImageView(ctx.device, &view_info, null, &view) != vk.VK_SUCCESS) return error.ImageViewCreationFailed;
-    return view;
+fn createSampler(ctx: *const Context, filter: vk.VkFilter) !vk.VkSampler {
+    const ci = std.mem.zeroInit(vk.VkSamplerCreateInfo, .{
+        .sType = vk.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = @as(c_uint, @intCast(filter)),
+        .minFilter = @as(c_uint, @intCast(filter)),
+        .addressModeU = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .mipmapMode = @as(c_uint, @intCast(if (filter == vk.VK_FILTER_LINEAR) vk.VK_SAMPLER_MIPMAP_MODE_LINEAR else vk.VK_SAMPLER_MIPMAP_MODE_NEAREST)),
+    });
+    var s: vk.VkSampler = null;
+    if (vk.vkCreateSampler(ctx.device, &ci, null, &s) != vk.VK_SUCCESS) return error.VulkanError;
+    return s;
+}
+
+fn transitionImageLayout(cmd: vk.VkCommandBuffer, image: vk.VkImage, layer_count: u32, old_layout: vk.VkImageLayout, new_layout: vk.VkImageLayout, shader_stages: vk.VkPipelineStageFlags) void {
+    var src_stage: vk.VkPipelineStageFlags = 0;
+    var dst_stage: vk.VkPipelineStageFlags = 0;
+    var src_access: vk.VkAccessFlags = 0;
+    var dst_access: vk.VkAccessFlags = 0;
+    if (old_layout == vk.VK_IMAGE_LAYOUT_UNDEFINED and new_layout == vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        dst_access = vk.VK_ACCESS_TRANSFER_WRITE_BIT;
+        src_stage = vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dst_stage = vk.VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (old_layout == vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL and new_layout == vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        src_access = vk.VK_ACCESS_SHADER_READ_BIT;
+        dst_access = vk.VK_ACCESS_TRANSFER_WRITE_BIT;
+        src_stage = shader_stages;
+        dst_stage = vk.VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (old_layout == vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL and new_layout == vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        src_access = vk.VK_ACCESS_TRANSFER_WRITE_BIT;
+        dst_access = vk.VK_ACCESS_SHADER_READ_BIT;
+        src_stage = vk.VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_stage = shader_stages;
+    } else unreachable;
+    const barrier = std.mem.zeroInit(vk.VkImageMemoryBarrier, .{ .sType = vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = src_access, .dstAccessMask = dst_access, .oldLayout = old_layout, .newLayout = new_layout, .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED, .image = image, .subresourceRange = .{ .aspectMask = vk.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = layer_count } });
+    vk.vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, null, 0, null, 1, &barrier);
 }

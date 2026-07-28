@@ -441,9 +441,15 @@ pub const GpuWorker = struct {
                         continue;
                     }
 
-                    // Create renderer + device atlas
+                    // Create renderer + device atlas (needs the shared page pool
+                    // for snail 0.15's flat-buffer sizing).
                     if (device_atlas == null) {
-                        device_atlas = vk.DeviceAtlas.init(&ctx, std.heap.smp_allocator, .{}) catch |e| {
+                        const ar = self.atlas_ref orelse {
+                            log.err(.gpu, "configure before atlas ref set", .{});
+                            writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
+                            continue;
+                        };
+                        device_atlas = vk.DeviceAtlas.init(&ctx, std.heap.smp_allocator, ar.pool, .{}) catch |e| {
                             log.err(.gpu, "device atlas init failed", .{ .err = e });
                             writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                             continue;
@@ -584,7 +590,7 @@ pub const GpuWorker = struct {
                         const cur_gen = lease.generation();
                         if (atlas_binding == null or cur_gen != cached_atlas_gen) {
                             if (atlas_binding) |b| device_atlas.?.releaseBinding(b);
-                            atlas_binding = device_atlas.?.upload(atlas_ref.pool, cur_atlas) catch |e| blk: {
+                            atlas_binding = device_atlas.?.upload(cur_atlas) catch |e| blk: {
                                 log.err(.gpu, "atlas upload failed", .{ .err = e });
                                 render_ok = false;
                                 break :blk null;
@@ -618,6 +624,7 @@ pub const GpuWorker = struct {
                         device_atlas.?.descriptorSet(),
                         frame_slot,
                         clear_color,
+                        device_atlas.?.atlasPageTexels(),
                         pipeline.?.emittedInstances(),
                         pipeline.?.emittedBatches(),
                     ) catch |e| {

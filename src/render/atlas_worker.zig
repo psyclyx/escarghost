@@ -199,7 +199,7 @@ pub const AtlasWorker = struct {
         // pages are 2x wider than before (1<<19) because CJK outlines are
         // curve-heavy (snail 90fce76: ~4x denser records).
         const pool = try snail.PagePool.init(alloc, .{
-            .max_pages = 256,
+            .max_pages = 64,
             .curve_words_per_page = 1 << 19,
             .band_words_per_page = 1 << 15,
         });
