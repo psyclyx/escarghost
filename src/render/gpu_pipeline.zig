@@ -47,7 +47,15 @@ pub fn computeCellMetrics(faces: *const snail.Faces, font_size: f32) !CellMetric
     const face = faces.faceCount() > 0;
     if (!face) return error.NoFaces;
     const font = faces.fontForFace(0) orelse return error.NoPrimaryFont;
+    return computeCellMetricsFromFont(font, font_size);
+}
 
+/// As `computeCellMetrics`, but from the primary `Font` directly — so the
+/// atlas worker can compute metrics the moment it parses the primary font,
+/// before building the full `Faces` (HarfBuzz shapers) / fallback chain, and
+/// hand main the numbers it needs to fork the PTY. Cell size is a property of
+/// the primary monospace font alone; fallbacks never affect it.
+pub fn computeCellMetricsFromFont(font: *const snail.Font, font_size: f32) !CellMetrics {
     const units_per_em: f32 = @floatFromInt(font.unitsPerEm());
     const scale = font_size / units_per_em;
 

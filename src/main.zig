@@ -302,12 +302,16 @@ pub fn main(init: std.process.Init) !void {
         log.warn(.gpu, "linux-dmabuf unavailable, falling back to cpu", .{});
     }
 
-    // ── Phase 2: wait for font (overlapped with Wayland init) ──
-    const font_resp = (try atlas_thread.readResponse()) orelse {
-        log.err(.atlas, "bootstrap response pipe closed before font_ready", .{});
+    // ── Phase 2: wait for primary-font cell metrics (overlapped with the
+    //    Wayland connect above). The atlas worker parses the primary font,
+    //    computes metrics, and signals here — the rest of its bootstrap
+    //    (fallbacks, Faces/HarfBuzz, pool, Powerline, prep) runs on in
+    //    parallel with the PTY fork + terminal init below. ──
+    const metrics_resp = (try atlas_thread.readResponse()) orelse {
+        log.err(.atlas, "bootstrap response pipe closed before metrics_ready", .{});
         return error.BootstrapFailed;
     };
-    if (font_resp.tag == .failed) {
+    if (metrics_resp.tag == .failed) {
         log.err(.atlas, "font bootstrap failed; cannot start without a usable font", .{
             .err = atlas_thread.bootstrap_err,
             .config_font = cfg.font_path,
@@ -315,15 +319,9 @@ pub fn main(init: std.process.Init) !void {
         if (atlas_thread.bootstrap_err) |err| return err;
         return error.BootstrapFailed;
     }
-    defer allocator.free(atlas_thread.bootstrap_font_path);
-    const atlas_ref_ptr = atlas_thread.atlas_ref;
-    atlas_ref_ptr.custom_glyphs = cfg.custom_glyphs;
-    state.refs.atlas_ref = atlas_ref_ptr;
-    log.info(.atlas, "font ready", .{});
-
-    var bootstrap_atlas_lease = atlas_ref_ptr.acquire();
-    defer bootstrap_atlas_lease.release();
-    const cell_metrics = try gpu_pipeline.computeCellMetrics(atlas_thread.faces.?, cfg.font_size);
+    // Metrics were computed on the atlas thread (no font work on main); the
+    // metrics_ready pipe read orders that write before this read.
+    const cell_metrics = atlas_thread.cell_metrics.?;
     state.metrics.font_size = cell_metrics.em;
     state.metrics.cell_width = cell_metrics.cell_width;
     state.metrics.cell_height = cell_metrics.cell_height;
@@ -362,12 +360,18 @@ pub fn main(init: std.process.Init) !void {
     term.on_bell = bell_mod.callback;
     state.refs.bell = &bell;
 
-    // ── Phase 4: wait for atlas (ASCII rasterization), start renderers ──
+    // ── Phase 4: wait for the full atlas bootstrap, start renderers ──
+    // By now the PTY fork + terminal init above have overlapped the atlas's
+    // fallback/Faces/pool/Powerline/prep work.
     const atlas_resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
     if (atlas_resp.tag == .failed) {
         if (atlas_thread.bootstrap_err) |err| return err;
         return error.BootstrapFailed;
     }
+    defer allocator.free(atlas_thread.bootstrap_font_path);
+    const atlas_ref_ptr = atlas_thread.atlas_ref;
+    atlas_ref_ptr.custom_glyphs = cfg.custom_glyphs;
+    state.refs.atlas_ref = atlas_ref_ptr;
     log.info(.atlas, "ready", .{});
 
     if (wl.shm) |shm| {
@@ -720,7 +724,7 @@ pub fn main(init: std.process.Init) !void {
             if (resp_opt) |resp| {
                 switch (resp.tag) {
                     .failed => log.err(.atlas, "bootstrap failed", .{}),
-                    .font_ready, .bootstrap_ready => {},
+                    .metrics_ready, .bootstrap_ready => {},
                 }
             }
         }

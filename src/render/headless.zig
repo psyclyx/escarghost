@@ -41,7 +41,7 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
         .fallback_fonts = cfg.fallback_fonts,
         .font_size = cfg.font_size,
     });
-    // font_ready then bootstrap_ready.
+    // metrics_ready then bootstrap_ready; wait for both so faces is live.
     for (0..2) |_| {
         const resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
         if (resp.tag == .failed) return atlas_thread.bootstrap_err orelse error.BootstrapFailed;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const snail = @import("snail");
 const atlas_ref_mod = @import("atlas_ref.zig");
+const gpu_pipeline = @import("gpu_pipeline.zig");
 const log = @import("../log.zig");
 
 const c = @cImport({
@@ -15,7 +16,11 @@ const c = @cImport({
 
 pub const ResponseTag = enum(u8) {
     failed = 2,
-    font_ready = 3,
+    /// Primary font parsed and cell metrics computed (in `cell_metrics`).
+    /// Main can compute the grid and fork the PTY; the rest of the atlas
+    /// bootstrap (fallbacks, faces, pool, Powerline, prep) runs on in
+    /// parallel and reports `bootstrap_ready` when done.
+    metrics_ready = 3,
     bootstrap_ready = 4,
 };
 
@@ -54,6 +59,10 @@ pub const AtlasWorker = struct {
     bootstrap_config: ?BootstrapConfig = null,
     bootstrap_font_path: []const u8 = "",
     bootstrap_err: ?anyerror = null,
+    /// Cell metrics from the primary font. Set by the worker thread and
+    /// published with the `metrics_ready` response (the pipe read/write pair
+    /// orders the write before main reads it). Null until then.
+    cell_metrics: ?gpu_pipeline.CellMetrics = null,
 
     pub fn responseFd(self: *const AtlasWorker) c_int {
         return self.response_fds[0];
@@ -150,6 +159,15 @@ pub const AtlasWorker = struct {
         defer face_entries.deinit(alloc);
         try face_entries.append(alloc, .{ .font = primary_font, .font_id = 0 });
 
+        // Cell size depends only on the primary font, so compute + publish it
+        // now — main forks the PTY off this while the rest of the bootstrap
+        // (fallbacks, Faces/HarfBuzz build, page pool, Powerline, prep thread)
+        // runs on below, overlapping the fork + terminal init.
+        self.cell_metrics = try gpu_pipeline.computeCellMetricsFromFont(primary_font, config.font_size);
+        self.bootstrap_font_path = font_path;
+        log.info(.atlas, "metrics ready", .{});
+        writeResponse(self.response_fds[1], self.io, .{ .tag = .metrics_ready });
+
         // Resolve and add fallback fonts.
         for (config.fallback_fonts, 1..) |name, i| {
             const path = resolveFontByQuery(alloc, self.io, name) catch |err| {
@@ -232,14 +250,12 @@ pub const AtlasWorker = struct {
         // never block on shape/record. See AtlasRef prep-thread machinery.
         try atlas_ref.startPrep();
 
-        self.bootstrap_font_path = font_path;
         self.atlas_ref = atlas_ref;
         self.page_pool = pool;
         self.faces = faces;
-        log.info(.atlas, "font ready", .{ .fallbacks = face_entries.items.len - 1 });
-
-        // Tell main it can compute cell metrics and fork the PTY now.
-        writeResponse(self.response_fds[1], self.io, .{ .tag = .font_ready });
+        log.info(.atlas, "atlas ready", .{ .fallbacks = face_entries.items.len - 1 });
+        // `bootstrap_ready` is emitted by workerMain once runBootstrap returns
+        // — it signals that atlas_ref / faces / pool are all live.
     }
 };
 
