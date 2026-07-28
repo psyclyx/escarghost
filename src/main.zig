@@ -223,27 +223,18 @@ pub fn main(init: std.process.Init) !void {
         log.info(.gpu, "disabled", .{ .reason = "SCRGO_RENDERER=cpu" });
     }
 
-    // Heap-allocated: the workers embed the per-slot snapshot cell buffers
-    // (MaxCols*MaxRows cells each), which are far too large for main's stack.
-    const gpu = try allocator.create(gpu_worker.GpuWorker);
-    defer allocator.destroy(gpu);
-    gpu.* = .{};
-    state.render.gpu_restart = app_state.GpuRestartBackoff.init(
-        cfg.gpu_restart_initial_delay_ms,
-        cfg.gpu_restart_max_delay_ms,
-        cfg.gpu_restart_jitter_percent,
-    );
-
-    // ── Spawn the worker threads: cheap spawns first, GPU last ──
+    // ── Spawn the worker threads: CPU + atlas first, GPU struct + spawn last ──
     //
-    // gpu.start() only *spawns* the worker, but that worker then loads the
-    // Vulkan driver on its own thread — and NVIDIA's driver hooks
-    // pthread_create when it loads, making every spawn after that cost
-    // ~6 ms. So spawn the CPU and atlas workers first, while pthread_create
-    // is still cheap, and start the GPU worker LAST. It's still started
-    // before the Wayland connect + PTY fork below, so its long context init
-    // (tens of ms) overlaps the rest of startup — it just mustn't slow down
-    // the other threads' spawns by loading the driver ahead of them.
+    // The CPU worker renders every frame until the GPU's Vulkan context comes
+    // up (~200 ms in), so it is squarely on the critical path to first paint.
+    // Spawn it — and the atlas bootstrap it depends on — before ANY other
+    // main-thread setup, so nothing head-of-line blocks it. In particular the
+    // GPU worker's struct is large (embeds the per-slot snapshot buffers) and
+    // its allocation/init used to sit ahead of this spawn, delaying it by
+    // several ms for no reason. The GPU comes last on two counts: its struct
+    // init is off the critical path, and starting the worker loads the Vulkan
+    // driver, whose NVIDIA pthread_create hook makes every later spawn cost
+    // ~6 ms — so no spawn may follow it.
 
     // CPU worker — the initial (and fallback) render path. Parks in
     // cond_wait until start() assigns it work.
@@ -257,8 +248,8 @@ pub fn main(init: std.process.Init) !void {
     log.info(.cpu, "thread spawned", .{});
 
     // Atlas worker — font+atlas bootstrap on its own thread. On the path to
-    // first paint (the CPU renderer needs the atlas), so keep its spawn in
-    // the cheap-pthread window too, before the GPU driver loads.
+    // first paint (the CPU renderer needs the atlas), so spawn it here too,
+    // before the GPU driver loads.
     var atlas_thread: atlas_worker.AtlasWorker = .{};
     try atlas_thread.startWithBootstrap(io, .{
         .allocator = allocator,
@@ -268,10 +259,17 @@ pub fn main(init: std.process.Init) !void {
     });
     defer atlas_thread.stop();
 
-    // GPU worker LAST — starting it triggers the driver load (and its
-    // pthread_create hook) on the worker thread, so every spawn above must
-    // already be done. Begins Vulkan context init immediately (no deps), so
-    // it still comes up concurrently with Wayland init and the PTY fork.
+    // GPU worker — allocate + init its large struct now that the critical-path
+    // threads are already running, then start it LAST (see above). Its Vulkan
+    // context init (tens of ms) still overlaps Wayland connect + PTY fork.
+    const gpu = try allocator.create(gpu_worker.GpuWorker);
+    defer allocator.destroy(gpu);
+    gpu.* = .{};
+    state.render.gpu_restart = app_state.GpuRestartBackoff.init(
+        cfg.gpu_restart_initial_delay_ms,
+        cfg.gpu_restart_max_delay_ms,
+        cfg.gpu_restart_jitter_percent,
+    );
     if (gpu_allowed) {
         gpu.start(io) catch |e| {
             log.err(.gpu, "thread start failed", .{ .err = e });

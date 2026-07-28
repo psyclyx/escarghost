@@ -125,7 +125,12 @@ pub const GpuWorker = struct {
     request: Request = .{ .tag = .quit },
     stop_requested: bool = false,
 
-    snapshots: [SnapshotSlotCount]render_snapshot.SharedSnapshot = [_]render_snapshot.SharedSnapshot{.{}} ** SnapshotSlotCount,
+    // Heap-allocated off to the side (see start()), NOT embedded by value.
+    // Each slot's ~5 MB cell buffer would otherwise bloat the struct so that
+    // `self.* = .{}` first-touches thousands of fresh pages (~3 ms of minor
+    // faults) on the main thread before we can paint. As a separate
+    // uninitialized allocation the pages fault in lazily during capture.
+    snapshots: *[SnapshotSlotCount]render_snapshot.SharedSnapshot = undefined,
     snapshot_busy: [SnapshotSlotCount]bool = [_]bool{false} ** SnapshotSlotCount,
 
     buffer_descs: [MaxBuffers]gpu_buffer.BufferDesc = [_]gpu_buffer.BufferDesc{.{}} ** MaxBuffers,
@@ -155,6 +160,12 @@ pub const GpuWorker = struct {
         if (self.active) return;
         self.* = .{};
         self.io = io;
+        // Uninitialized on purpose — capture() fills each slot before it's
+        // rendered, so the pages fault in lazily off the critical path.
+        self.snapshots = std.heap.smp_allocator.create(
+            [SnapshotSlotCount]render_snapshot.SharedSnapshot,
+        ) catch return error.OutOfMemory;
+        errdefer std.heap.smp_allocator.destroy(self.snapshots);
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         self.request_event_fd = c.eventfd(0, c.EFD_CLOEXEC);
@@ -340,6 +351,7 @@ pub const GpuWorker = struct {
             self.request_event_fd = -1;
         }
         _ = c.pthread_mutex_destroy(&self.mutex);
+        std.heap.smp_allocator.destroy(self.snapshots);
         self.active = false;
         self.context_ready = false;
         self.ready = false;

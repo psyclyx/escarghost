@@ -60,7 +60,13 @@ pub const Frontend = struct {
     stop_requested: bool = false,
     active: bool = false,
     io: std.Io = undefined,
-    snapshots: [SnapshotSlotCount]render_snapshot.SharedSnapshot = [_]render_snapshot.SharedSnapshot{.{}} ** SnapshotSlotCount,
+    // Heap-allocated off to the side (see spawnThread), NOT embedded by value.
+    // Each slot's ~5 MB cell buffer would otherwise bloat the Frontend struct
+    // so that `self.* = .{}` on the main thread first-touches thousands of
+    // fresh pages (~3 ms of minor faults) before we can even paint. As a
+    // separate uninitialized allocation the pages fault in lazily during
+    // capture, on the render path, only for cells actually written.
+    snapshots: *[SnapshotSlotCount]render_snapshot.SharedSnapshot = undefined,
     snapshot_busy: [SnapshotSlotCount]bool = [_]bool{false} ** SnapshotSlotCount,
     buffers: [BufferCount]cpu_buffer.SharedBuffer = undefined,
     buffer_count: usize = 0,
@@ -78,6 +84,13 @@ pub const Frontend = struct {
     pub fn spawnThread(self: *Frontend, io: std.Io) !void {
         if (self.thread != null) return;
         self.io = io;
+        // Uninitialized on purpose — capture() writes each slot before it's
+        // rendered, so the pages fault in lazily on the render path rather
+        // than all at once on the startup critical path.
+        self.snapshots = std.heap.smp_allocator.create(
+            [SnapshotSlotCount]render_snapshot.SharedSnapshot,
+        ) catch return error.OutOfMemory;
+        errdefer std.heap.smp_allocator.destroy(self.snapshots);
         if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
         errdefer _ = c.pthread_mutex_destroy(&self.mutex);
         if (c.pthread_cond_init(&self.cond, null) != 0) return error.CondInitFailed;
@@ -139,6 +152,7 @@ pub const Frontend = struct {
         self.render_in_flight = false;
         self.stop_requested = false;
         self.snapshot_busy = [_]bool{false} ** SnapshotSlotCount;
+        std.heap.smp_allocator.destroy(self.snapshots);
         log.info(.cpu, "stopped", .{});
     }
 
