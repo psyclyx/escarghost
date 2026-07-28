@@ -525,6 +525,7 @@ pub fn main(init: std.process.Init) !void {
         render_loop.tickBell(&state);
         input.tickTouch();
         input.tickFling();
+        render_loop.pollAtlasUpdate(&state);
         render_loop.maybeQueueGpuFrame(&state);
         render_loop.renderActivePath(&state);
         wl.flush();
@@ -549,16 +550,21 @@ pub fn main(init: std.process.Init) !void {
             touch_timeout,
         );
 
+        // The atlas update eventfd wakes us when the prep thread publishes
+        // newly-prepped glyphs, so a partial frame gets re-rendered without
+        // polling; it stays quiet (no wake, no burn) when the atlas is warm.
+        const atlas_update_fd = atlas_ref_ptr.updateFd();
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },
             .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
             .{ .fd = if (gpu.active) gpu.responseFd() else -1, .events = if (gpu.active) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (cpu.active) cpu.responseFd() else -1, .events = if (cpu.active) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (atlas_thread.active) atlas_thread.responseFd() else -1, .events = if (atlas_thread.active) c.POLLIN else 0, .revents = 0 },
+            .{ .fd = atlas_update_fd, .events = c.POLLIN, .revents = 0 },
         };
 
         const poll_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
-        const poll_rc = c.poll(&pollfds, 5, poll_timeout);
+        const poll_rc = c.poll(&pollfds, pollfds.len, poll_timeout);
         if (state.diag.trace_commits) {
             state.diag.phase_poll_ns += monotonicNowNs() - poll_t0;
             state.diag.phase_poll_calls += 1;
@@ -568,6 +574,10 @@ pub fn main(init: std.process.Init) !void {
             log.err(.main, "poll failed, exiting", .{});
             break;
         }
+
+        // Atlas advanced (prep published new glyphs): drain the eventfd and let
+        // pollAtlasUpdate below mark a redraw so partial frames fill in.
+        if (pollfds[5].revents & c.POLLIN != 0) atlas_ref_ptr.drainUpdate();
 
         if (pollfds[0].revents & c.POLLIN != 0) {
             wl.readEvents() catch {
@@ -801,6 +811,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        render_loop.pollAtlasUpdate(&state);
         render_loop.maybeQueueGpuFrame(&state);
         render_loop.renderActivePath(&state);
 

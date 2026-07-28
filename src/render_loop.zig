@@ -7,6 +7,20 @@ const log = @import("log.zig");
 
 const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 
+/// Re-render when the async prep thread has published newly-prepped glyphs
+/// (atlas generation advanced), regardless of terminal state — a frame drawn
+/// with missing glyphs must be redrawn once the atlas catches up, or those
+/// cells stay blank until the next terminal change. No-op when the atlas is
+/// warm (generation stable → no spurious redraws).
+pub fn pollAtlasUpdate(s: *app_state.AppState) void {
+    const gen = s.refs.atlas_ref.loadGeneration();
+    if (gen != s.render.last_atlas_gen) {
+        s.render.last_atlas_gen = gen;
+        s.render.gpu_snapshot_dirty = true;
+        s.render.needs_redraw = true;
+    }
+}
+
 pub fn markRenderDirty(s: *app_state.AppState) void {
     s.render.render_serial +%= 1;
     if (s.render.render_serial == 0) s.render.render_serial = 1;

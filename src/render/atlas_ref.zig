@@ -6,6 +6,8 @@ const log = @import("../log.zig");
 
 const c = @cImport({
     @cInclude("pthread.h");
+    @cInclude("sys/eventfd.h");
+    @cInclude("unistd.h");
 });
 
 // Prep-thread diagnostics (globals: one AtlasRef per process). `prep_full`
@@ -101,6 +103,10 @@ pub const AtlasRef = struct {
     prep_stop: bool = false,
     prep_len: usize = 0,
     prep_text: [glyph_misses.MaxBytes]u8 = undefined,
+    /// eventfd the prep thread bumps on `publish` so the main loop can wake
+    /// and re-render newly-prepped glyphs without polling. Stays quiet when
+    /// the atlas is warm, so an idle terminal burns no CPU/GPU.
+    update_fd: c_int = -1,
 
     /// A unit filled-rectangle path record (namespace `path_fill`) baked into
     /// the atlas at bootstrap. Renderers instance it — varying `local_transform`
@@ -180,7 +186,28 @@ pub const AtlasRef = struct {
         if (c.pthread_mutex_init(&ref.shape_lock, null) != 0) return error.MutexInitFailed;
         if (c.pthread_mutex_init(&ref.prep_mutex, null) != 0) return error.MutexInitFailed;
         if (c.pthread_cond_init(&ref.prep_cond, null) != 0) return error.MutexInitFailed;
+        ref.update_fd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
         return ref;
+    }
+
+    /// Read end of the update eventfd — add to the main loop's poll set; a
+    /// readable fd means the atlas advanced and a re-render is due. Drain it
+    /// with `drainUpdate`.
+    pub fn updateFd(self: *const AtlasRef) c_int {
+        return self.update_fd;
+    }
+
+    /// Drain the update eventfd after it signals (clears its counter).
+    pub fn drainUpdate(self: *AtlasRef) void {
+        if (self.update_fd < 0) return;
+        var buf: u64 = 0;
+        _ = c.read(self.update_fd, &buf, @sizeOf(u64));
+    }
+
+    fn notifyUpdate(self: *AtlasRef) void {
+        if (self.update_fd < 0) return;
+        const one: u64 = 1;
+        _ = c.write(self.update_fd, &one, @sizeOf(u64));
     }
 
     /// Acquire the current snapshot and keep it alive until the lease is
@@ -507,6 +534,7 @@ pub const AtlasRef = struct {
         const old = self.current;
         self.current = next_snapshot;
         if (old) |snapshot| self.retireLocked(snapshot);
+        self.notifyUpdate();
     }
 
     /// Clean up all held snapshots. Call only when no threads are reading.
@@ -542,6 +570,7 @@ pub const AtlasRef = struct {
         _ = c.pthread_mutex_destroy(&self.shape_lock);
         _ = c.pthread_cond_destroy(&self.prep_cond);
         _ = c.pthread_mutex_destroy(&self.prep_mutex);
+        if (self.update_fd >= 0) _ = c.close(self.update_fd);
     }
 
     fn retain(self: *AtlasRef, snapshot: *Snapshot) Lease {

@@ -116,6 +116,11 @@ pub const RenderState = struct {
     gpu_snapshot_dirty: bool = false,
     gpu_reconfigure_requested: bool = false,
     render_serial: u32 = 0,
+    /// Atlas generation reflected by the last queued render. When the async
+    /// prep thread publishes newly-prepped glyphs the generation advances; we
+    /// re-render to fill in glyphs that were missing last frame, even if the
+    /// terminal state itself hasn't changed.
+    last_atlas_gen: u64 = 0,
     target_render_path: RenderPath = .gpu,
     active_render_path: RenderPath = .cpu,
     gpu_restart: GpuRestartBackoff = .{},
