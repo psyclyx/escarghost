@@ -83,7 +83,11 @@ pub const ScrollbarOverlay = struct {
 
 pub const SharedSnapshot = struct {
     header: Header = .{},
-    cells: [MaxCells]Cell = [_]Cell{.{}} ** MaxCells,
+    // Undefined, not zero-filled: `capture` overwrites cells[0..cell_count]
+    // before any render, and readers only touch cells[0..cell_count] (bounded
+    // by the defaulted header). Zeroing ~5 MB/snapshot at every worker's
+    // `.{}` was pure startup latency (several ms before the threads spawn).
+    cells: [MaxCells]Cell = undefined,
     /// Active text selection at the time the snapshot was captured.
     /// Null = no selection; renderers skip the highlight pass.
     selection: ?selection_mod.Snapshot = null,
