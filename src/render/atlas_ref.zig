@@ -306,9 +306,17 @@ pub const AtlasRef = struct {
     /// in parallel with render-side shaping. Only the prep thread extends, so
     /// there is no concurrent page-pool mutation.
     fn runPrep(self: *AtlasRef, miss_text: []const u8) void {
-        // Phase A — fallback coverage + shape, under shape_lock.
-        _ = c.pthread_mutex_lock(&self.shape_lock);
+        // Phase A1 — fallback coverage, UNLOCKED. Resolving/mmapping/parsing a
+        // covering font and rebuilding `Faces` (per-font HarfBuzz face/shaper
+        // objects) touches only immutable font data, not the shared shaping
+        // buffer — so it must NOT hold shape_lock, or a single big fallback
+        // load (unifont, CJK-VF, …) would block every render-side shape for
+        // tens of ms and stall frames. ensureFallbackCoverage takes shape_lock
+        // only for the brief `faces` pointer swap.
         _ = self.ensureFallbackCoverage(miss_text);
+
+        // Phase A2 — shape under shape_lock (Faces has one shared hb_buffer).
+        _ = c.pthread_mutex_lock(&self.shape_lock);
         const faces = self.faces orelse {
             _ = c.pthread_mutex_unlock(&self.shape_lock);
             return;
@@ -380,9 +388,13 @@ pub const AtlasRef = struct {
     }
 
     /// Load covering fonts for any uncovered codepoint in `miss_text` and,
-    /// if at least one was added, rebuild `faces`. Runs under `shape_lock`
-    /// (held by `extend`). Best-effort: resolver / build failures leave the
-    /// existing chain intact. Returns true when `faces` was swapped.
+    /// if at least one was added, rebuild `faces`. Runs UNLOCKED — the heavy
+    /// resolve/parse/`Faces.build` only touches immutable font data and fresh
+    /// per-font hb objects — and grabs `shape_lock` solely for the final
+    /// pointer swap (render-side shaping reads `self.faces` under that lock).
+    /// Best-effort: resolver / build failures leave the existing chain intact.
+    /// Only the prep thread calls this, so `face_specs` needs no lock.
+    /// Returns true when `faces` was swapped.
     fn ensureFallbackCoverage(self: *AtlasRef, miss_text: []const u8) bool {
         const resolve = self.fallback_resolve orelse return false;
         const ctx = self.fallback_ctx.?;
@@ -434,8 +446,14 @@ pub const AtlasRef = struct {
             return false;
         };
 
+        // Publish under shape_lock: render-side shaping reads `self.faces`
+        // under the same lock, so the swap can't race a live shaper, and the
+        // retired Faces is out of use past this point (freed only at deinit).
+        // Only the pointer swap is locked; the Faces.build above ran unlocked.
+        _ = c.pthread_mutex_lock(&self.shape_lock);
         if (self.faces) |old| self.retired_faces.append(self.allocator, old) catch {};
         self.faces = new_faces;
+        _ = c.pthread_mutex_unlock(&self.shape_lock);
         return true;
     }
 
