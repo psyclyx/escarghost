@@ -83,6 +83,10 @@ pub const AtlasRef = struct {
     /// `resolve` returns a covering `*const Font` for a codepoint, or null.
     fallback_ctx: ?*anyopaque = null,
     fallback_resolve: ?*const fn (*anyopaque, u32) ?*const snail.Font = null,
+    /// Batch resolver: covering fonts for a set of codepoints in one call
+    /// (owned slice, caller frees). One `FcFontSort` for the whole miss text
+    /// instead of an `FcFontMatch` per uncovered codepoint.
+    fallback_resolve_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const u32) []*const snail.Font = null,
 
     // ── Async glyph prep ──
     //
@@ -103,6 +107,16 @@ pub const AtlasRef = struct {
     prep_stop: bool = false,
     prep_len: usize = 0,
     prep_text: [glyph_misses.MaxBytes]u8 = undefined,
+    /// Number of worker stripes for parallel glyph extraction. Set at
+    /// `startPrep` to min(nproc, 8); the prep thread runs one stripe itself
+    /// and spawns the rest per batch (prep batches are infrequent).
+    prep_workers: usize = 1,
+    /// One persistent `ExtractContext` per worker, reused across prep
+    /// batches so per-font HarfBuzz Instances (expensive to build for large
+    /// CJK variable fonts) and scratch capacity survive between batches
+    /// instead of being rebuilt each time. Owned; allocated at `startPrep`,
+    /// freed at `stopPrep` after the prep thread joins.
+    prep_contexts: []snail.ExtractContext = &.{},
     /// eventfd the prep thread bumps on `publish` so the main loop can wake
     /// and re-render newly-prepped glyphs without polling. Stays quiet when
     /// the atlas is warm, so an idle terminal burns no CPU/GPU.
@@ -245,6 +259,11 @@ pub const AtlasRef = struct {
     /// fallback resolver are set (i.e. after bootstrap).
     pub fn startPrep(self: *AtlasRef) !void {
         if (self.prep_active) return;
+        // Cap at 8: enough to clear a glyph flood in a frame or two while
+        // leaving cores for the render loop, GPU worker, and CPU raster pool.
+        self.prep_workers = @max(1, @min(std.Thread.getCpuCount() catch 4, 8));
+        self.prep_contexts = try self.allocator.alloc(snail.ExtractContext, self.prep_workers);
+        for (self.prep_contexts) |*cx| cx.* = snail.ExtractContext.init(self.allocator, self.allocator);
         self.prep_active = true;
         self.prep_thread = std.Thread.spawn(.{}, prepLoop, .{self}) catch |err| {
             self.prep_active = false;
@@ -262,6 +281,10 @@ pub const AtlasRef = struct {
         if (self.prep_thread) |t| t.join();
         self.prep_thread = null;
         self.prep_active = false;
+        // Safe now that the only user (the prep thread) has joined.
+        for (self.prep_contexts) |*cx| cx.deinit();
+        self.allocator.free(self.prep_contexts);
+        self.prep_contexts = &.{};
     }
 
     /// Hand `miss_text` to the prep thread and return immediately. Single-slot
@@ -328,11 +351,14 @@ pub const AtlasRef = struct {
         _ = c.pthread_mutex_unlock(&self.shape_lock);
         defer shaped.deinit();
 
-        // Phase B — clone the current atlas + record, no lock.
+        // Phase B — clone the current atlas + record, no lock. Extraction
+        // (the ~90% curve-baking cost) fans across the prep worker stripes;
+        // planning (dedup) and insertion stay serial on this thread. Only the
+        // prep thread extends, so there is no concurrent page-pool mutation.
         var lease = self.acquire();
         defer lease.release();
         var next = lease.get().extend(self.allocator, &.{}) catch return;
-        snail.recordUnhintedRun(&next, self.allocator, faces, &shaped, .{}) catch |err| {
+        self.recordParallel(&next, faces, &shaped) catch |err| {
             if (err == error.OutOfLayers) {
                 // Pool exhausted: new glyphs can't be prepped and render as
                 // gaps. Warn once — sustained hits on a *real* workload (not
@@ -358,6 +384,80 @@ pub const AtlasRef = struct {
         };
     }
 
+    /// One extraction worker. Claims contiguous chunks of request indices
+    /// from a shared atomic cursor — contiguous for cache locality and to
+    /// avoid false sharing on the large `results[]` slots, dynamic so workers
+    /// self-balance across glyphs whose extraction cost varies and clusters
+    /// by script. Owns its `ExtractContext` (per-thread scratch + Instances).
+    const PrepTask = struct {
+        plan: *snail.UnhintedExtractPlan,
+        ctx: *snail.ExtractContext,
+        cursor: *std.atomic.Value(usize),
+        err: ?anyerror = null,
+
+        /// Chunk size trades scheduling granularity (smaller = better balance)
+        /// against atomic/locality overhead. 16 gives ~cores×8 chunks over a
+        /// typical flood — ample for balancing.
+        const chunk: usize = 16;
+
+        fn run(self: *PrepTask) void {
+            // `ctx` is a persistent per-worker context (Instances + scratch
+            // survive across batches); do not deinit it here.
+            const count = self.plan.requestCount();
+            while (true) {
+                const start = self.cursor.fetchAdd(chunk, .monotonic);
+                if (start >= count) break;
+                const end = @min(start + chunk, count);
+                for (start..end) |i| {
+                    self.plan.extractOne(i, self.ctx) catch |e| {
+                        self.err = e;
+                        return;
+                    };
+                }
+            }
+        }
+    };
+
+    /// Plan → parallel-extract → apply. Extraction fans across up to
+    /// `prep_workers` workers (this thread runs one, spawns the rest);
+    /// planning and insertion stay serial. Any extraction error aborts before
+    /// `apply`, so `next` is left unchanged (the caller deinits it).
+    fn recordParallel(
+        self: *AtlasRef,
+        next: *snail.Atlas,
+        faces: *const snail.Faces,
+        shaped: *const snail.ShapedText,
+    ) !void {
+        var plan = try snail.planUnhintedRuns(next, self.allocator, faces, &.{shaped}, .{});
+        defer plan.deinit();
+
+        const count = plan.requestCount();
+        if (count == 0) return plan.apply(next);
+
+        const n = @max(1, @min(self.prep_workers, count));
+        var cursor = std.atomic.Value(usize).init(0);
+        const tasks = try self.allocator.alloc(PrepTask, n);
+        defer self.allocator.free(tasks);
+        const threads = try self.allocator.alloc(?std.Thread, n);
+        defer self.allocator.free(threads);
+        for (tasks, 0..) |*t, ti| t.* = .{ .plan = &plan, .ctx = &self.prep_contexts[ti], .cursor = &cursor };
+
+        // Spawn workers 1..n; run worker 0 on this thread. A failed spawn just
+        // runs that worker inline here — parallelism is best-effort, and all
+        // workers pull from the same cursor so nothing is skipped.
+        for (1..n) |ti| {
+            threads[ti] = std.Thread.spawn(.{}, PrepTask.run, .{&tasks[ti]}) catch blk: {
+                PrepTask.run(&tasks[ti]);
+                break :blk null;
+            };
+        }
+        PrepTask.run(&tasks[0]);
+        for (1..n) |ti| if (threads[ti]) |th| th.join();
+
+        for (tasks) |t| if (t.err) |e| return e;
+        return plan.apply(next);
+    }
+
     /// Seed the auto-fallback machinery with the bootstrap chain and the
     /// resolver used to load covering fonts on demand. `specs` is copied
     /// (the borrowed `*const Font` pointers must outlive the process, as
@@ -367,6 +467,7 @@ pub const AtlasRef = struct {
         specs: []const snail.Face,
         ctx: *anyopaque,
         resolve: *const fn (*anyopaque, u32) ?*const snail.Font,
+        resolve_batch: *const fn (*anyopaque, std.mem.Allocator, []const u32) []*const snail.Font,
     ) !void {
         try self.face_specs.appendSlice(self.allocator, specs);
         var max_id: u32 = 0;
@@ -374,6 +475,7 @@ pub const AtlasRef = struct {
         self.next_font_id = if (specs.len == 0) 0 else max_id + 1;
         self.fallback_ctx = ctx;
         self.fallback_resolve = resolve;
+        self.fallback_resolve_batch = resolve_batch;
     }
 
     /// True if any live face has a real glyph for `cp`. Checked against
@@ -396,25 +498,33 @@ pub const AtlasRef = struct {
     /// Only the prep thread calls this, so `face_specs` needs no lock.
     /// Returns true when `faces` was swapped.
     fn ensureFallbackCoverage(self: *AtlasRef, miss_text: []const u8) bool {
-        const resolve = self.fallback_resolve orelse return false;
+        const resolve_batch = self.fallback_resolve_batch orelse return false;
         const ctx = self.fallback_ctx.?;
 
         const base_len = self.face_specs.items.len;
         const base_next = self.next_font_id;
 
+        // Collect the distinct codepoints no current face covers. `fallback_tried`
+        // dedups across calls and within this one, and marks each attempted so a
+        // glyph no installed font carries doesn't re-resolve every frame.
+        var uncovered: std.ArrayList(u32) = .empty;
+        defer uncovered.deinit(self.allocator);
         var view = std.unicode.Utf8View.init(miss_text) catch return false;
         var it = view.iterator();
         while (it.nextCodepoint()) |cp| {
             if (cp <= 0x20) continue; // run separators / control
             if (self.fallback_tried.contains(cp)) continue;
-            if (self.coversCodepoint(cp)) continue;
-            // Attempt exactly once, whatever the outcome, so a glyph no
-            // installed font carries doesn't re-hit fontconfig each frame.
             self.fallback_tried.put(self.allocator, cp, {}) catch {};
+            if (self.coversCodepoint(cp)) continue;
+            uncovered.append(self.allocator, cp) catch {};
+        }
+        if (uncovered.items.len == 0) return false;
 
-            const font = resolve(ctx, cp) orelse continue;
-            // The resolver returns a shared pointer per file; guard against
-            // appending the same font twice within one pass.
+        // One batched fontconfig sort for the whole set, instead of a match
+        // per codepoint. Append each covering font once (deduped by pointer).
+        const fonts = resolve_batch(ctx, self.allocator, uncovered.items);
+        defer self.allocator.free(fonts);
+        for (fonts) |font| {
             var dup = false;
             for (self.face_specs.items) |s| {
                 if (s.font == font) {
@@ -423,7 +533,6 @@ pub const AtlasRef = struct {
                 }
             }
             if (dup) continue;
-
             self.face_specs.append(self.allocator, .{
                 .font = font,
                 .font_id = self.next_font_id,

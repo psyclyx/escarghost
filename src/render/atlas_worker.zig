@@ -255,7 +255,12 @@ pub const AtlasWorker = struct {
         // appended. The resolver outlives this frame (process lifetime).
         const resolver = try alloc.create(FallbackResolver);
         resolver.* = .{ .allocator = alloc, .io = self.io };
-        try atlas_ref.registerFallback(face_entries.items, resolver, FallbackResolver.resolveThunk);
+        try atlas_ref.registerFallback(
+            face_entries.items,
+            resolver,
+            FallbackResolver.resolveThunk,
+            FallbackResolver.resolveBatchThunk,
+        );
 
         // Start the async glyph-prep thread: render workers post misses and
         // never block on shape/record. See AtlasRef prep-thread machinery.
@@ -371,6 +376,96 @@ pub const FallbackResolver = struct {
     pub fn resolveThunk(ctx: *anyopaque, codepoint: u32) ?*const snail.Font {
         const self: *FallbackResolver = @ptrCast(@alignCast(ctx));
         return self.resolve(codepoint);
+    }
+
+    /// Type-erased batch entry point. Returns an `allocator`-owned slice of
+    /// covering fonts; caller owns and frees it.
+    pub fn resolveBatchThunk(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        codepoints: []const u32,
+    ) []*const snail.Font {
+        const self: *FallbackResolver = @ptrCast(@alignCast(ctx));
+        return self.resolveBatch(allocator, codepoints);
+    }
+
+    /// Resolve a whole set of uncovered codepoints in one `FcFontSort` plus
+    /// in-memory charset checks, instead of one `FcFontMatch` per codepoint.
+    /// Returns the deduped covering fonts (owned by `allocator`). Codepoints
+    /// no installed font covers simply stay uncovered — they cost nothing
+    /// beyond the single sort, where per-codepoint matching burned a full
+    /// fontconfig query each.
+    fn resolveBatch(
+        self: *FallbackResolver,
+        allocator: std.mem.Allocator,
+        codepoints: []const u32,
+    ) []*const snail.Font {
+        var out: std.ArrayList(*const snail.Font) = .empty;
+        const owned = struct {
+            fn f(o: *std.ArrayList(*const snail.Font), a: std.mem.Allocator) []*const snail.Font {
+                return o.toOwnedSlice(a) catch &.{};
+            }
+        }.f;
+        if (codepoints.len == 0) return owned(&out, allocator);
+
+        const covered = allocator.alloc(bool, codepoints.len) catch return owned(&out, allocator);
+        defer allocator.free(covered);
+        @memset(covered, false);
+
+        // One pattern whose charset is every uncovered codepoint.
+        const want = c.FcCharSetCreate() orelse return owned(&out, allocator);
+        defer c.FcCharSetDestroy(want);
+        for (codepoints) |cp| _ = c.FcCharSetAddChar(want, cp);
+
+        const pattern = c.FcPatternCreate() orelse return owned(&out, allocator);
+        defer c.FcPatternDestroy(pattern);
+        if (c.FcPatternAddCharSet(pattern, c.FC_CHARSET, want) == 0) return owned(&out, allocator);
+        _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
+        c.FcDefaultSubstitute(pattern);
+
+        // Priority-sorted candidate list, redundant fonts trimmed.
+        var csp: ?*c.FcCharSet = null;
+        var result: c.FcResult = undefined;
+        const set = c.FcFontSort(null, pattern, c.FcTrue, &csp, &result) orelse
+            return owned(&out, allocator);
+        defer c.FcFontSetDestroy(set);
+        if (csp) |cs| c.FcCharSetDestroy(cs);
+
+        var remaining = codepoints.len;
+        const fonts = set.*.fonts[0..@intCast(set.*.nfont)];
+        for (fonts) |pat| {
+            if (remaining == 0) break;
+            var fc: ?*c.FcCharSet = null;
+            if (c.FcPatternGetCharSet(pat, c.FC_CHARSET, 0, &fc) != c.FcResultMatch) continue;
+            // Cheap in-memory check: does this font's charset claim any of the
+            // still-uncovered codepoints? Skip the mmap+parse if not.
+            var claims = false;
+            for (codepoints, covered) |cp, cov| {
+                if (!cov and c.FcCharSetHasChar(fc, cp) != 0) {
+                    claims = true;
+                    break;
+                }
+            }
+            if (!claims) continue;
+
+            var file_ptr: [*c]u8 = undefined;
+            if (c.FcPatternGetString(pat, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) continue;
+            const path = std.mem.sliceTo(file_ptr, 0);
+            const font = self.fontForPath(path) orelse continue;
+
+            // Verify against the real font (fontconfig charsets can overclaim)
+            // and mark what it actually covers.
+            var added = false;
+            for (codepoints, covered) |cp, *cov| {
+                if (!cov.* and (font.glyphIndex(cp) catch 0) != 0) {
+                    cov.* = true;
+                    remaining -= 1;
+                    added = true;
+                }
+            }
+            if (added) out.append(allocator, font) catch {};
+        }
+        return owned(&out, allocator);
     }
 
     fn resolve(self: *FallbackResolver, codepoint: u32) ?*const snail.Font {
