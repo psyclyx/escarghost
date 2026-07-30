@@ -157,6 +157,11 @@ pub const CpuPipeline = struct {
     // snail-raster software renderer state.
     device_atlas: raster.DeviceAtlas,
     renderer: ?raster.Renderer = null,
+    /// Fans the software raster's tile work across cores (snail-raster's
+    /// ThreadPool). Owned; spawned once at init. `pool_ready` is false if the
+    /// spawn failed, in which case draw() runs single-threaded.
+    thread_pool: raster.ThreadPool = undefined,
+    pool_ready: bool = false,
     instances: std.ArrayList(Instance) = .empty,
     batches: std.ArrayList(DrawBatch) = .empty,
     /// Live binding from the last `device_atlas.upload`, released and
@@ -174,9 +179,17 @@ pub const CpuPipeline = struct {
             .eph = row_build.EphemeralBlobs.init(allocator),
             .device_atlas = device_atlas,
         };
+        // Spawn the raster thread pool (all cores by default). Best-effort:
+        // on failure we fall back to single-threaded rasterization.
+        if (self.thread_pool.init(allocator, .{})) |_| {
+            self.pool_ready = true;
+        } else |err| {
+            log.warn(.cpu, "raster thread pool init failed; single-threaded", .{ .err = err });
+        }
     }
 
     pub fn deinit(self: *CpuPipeline) void {
+        if (self.pool_ready) self.thread_pool.deinit();
         if (self.cache_binding) |b| self.device_atlas.release(b);
         self.device_atlas.deinit();
         self.eph.deinit();
@@ -434,7 +447,7 @@ pub const CpuPipeline = struct {
             draw_state,
             .{ .instances = self.instances.items[0..instance_len], .batches = self.batches.items[0..batch_len] },
             &[_]*const raster.DeviceAtlas{&self.device_atlas},
-            null,
+            if (self.pool_ready) &self.thread_pool else null,
         ) catch |err| {
             log.warn(.cpu, "raster draw failed", .{ .err = err });
         };
