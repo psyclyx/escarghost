@@ -20,6 +20,17 @@ pub const Context = struct {
     command_pool: vk.VkCommandPool,
     render_pass: vk.VkRenderPass,
     supports_dual_source_blend: bool,
+    /// GPU-side frame timing via timestamp queries (2 slots: top/bottom of
+    /// the frame command buffer). Null when the queue family doesn't support
+    /// timestamps. Single pool is safe: rendering is fully synchronous
+    /// (submitAndWait), so queries are read back before the next frame reuses
+    /// them.
+    timestamp_query_pool: vk.VkQueryPool = null,
+    /// Nanoseconds per timestamp tick (device limit `timestampPeriod`).
+    timestamp_period: f32 = 0,
+    /// Valid bits in a timestamp value for our queue family; deltas wrap
+    /// within this width.
+    timestamp_valid_bits: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !Context {
         // ── Instance ──
@@ -190,9 +201,40 @@ pub const Context = struct {
             return error.RenderPassCreationFailed;
         }
 
+        // ── Timestamp queries (GPU-side frame timing) ──
+        var timestamp_period: f32 = 0;
+        var timestamp_valid_bits: u32 = 0;
+        {
+            var props: vk.VkPhysicalDeviceProperties = undefined;
+            vk.vkGetPhysicalDeviceProperties(physical_device, &props);
+            timestamp_period = props.limits.timestampPeriod;
+
+            var count: u32 = 0;
+            vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &count, null);
+            const qprops = try allocator.alloc(vk.VkQueueFamilyProperties, count);
+            defer allocator.free(qprops);
+            vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &count, qprops.ptr);
+            if (queue_family_index < count) {
+                timestamp_valid_bits = qprops[queue_family_index].timestampValidBits;
+            }
+        }
+        var timestamp_query_pool: vk.VkQueryPool = null;
+        if (timestamp_period > 0 and timestamp_valid_bits > 0) {
+            const pool_info = vk.VkQueryPoolCreateInfo{
+                .sType = vk.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .queryType = vk.VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = 2,
+            };
+            // Best-effort: no pool just means gpu_ms reads 0.
+            if (vk.vkCreateQueryPool(device, &pool_info, null, &timestamp_query_pool) != vk.VK_SUCCESS) {
+                timestamp_query_pool = null;
+            }
+        }
+
         log.info(.gpu, "vulkan context ready", .{
             .queue_family = queue_family_index,
             .dual_src_blend = supports_dual_source_blend,
+            .gpu_timestamps = timestamp_query_pool != null,
         });
 
         return .{
@@ -204,10 +246,14 @@ pub const Context = struct {
             .command_pool = command_pool,
             .render_pass = render_pass,
             .supports_dual_source_blend = supports_dual_source_blend,
+            .timestamp_query_pool = timestamp_query_pool,
+            .timestamp_period = timestamp_period,
+            .timestamp_valid_bits = timestamp_valid_bits,
         };
     }
 
     pub fn deinit(self: *Context) void {
+        if (self.timestamp_query_pool != null) vk.vkDestroyQueryPool(self.device, self.timestamp_query_pool, null);
         vk.vkDestroyRenderPass(self.device, self.render_pass, null);
         vk.vkDestroyCommandPool(self.device, self.command_pool, null);
         vk.vkDestroyDevice(self.device, null);

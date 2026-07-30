@@ -102,7 +102,7 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
 
         const binding = try device_atlas.upload(atlas);
         try pl.emitBuilt(atlas, binding, snap);
-        try vk.renderToTarget(&renderer, &ctx, &target, device_atlas.descriptorSet(), frame_slot, clear, device_atlas.atlasPageTexels(), pl.emittedInstances(), pl.emittedBatches());
+        _ = try vk.renderToTarget(&renderer, &ctx, &target, device_atlas.descriptorSet(), frame_slot, clear, device_atlas.atlasPageTexels(), pl.emittedInstances(), pl.emittedBatches());
         device_atlas.releaseBinding(binding);
         lease.release();
         frame_slot +%= 1;

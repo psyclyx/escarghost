@@ -60,6 +60,9 @@ pub var phasePrepNs: u64 = 0;
 pub var phaseUploadNs: u64 = 0;
 pub var phaseEmitNs: u64 = 0;
 pub var phaseRenderNs: u64 = 0;
+/// GPU-side execution time (timestamp queries) — the on-GPU portion of
+/// `phaseRenderNs`; the difference is submit/wait/driver overhead.
+pub var phaseGpuNs: u64 = 0;
 pub var phaseFrameCount: u64 = 0;
 pub var workerWaitAccumNs: u64 = 0;
 pub var workerWaitCount: u64 = 0;
@@ -576,6 +579,7 @@ pub const GpuWorker = struct {
                     // below, against the completed atlas.
                     const cur_atlas = lease.get();
 
+                    log.setFrame(.gpu, request.serial);
                     var render_ok = true;
                     var phase_t = perf.Timer.now();
                     const had_misses = pipeline.?.buildShapes(cur_atlas, faces, &self.snapshots[snapshot_slot]) catch |e| blk: {
@@ -583,7 +587,8 @@ pub const GpuWorker = struct {
                         render_ok = false;
                         break :blk false;
                     };
-                    phaseBuildNs += phase_t.elapsedNs();
+                    const build_ns = phase_t.elapsedNs();
+                    phaseBuildNs += build_ns;
                     // Hand any newly-seen glyphs to the async prep thread and
                     // move on — the frame does NOT block on prep. Glyphs not yet
                     // prepped are skipped per-glyph by emit and appear on a later
@@ -598,6 +603,7 @@ pub const GpuWorker = struct {
                     // snapshot's generation, not the global counter — the prep
                     // thread may have published newer snapshots since we leased).
                     phase_t = perf.Timer.now();
+                    var atlas_uploaded = false;
                     if (render_ok) {
                         const cur_gen = lease.generation();
                         if (atlas_binding == null or cur_gen != cached_atlas_gen) {
@@ -607,10 +613,14 @@ pub const GpuWorker = struct {
                                 render_ok = false;
                                 break :blk null;
                             };
-                            if (render_ok) cached_atlas_gen = cur_gen;
+                            if (render_ok) {
+                                cached_atlas_gen = cur_gen;
+                                atlas_uploaded = true;
+                            }
                         }
                     }
-                    phaseUploadNs += phase_t.elapsedNs();
+                    const upload_ns = phase_t.elapsedNs();
+                    phaseUploadNs += upload_ns;
                     phase_t = perf.Timer.now();
                     if (render_ok) {
                         pipeline.?.emitBuilt(cur_atlas, atlas_binding.?, &self.snapshots[snapshot_slot]) catch |e| {
@@ -618,7 +628,8 @@ pub const GpuWorker = struct {
                             render_ok = false;
                         };
                     }
-                    phaseEmitNs += phase_t.elapsedNs();
+                    const emit_ns = phase_t.elapsedNs();
+                    phaseEmitNs += emit_ns;
                     if (!render_ok) {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
@@ -629,7 +640,7 @@ pub const GpuWorker = struct {
                     const clear_color = self.snapshots[snapshot_slot].header.default_bg.toLinearFloat4(1.0);
 
                     phase_t = perf.Timer.now();
-                    vk.renderToTarget(
+                    const gpu_ns = vk.renderToTarget(
                         &renderer.?,
                         &ctx,
                         &dmabuf_targets[buffer_index],
@@ -644,7 +655,9 @@ pub const GpuWorker = struct {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
                     };
-                    phaseRenderNs += phase_t.elapsedNs();
+                    const render_ns = phase_t.elapsedNs();
+                    phaseRenderNs += render_ns;
+                    phaseGpuNs += gpu_ns;
                     phaseFrameCount += 1;
                     frame_slot +%= 1;
 
@@ -653,6 +666,24 @@ pub const GpuWorker = struct {
                         .buffer_index = buffer_index,
                         .snapshot_slot = snapshot_slot,
                         .serial = request.serial,
+                    });
+
+                    // Per-frame phase split (mirrors the CPU worker's "frame
+                    // complete"). `render` is CPU wall time around the
+                    // synchronous Vulkan submit; `gpu` is the actual on-GPU
+                    // execution from timestamp queries (0 = unsupported);
+                    // `upload` is ~0 unless the atlas generation changed.
+                    const ms = std.time.ns_per_ms;
+                    log.debug(.gpu, "frame complete", .{
+                        .buffer = buffer_index,
+                        .build_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(build_ns)) / ms}),
+                        .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(upload_ns)) / ms}),
+                        .emit_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(emit_ns)) / ms}),
+                        .render_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(render_ns)) / ms}),
+                        .gpu_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_ns)) / ms}),
+                        .total_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(build_ns + upload_ns + emit_ns + render_ns)) / ms}),
+                        .atlas_uploaded = atlas_uploaded,
+                        .misses = had_misses,
                     });
 
                     diag_frame_counter += 1;

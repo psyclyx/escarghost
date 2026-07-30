@@ -584,6 +584,11 @@ fn imageBarrier(
 /// Record a full frame into `target`: clear to `clear_color`, draw the
 /// instances/batches, and leave the image in `GENERAL` for the compositor to
 /// scan out. Blocks until the GPU finishes (submitAndWait).
+///
+/// Returns the GPU-side execution time of the frame command buffer in
+/// nanoseconds (timestamp queries, top→bottom of pipe), or 0 when the device
+/// doesn't support timestamps. The synchronous submit makes the readback
+/// race-free.
 pub fn renderToTarget(
     self: *Renderer,
     ctx: *const Context,
@@ -594,7 +599,7 @@ pub fn renderToTarget(
     atlas_page_texels: [2]i32,
     instances: []const snail.render.records.Instance,
     batches: []const snail.render.records.DrawBatch,
-) !void {
+) !u64 {
     const w = target.desc.width;
     const h = target.desc.height;
 
@@ -606,6 +611,12 @@ pub fn renderToTarget(
         .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     if (vk.vkBeginCommandBuffer(cmd, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandFailed;
+
+    const ts_pool = ctx.timestamp_query_pool;
+    if (ts_pool != null) {
+        vk.vkCmdResetQueryPool(cmd, ts_pool, 0, 2);
+        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool, 0);
+    }
 
     // Whatever the image's prior layout, discard it — the render pass clears.
     imageBarrier(
@@ -654,8 +665,35 @@ pub fn renderToTarget(
         vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
     );
 
+    if (ts_pool != null) {
+        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 1);
+    }
+
     if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.EndCommandFailed;
     try ctx.submitAndWait(cmd);
+
+    if (ts_pool != null) {
+        var raw: [2]u64 = undefined;
+        const qr = vk.vkGetQueryPoolResults(
+            ctx.device,
+            ts_pool,
+            0,
+            2,
+            @sizeOf([2]u64),
+            &raw,
+            @sizeOf(u64),
+            vk.VK_QUERY_RESULT_64_BIT,
+        );
+        if (qr == vk.VK_SUCCESS) {
+            const mask: u64 = if (ctx.timestamp_valid_bits >= 64)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @intCast(ctx.timestamp_valid_bits)) - 1;
+            const ticks = (raw[1] -% raw[0]) & mask;
+            return @intFromFloat(@as(f64, @floatFromInt(ticks)) * ctx.timestamp_period);
+        }
+    }
+    return 0;
 }
 
 fn createShaderModule(device: vk.VkDevice, spv: []align(4) const u8) !vk.VkShaderModule {

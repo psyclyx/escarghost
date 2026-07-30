@@ -275,6 +275,7 @@ pub const Diagnostics = struct {
                     .upload_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseUploadNs)) / ms_f / fc}),
                     .emit_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseEmitNs)) / ms_f / fc}),
                     .render_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseRenderNs)) / ms_f / fc}),
+                    .gpu_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseGpuNs)) / ms_f / fc}),
                 });
             }
             log.info(.diag, "memory", .{
