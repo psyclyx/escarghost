@@ -179,6 +179,7 @@ pub const CpuPipeline = struct {
             .eph = row_build.EphemeralBlobs.init(allocator),
             .device_atlas = device_atlas,
         };
+        self.misses.lifo = std.c.getenv("SCRGO_MISS_LIFO") != null;
         // Spawn the raster thread pool at up to 4 threads — enough to
         // parallelize a full-screen software frame while leaving most cores for
         // the prep thread + GPU worker. Best-effort: on failure we fall back to

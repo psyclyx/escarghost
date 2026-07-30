@@ -166,6 +166,7 @@ pub const GpuPipeline = struct {
             .atlas_ref = atlas_ref,
             .eph = row_build.EphemeralBlobs.init(allocator),
         };
+        self.misses.lifo = std.c.getenv("SCRGO_MISS_LIFO") != null;
     }
 
     pub fn deinit(self: *GpuPipeline) void {
