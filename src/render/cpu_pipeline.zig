@@ -146,6 +146,7 @@ pub const CpuPipeline = struct {
     scratch_box_rects: [row_build.MAX_BOX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
     rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
     selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
+    row_scratch: row_build.RowScratch = .{},
     eph: row_build.EphemeralBlobs,
     misses: glyph_misses.Set = .{},
 
@@ -269,6 +270,7 @@ pub const CpuPipeline = struct {
                 &self.selection_spans,
                 &self.eph,
                 &self.misses,
+                &self.row_scratch,
             );
         };
 

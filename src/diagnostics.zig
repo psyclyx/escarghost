@@ -278,6 +278,19 @@ pub const Diagnostics = struct {
                     .gpu_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseGpuNs)) / ms_f / fc}),
                 });
             }
+            // Where row building (the "build" phase, both workers) spends its
+            // time: the per-cell walk vs actual shape/place calls vs the
+            // per-row heap copies.
+            if (row_build_mod.phase_row_count > 0) {
+                log.info(.diag, "row build phases", .{
+                    .rows = row_build_mod.phase_row_count,
+                    .cell_walk_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_build_mod.phase_cell_walk_ns)) / ms_f}),
+                    .shape_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_build_mod.phase_shape_call_ns)) / ms_f}),
+                    .shape_calls = row_build_mod.phase_shape_call_count,
+                    .finish_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_build_mod.phase_row_finish_ns)) / ms_f}),
+                    .row_total_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(row_build_mod.phase_row_rebuild_ns)) / ms_f}),
+                });
+            }
             log.info(.diag, "memory", .{
                 .peak_rss_mib = self.peak_vmrss_kib / 1024,
                 .peak_anon_mib = self.peak_rss_anon_kib / 1024,

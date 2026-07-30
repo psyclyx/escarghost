@@ -32,6 +32,12 @@ pub var phase_row_rebuild_ns: u64 = 0;
 pub var phase_row_shape_ns: u64 = 0;
 pub var phase_row_finish_ns: u64 = 0;
 pub var phase_row_count: u64 = 0;
+/// Time inside snail.shape + place (HarfBuzz proper) vs the cell walk —
+/// splits buildRow so "shaping is slow" claims can be checked against
+/// where the time actually goes.
+pub var phase_shape_call_ns: u64 = 0;
+pub var phase_shape_call_count: u64 = 0;
+pub var phase_cell_walk_ns: u64 = 0;
 
 // Hint diagnostic stubs (referenced by diagnostics.zig). The snail 0.13
 // pipeline doesn't populate these yet.
@@ -140,6 +146,11 @@ fn rgbEq(a: Rgb, b: Rgb) bool {
 
 /// Build one row: walk cells, accumulate text, shape, record, place.
 /// Returns the shapes (caller-owned via allocator) and rects.
+///
+/// `row` is caller-owned scratch, reset here. It must NOT be a local:
+/// it's ~48 KB of `undefined` buffers, and in safety-checked builds every
+/// `undefined` local is pattern-filled on entry — declared per row that
+/// memset dwarfed all real work (~5 ms/frame of the "build" phase).
 fn buildRow(
     snapshot: *const render_snapshot.SharedSnapshot,
     cell_index: *usize,
@@ -154,9 +165,11 @@ fn buildRow(
     misses: *glyph_misses.Set,
     shapes_out: []snail.Shape,
     box_rects_out: []ColoredRect,
+    row: *RowAccumulator,
 ) !struct { rect_count: usize, shape_count: usize, box_rect_count: usize, had_misses: bool } {
     var rect_count: usize = 0;
     var had_misses = false;
+    row.reset();
 
     // Terminal-drawn glyphs written ahead of the shaped text. `pl_n`
     // Powerline separator shapes occupy shapes_out[0..pl_n]; `box_n`
@@ -172,8 +185,7 @@ fn buildRow(
     var bg_span_color: ?Rgb = null;
     var bg_span_len: u16 = 0;
 
-    var row = RowAccumulator{};
-
+    const walk_t0 = perf.Timer.now();
     var col_idx: u16 = 0;
     while (col_idx < cols and cell_index.* < snapshot.header.cell_count) : ({
         col_idx += 1;
@@ -280,10 +292,17 @@ fn buildRow(
         }
     }
 
+    phase_cell_walk_ns += walk_t0.elapsedNs();
+
     // Shape + record + place. Text shapes go after any Powerline shapes we
     // already wrote at shapes_out[0..pl_n].
     var shape_count: usize = pl_n;
+    const shape_t = perf.Timer.now();
+    defer {
+        phase_shape_call_ns += shape_t.elapsedNs();
+    }
     if (!row.isEmpty()) {
+        phase_shape_call_count += 1;
         var shaped = snail.shape(allocator, faces, row.text[0..row.text_len], .{}) catch {
             row.reset();
             // Flush trailing bg span
@@ -441,6 +460,17 @@ pub const BuiltSnapshot = struct {
 /// Max shapes per row — generous upper bound for a full row of glyphs.
 const MAX_SHAPES_PER_ROW: usize = render_snapshot.MaxCols * 4;
 
+/// Row-scratch owned by the pipeline (~300 KB), passed into
+/// `buildSnapshot` each frame. Lives in the (heap-allocated) pipeline
+/// struct rather than as a local: safety-checked builds pattern-fill
+/// `undefined` locals on every scope entry, so even a hoisted per-call
+/// local re-pays a ~300 KB memset per frame. As a field it's filled once
+/// at pipeline init.
+pub const RowScratch = struct {
+    shapes: [MAX_SHAPES_PER_ROW]snail.Shape = undefined,
+    acc: RowAccumulator = .{},
+};
+
 /// Walk a snapshot row-by-row, shape each row's text, and capture cursor
 /// state in one pass.
 pub fn buildSnapshot(
@@ -456,6 +486,7 @@ pub fn buildSnapshot(
     selection_spans_out: []SelectionSpan,
     rect_stash: *EphemeralBlobs,
     misses: *glyph_misses.Set,
+    row_scratch: *RowScratch,
 ) !BuiltSnapshot {
     const header = snapshot.header;
     const default_fg = header.default_fg;
@@ -495,8 +526,6 @@ pub fn buildSnapshot(
         const rebuild_t0 = perf.Timer.now();
         const shape_t0 = perf.Timer.now();
 
-        // Scratch shape buffer for this row
-        var row_shapes: [MAX_SHAPES_PER_ROW]snail.Shape = undefined;
         const built = try buildRow(
             snapshot,
             &cell_index,
@@ -509,13 +538,14 @@ pub fn buildSnapshot(
             allocator,
             metrics,
             misses,
-            &row_shapes,
+            &row_scratch.shapes,
             box_rects_scratch,
+            &row_scratch.acc,
         );
         phase_row_shape_ns += shape_t0.elapsedNs();
 
         // Copy shapes + rects to heap for stable references
-        const shapes = try allocator.dupe(snail.Shape, row_shapes[0..built.shape_count]);
+        const shapes = try allocator.dupe(snail.Shape, row_scratch.shapes[0..built.shape_count]);
         try rect_stash.stashShapes(shapes);
         const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
         try rect_stash.stashRects(rects);
