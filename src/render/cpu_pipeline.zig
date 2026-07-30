@@ -179,9 +179,13 @@ pub const CpuPipeline = struct {
             .eph = row_build.EphemeralBlobs.init(allocator),
             .device_atlas = device_atlas,
         };
-        // Spawn the raster thread pool (all cores by default). Best-effort:
-        // on failure we fall back to single-threaded rasterization.
-        if (self.thread_pool.init(allocator, .{})) |_| {
+        // Spawn the raster thread pool at max(nproc/2, 8) threads — enough to
+        // parallelize a full-screen software frame without claiming every core
+        // (the prep thread + GPU worker also want CPU). Best-effort: on failure
+        // we fall back to single-threaded rasterization.
+        const cpu_count = std.Thread.getCpuCount() catch 8;
+        const pool_threads = @max(cpu_count / 2, 8);
+        if (self.thread_pool.init(allocator, .{ .threads = pool_threads })) |_| {
             self.pool_ready = true;
         } else |err| {
             log.warn(.cpu, "raster thread pool init failed; single-threaded", .{ .err = err });
