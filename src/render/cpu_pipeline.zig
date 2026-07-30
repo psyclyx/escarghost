@@ -145,6 +145,10 @@ pub const CpuPipeline = struct {
     scratch_rects: [row_build.MAX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
     scratch_box_rects: [row_build.MAX_BOX_RECTS_PER_ROW]row_build.ColoredRect = undefined,
     rows_out: [render_snapshot.MaxRows]row_build.RowDraw = undefined,
+    /// Scratch for the graceful-skip path: a row's shapes filtered to those
+    /// already prepped in the atlas, when emit's all-or-nothing call fails on a
+    /// not-yet-prepped glyph. Only touched on a partial row. Mirrors GpuPipeline.
+    filtered_shapes: [render_snapshot.MaxCols * 4]snail.Shape = undefined,
     selection_spans: [row_build.MAX_SELECTION_SPANS]row_build.SelectionSpan = undefined,
     row_scratch: row_build.RowScratch = .{},
     eph: row_build.EphemeralBlobs,
@@ -362,8 +366,14 @@ pub const CpuPipeline = struct {
         try self.instances.resize(self.allocator, cap);
         try self.batches.resize(self.allocator, cap);
 
+        // emit is all-or-nothing per call: one glyph not yet prepped in the
+        // atlas fails the whole row. Rather than drop the row (and log per
+        // row — which flooded the log under a flood), re-emit only the prepped
+        // shapes so the row still renders; the rest fill in on a later sampled
+        // frame. Summarize the partials once per frame. Mirrors GpuPipeline.
         var instance_len: usize = 0;
         var batch_len: usize = 0;
+        var partial_rows: u32 = 0;
         for (rows) |row| {
             if (row.shapes.len == 0) continue;
             const xform = snail.Transform2D.translate(0, row.row_y);
@@ -377,10 +387,37 @@ pub const CpuPipeline = struct {
                 row.shapes,
                 xform,
                 white_tint,
-            ) catch |err| {
-                log.warn(.cpu, "emit failed for row", .{ .err = err });
-                continue;
+            ) catch {
+                // Failed call stages into the buffer tails but only commits on
+                // full success, so il/bl are untouched — re-emit the subset.
+                partial_rows += 1;
+                var n: usize = 0;
+                for (row.shapes) |s| {
+                    if (atlas.contains(s.key)) {
+                        self.filtered_shapes[n] = s;
+                        n += 1;
+                    }
+                }
+                if (n > 0) {
+                    _ = snail.emit.emit(
+                        self.instances.items,
+                        self.batches.items,
+                        &instance_len,
+                        &batch_len,
+                        binding,
+                        atlas,
+                        self.filtered_shapes[0..n],
+                        xform,
+                        white_tint,
+                    ) catch {};
+                }
             };
+        }
+        if (partial_rows > 0) {
+            log.warn(.cpu, "rows partially drawn (glyphs not yet prepped)", .{
+                .rows = partial_rows,
+                .total_rows = rows.len,
+            });
         }
         if (instance_len == 0) return;
 
