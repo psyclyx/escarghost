@@ -427,6 +427,12 @@ pub fn main(init: std.process.Init) !void {
     state.render.gpu_snapshot_dirty = false;
     state.render.gpu_reconfigure_requested = false;
     state.render.render_serial = 0;
+    // Start atlas-generation tracking from the bootstrap's final value —
+    // the rect/Powerline bakes advanced it from 0, and counting those as
+    // a catch-up would render (and commit) an empty pre-content frame
+    // whose 20 ms cold render + vsync gate then serialize ahead of the
+    // first real content frame.
+    state.render.last_atlas_gen = atlas_ref_ptr.loadGeneration();
 
     // ── Phase 5: early PTY drain + event loop ──
     state.refs.gpu = gpu;
