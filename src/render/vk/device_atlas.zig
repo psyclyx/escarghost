@@ -35,6 +35,12 @@ pub const DeviceAtlasOptions = struct {
     max_images: u32 = 16,
     max_image_width: u32 = 1024,
     max_image_height: u32 = 1024,
+    /// Initial curve/band GPU buffer capacity, in pages. The buffers grow on
+    /// demand up to the pool's `max_pages` ceiling (see `growPoolBuffers`), so
+    /// this is just the starting size — big enough that a normal screen never
+    /// triggers a grow, small relative to the ceiling so we don't reserve the
+    /// worst case up front.
+    initial_pages: u32 = 64,
 };
 
 // ── Descriptor bindings (must match renderer.zig / snail's shader ABI) ──
@@ -56,6 +62,19 @@ pub const DeviceAtlas = struct {
     desc_set_layout: vk.VkDescriptorSetLayout = null,
 
     flat: upload_plan.FlatLayout,
+    /// Current curve/band GPU buffer capacity, in pages. Starts at
+    /// `options.initial_pages`, grows toward `flat.logical_pages` (`max_pages`)
+    /// as the working set climbs. The buffers only ever hold pages
+    /// `0..capacity_pages`; page k's byte offset is `k * page_texels * bpp`
+    /// (snail's `FlatLayout.translate`), independent of total size, so a buffer
+    /// smaller than the `max_pages` total is valid as long as it covers every
+    /// page the current atlas touches.
+    capacity_pages: u32 = 0,
+    /// Hard cap on `capacity_pages`: the smaller of the pool ceiling and what a
+    /// uniform texel buffer can address on this GPU (`maxTexelBufferElements /
+    /// curve_page_texels`). Growth never exceeds this; a working set past it
+    /// (physically enormous) degrades to partial rather than an OOB copy.
+    max_gpu_pages: u32 = 0,
 
     curve_buffer: vk.VkBuffer = null,
     curve_memory: vk.VkDeviceMemory = null,
@@ -117,12 +136,22 @@ pub const DeviceAtlas = struct {
         const info_scratch = try allocator.alloc(f32, info_scratch_len);
         errdefer allocator.free(info_scratch);
 
+        const flat = try upload_plan.FlatLayout.init(pool);
+
+        // Clamp GPU capacity to what a uniform texel buffer can address here.
+        var props: vk.VkPhysicalDeviceProperties = undefined;
+        vk.vkGetPhysicalDeviceProperties(ctx.physical_device, &props);
+        const limit_pages: u32 = @intCast(@min(@as(u64, props.limits.maxTexelBufferElements) / flat.curve_page_texels, @as(u64, flat.logical_pages)));
+        const max_gpu_pages = @max(@as(u32, 1), limit_pages);
+
         var self: Self = .{
             .allocator = allocator,
             .ctx = ctx,
             .pool = pool,
             .options = options,
-            .flat = try upload_plan.FlatLayout.init(pool),
+            .flat = flat,
+            .max_gpu_pages = max_gpu_pages,
+            .capacity_pages = @min(@max(1, options.initial_pages), max_gpu_pages),
             .planner = try upload_plan.Planner.init(pool, opts, gen, curve_words, band_words, slots, info_free, image_free),
             .plan_gen = gen,
             .plan_curve = curve_words,
@@ -168,6 +197,15 @@ pub const DeviceAtlas = struct {
         return .{ @intCast(self.flat.curve_page_texels), @intCast(self.flat.band_page_texels) };
     }
 
+    /// Byte size of the curve/band buffers for a given page capacity. Curve
+    /// texels are RGBA16F (8 B), band texels RG16UI (4 B).
+    fn curveBytes(self: *const Self, pages: u32) u64 {
+        return @as(u64, pages) * self.flat.curve_page_texels * 8;
+    }
+    fn bandBytes(self: *const Self, pages: u32) u64 {
+        return @as(u64, pages) * self.flat.band_page_texels * 4;
+    }
+
     /// Plan + upload `atlas` synchronously; returns the binding to emit with.
     pub fn upload(self: *Self, atlas: *const snail.Atlas) !Binding {
         try self.ensureGpuResources();
@@ -177,6 +215,15 @@ pub const DeviceAtlas = struct {
         const binding = try self.planner.plan(atlas, self.plan_regions, &len, info_scratch);
         errdefer _ = self.planner.release(binding);
         const regions = self.plan_regions[0..len];
+
+        // Grow the curve/band buffers if this atlas references a page beyond
+        // the current GPU capacity, before any copies target them.
+        var max_page: u32 = 0;
+        for (regions) |r| switch (r.target) {
+            .curve, .band => max_page = @max(max_page, r.page + 1),
+            else => {},
+        };
+        if (max_page > self.capacity_pages) try self.growPoolBuffers(max_page);
 
         var total: usize = 0;
         for (regions) |r| total = std.math.add(usize, total, r.src.len) catch return error.UploadSizeOverflow;
@@ -231,6 +278,11 @@ pub const DeviceAtlas = struct {
         for (regions, 0..) |r, i| {
             switch (r.target) {
                 .curve, .band => {
+                    // Skip pages the GPU buffer can't hold (growth hit the
+                    // texel-buffer limit); their glyphs render as gaps rather
+                    // than overrun the buffer. Only reachable past ~128k
+                    // distinct on-screen glyphs.
+                    if (r.page >= self.capacity_pages) continue;
                     const copy = (try self.flat.translate(r)).?;
                     const region = vk.VkBufferCopy{ .srcOffset = @intCast(offsets[i]), .dstOffset = copy.byte_offset, .size = @intCast(r.src.len) };
                     const dst_buf = if (r.target == .curve) self.curve_buffer else self.band_buffer;
@@ -297,12 +349,102 @@ pub const DeviceAtlas = struct {
     }
 
     fn createPoolBuffers(self: *Self) !void {
-        const usage = vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
-        try createBuffer(self.ctx, self.flat.curveByteSize(), usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.curve_buffer, &self.curve_memory);
-        try createBuffer(self.ctx, self.flat.bandByteSize(), usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.band_buffer, &self.band_memory);
-        self.curve_view = try createBufferView(self.ctx, self.curve_buffer, CURVE_FMT, self.flat.curveByteSize());
-        self.band_view = try createBufferView(self.ctx, self.band_buffer, BAND_FMT, self.flat.bandByteSize());
-        memtrack.atlas_image.onAlloc(self.flat.curveByteSize() + self.flat.bandByteSize());
+        const usage = vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+        const curve_bytes = self.curveBytes(self.capacity_pages);
+        const band_bytes = self.bandBytes(self.capacity_pages);
+        try createBuffer(self.ctx, curve_bytes, usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.curve_buffer, &self.curve_memory);
+        try createBuffer(self.ctx, band_bytes, usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.band_buffer, &self.band_memory);
+        self.curve_view = try createBufferView(self.ctx, self.curve_buffer, CURVE_FMT, curve_bytes);
+        self.band_view = try createBufferView(self.ctx, self.band_buffer, BAND_FMT, band_bytes);
+        memtrack.atlas_image.onAlloc(curve_bytes + band_bytes);
+    }
+
+    /// Grow the curve/band GPU buffers so they cover at least `needed_pages`
+    /// pages. New device-local buffers are allocated at the next power-of-two
+    /// capacity (capped at the pool ceiling), the live region is copied
+    /// old→new on the GPU (device-local→device-local, VRAM bandwidth), the old
+    /// buffers are freed, and the descriptor set is repointed. Runs on the GPU
+    /// worker between frames (synchronous `submitAndWait`), so no frame is
+    /// mid-flight reading the descriptor during the swap. No-op if the current
+    /// capacity already covers `needed_pages`.
+    fn growPoolBuffers(self: *Self, needed_pages: u32) !void {
+        const ceiling = self.max_gpu_pages;
+        if (needed_pages <= self.capacity_pages) return;
+        var new_cap = self.capacity_pages;
+        while (new_cap < needed_pages) new_cap *|= 2;
+        new_cap = @min(new_cap, ceiling);
+        if (new_cap <= self.capacity_pages) return; // already at ceiling
+
+        const usage = vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+        const new_curve_bytes = self.curveBytes(new_cap);
+        const new_band_bytes = self.bandBytes(new_cap);
+
+        var new_curve_buf: vk.VkBuffer = null;
+        var new_curve_mem: vk.VkDeviceMemory = null;
+        try createBuffer(self.ctx, new_curve_bytes, usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &new_curve_buf, &new_curve_mem);
+        errdefer {
+            vk.vkDestroyBuffer(self.ctx.device, new_curve_buf, null);
+            vk.vkFreeMemory(self.ctx.device, new_curve_mem, null);
+        }
+        var new_band_buf: vk.VkBuffer = null;
+        var new_band_mem: vk.VkDeviceMemory = null;
+        try createBuffer(self.ctx, new_band_bytes, usage, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &new_band_buf, &new_band_mem);
+        errdefer {
+            vk.vkDestroyBuffer(self.ctx.device, new_band_buf, null);
+            vk.vkFreeMemory(self.ctx.device, new_band_mem, null);
+        }
+
+        // All remaining fallible work happens before the irreversible swap, so
+        // a failure leaves the old buffers + descriptor intact (caller retries).
+        const new_curve_view = try createBufferView(self.ctx, new_curve_buf, CURVE_FMT, new_curve_bytes);
+        errdefer vk.vkDestroyBufferView(self.ctx.device, new_curve_view, null);
+        const new_band_view = try createBufferView(self.ctx, new_band_buf, BAND_FMT, new_band_bytes);
+        errdefer vk.vkDestroyBufferView(self.ctx.device, new_band_view, null);
+
+        // Copy the live region old→new on the GPU, then barrier transfer→shader
+        // so the copied pages are readable regardless of what the ensuing
+        // upload touches. The queue is idle here (prior frame waited), so the
+        // old buffers' last reads are already complete.
+        const cmd = try self.ctx.allocCommandBuffer();
+        defer self.ctx.freeCommandBuffer(cmd);
+        const begin = vk.VkCommandBufferBeginInfo{ .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (vk.vkBeginCommandBuffer(cmd, &begin) != vk.VK_SUCCESS) return error.VulkanError;
+        const curve_copy = vk.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = self.curveBytes(self.capacity_pages) };
+        vk.vkCmdCopyBuffer(cmd, self.curve_buffer, new_curve_buf, 1, &curve_copy);
+        const band_copy = vk.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = self.bandBytes(self.capacity_pages) };
+        vk.vkCmdCopyBuffer(cmd, self.band_buffer, new_band_buf, 1, &band_copy);
+        var bb = [2]vk.VkBufferMemoryBarrier{ bufBarrier(new_curve_buf), bufBarrier(new_band_buf) };
+        vk.vkCmdPipelineBarrier(cmd, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 2, &bb, 0, null);
+        if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.VulkanError;
+        try self.ctx.submitAndWait(cmd);
+
+        // ── Irreversible from here (no fallible calls): retire old, install
+        // new, repoint the descriptor set. ──
+        const dev = self.ctx.device;
+        memtrack.atlas_image.onFree(self.curveBytes(self.capacity_pages) + self.bandBytes(self.capacity_pages));
+        if (self.curve_view != null) vk.vkDestroyBufferView(dev, self.curve_view, null);
+        if (self.curve_buffer != null) vk.vkDestroyBuffer(dev, self.curve_buffer, null);
+        if (self.curve_memory != null) vk.vkFreeMemory(dev, self.curve_memory, null);
+        if (self.band_view != null) vk.vkDestroyBufferView(dev, self.band_view, null);
+        if (self.band_buffer != null) vk.vkDestroyBuffer(dev, self.band_buffer, null);
+        if (self.band_memory != null) vk.vkFreeMemory(dev, self.band_memory, null);
+
+        self.curve_buffer = new_curve_buf;
+        self.curve_memory = new_curve_mem;
+        self.band_buffer = new_band_buf;
+        self.band_memory = new_band_mem;
+        self.curve_view = new_curve_view;
+        self.band_view = new_band_view;
+
+        var texel_views = [2]vk.VkBufferView{ self.curve_view, self.band_view };
+        var writes = [2]vk.VkWriteDescriptorSet{
+            std.mem.zeroInit(vk.VkWriteDescriptorSet, .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = self.desc_set, .dstBinding = CURVE_BINDING, .descriptorCount = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &texel_views[0] }),
+            std.mem.zeroInit(vk.VkWriteDescriptorSet, .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = self.desc_set, .dstBinding = BAND_BINDING, .descriptorCount = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &texel_views[1] }),
+        };
+        vk.vkUpdateDescriptorSets(dev, 2, &writes, 0, null);
+        memtrack.atlas_image.onAlloc(new_curve_bytes + new_band_bytes);
+        log.info(.gpu, "atlas grew", .{ .pages = new_cap, .curve_mb = new_curve_bytes / (1 << 20) });
+        self.capacity_pages = new_cap;
     }
 
     fn createSampledImages(self: *Self) !void {

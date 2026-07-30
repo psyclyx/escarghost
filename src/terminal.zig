@@ -1,9 +1,11 @@
 const std = @import("std");
 const color = @import("color");
+const term_events = @import("term_events.zig");
 const Rgb = color.Rgb;
 
 const c = @cImport({
     @cInclude("ghostty/vt.h");
+    @cInclude("pthread.h");
 });
 
 fn ghosttyRgb(rgb: Rgb) c.GhosttyColorRgb {
@@ -45,12 +47,43 @@ pub const Terminal = struct {
     key_encoder: c.GhosttyKeyEncoder,
     key_event: c.GhosttyKeyEvent,
 
+    // ── Locking discipline ──
+    //
+    // The PTY reader thread mutates the terminal through `feedData`; the
+    // main thread reads (snapshot capture, selection) and mutates
+    // (scroll, resize) it. `mutex` serializes them.
+    //
+    // Two method families:
+    //  - Self-locking: feedData, resize, scrollViewport, scrollToTop,
+    //    scrollToBottom, scrollbar, colCount, rowCount, encodeKey,
+    //    isBracketedPaste. Call freely from the main thread.
+    //  - Externally-locked (marked "caller holds lock"): the
+    //    render-state/iteration family (updateRenderState, resetDirty,
+    //    getColors, getCursor, beginRowIteration, nextRow, isRowDirty,
+    //    beginCellIteration, nextCell, getCellInfo), fillRowFromScreen,
+    //    and getTitle. These span multiple calls or return borrowed
+    //    memory, so the caller brackets the whole use with
+    //    `lock()`/`unlock()`. Never call a self-locking method inside
+    //    that bracket (the mutex is not recursive).
+    //
+    // Terminal callbacks (bell, title, future OSC) fire inside
+    // `feedData`, i.e. on the reader thread UNDER the lock: they must
+    // not call back into locking methods. Main-thread work is deferred
+    // by pushing a term_events.Event instead (see term_events.zig).
+    //
+    // pthread mutex (blocking, like atlas_ref's shape_lock): holds span
+    // a full feedData chunk or snapshot capture (~100-500 us) — spinning
+    // that long would burn a core.
+    mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
+
     pty_fd: std.posix.fd_t = -1,
     title: []const u8 = "",
 
     // Callbacks
     on_bell: ?*const fn () void = null,
-    on_title_changed: ?*const fn ([]const u8) void = null,
+    /// Reader→main event channel for callbacks that need main-thread
+    /// handling (title today; OSC callbacks land here too).
+    events: ?*term_events.Queue = null,
     io: std.Io = undefined,
 
     /// Approximate bytes-per-row used to translate the caller's
@@ -116,7 +149,8 @@ pub const Terminal = struct {
         self.pty_fd = -1;
         self.title = "";
         self.on_bell = null;
-        self.on_title_changed = null;
+        self.events = null;
+        if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.MutexInitFailed;
 
         // Set colors
         var palette_c: [256]c.GhosttyColorRgb = undefined;
@@ -137,6 +171,7 @@ pub const Terminal = struct {
     }
 
     pub fn deinit(self: *Terminal) void {
+        _ = c.pthread_mutex_destroy(&self.mutex);
         c.ghostty_key_event_free(self.key_event);
         c.ghostty_key_encoder_free(self.key_encoder);
         c.ghostty_render_state_row_cells_free(self.row_cells);
@@ -145,22 +180,45 @@ pub const Terminal = struct {
         c.ghostty_terminal_free(self.handle);
     }
 
+    /// Acquire/release the terminal lock for a multi-call read or write
+    /// (snapshot capture, row iteration, fillRowFromScreen, getTitle).
+    pub fn lock(self: *Terminal) void {
+        _ = c.pthread_mutex_lock(&self.mutex);
+    }
+
+    pub fn unlock(self: *Terminal) void {
+        _ = c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    /// Self-locking. Runs terminal callbacks (bell/title/OSC) inline,
+    /// under the lock, on the calling (reader) thread.
     pub fn feedData(self: *Terminal, data: []const u8) void {
+        self.lock();
+        defer self.unlock();
         c.ghostty_terminal_vt_write(self.handle, data.ptr, data.len);
     }
 
+    /// Self-locking.
     pub fn resize(self: *Terminal, cols: u16, rows: u16, cell_w: u32, cell_h: u32) !void {
+        self.lock();
+        defer self.unlock();
         if (c.ghostty_terminal_resize(self.handle, cols, rows, cell_w, cell_h) != c.GHOSTTY_SUCCESS)
             return error.ResizeFailed;
     }
 
+    /// Self-locking.
     pub fn colCount(self: *Terminal) u16 {
+        self.lock();
+        defer self.unlock();
         var n: u16 = 0;
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_COLS, &n);
         return n;
     }
 
+    /// Self-locking.
     pub fn rowCount(self: *Terminal) u16 {
+        self.lock();
+        defer self.unlock();
         var n: u16 = 0;
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_ROWS, &n);
         return n;
@@ -176,17 +234,27 @@ pub const Terminal = struct {
     /// number of rows including scrollback; `offset` is the topmost
     /// visible row; `len` is the viewport height in rows. When
     /// `total == len` the user is at the bottom with no scrollback.
+    /// Self-locking.
     pub fn scrollbar(self: *Terminal) Scrollbar {
+        self.lock();
+        defer self.unlock();
+        return self.scrollbarLocked();
+    }
+
+    /// Caller holds lock (used inside snapshot capture).
+    pub fn scrollbarLocked(self: *Terminal) Scrollbar {
         var sb: c.GhosttyTerminalScrollbar = .{ .total = 0, .offset = 0, .len = 0 };
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb);
         return .{ .total = sb.total, .offset = sb.offset, .len = sb.len };
     }
 
+    /// Caller holds lock.
     pub fn updateRenderState(self: *Terminal) !void {
         if (c.ghostty_render_state_update(self.render_state, self.handle) != c.GHOSTTY_SUCCESS)
             return error.RenderStateUpdateFailed;
     }
 
+    /// Caller holds lock.
     pub fn resetDirty(self: *Terminal) void {
         var dirty_false: c.GhosttyRenderStateDirty = c.GHOSTTY_RENDER_STATE_DIRTY_FALSE;
         _ = c.ghostty_render_state_set(self.render_state, c.GHOSTTY_RENDER_STATE_OPTION_DIRTY, &dirty_false);
@@ -344,21 +412,30 @@ pub const Terminal = struct {
         return info;
     }
 
+    /// Self-locking.
     pub fn scrollViewport(self: *Terminal, delta: isize) void {
+        self.lock();
+        defer self.unlock();
         c.ghostty_terminal_scroll_viewport(self.handle, .{
             .tag = c.GHOSTTY_SCROLL_VIEWPORT_DELTA,
             .value = .{ .delta = @intCast(delta) },
         });
     }
 
+    /// Self-locking.
     pub fn scrollToTop(self: *Terminal) void {
+        self.lock();
+        defer self.unlock();
         c.ghostty_terminal_scroll_viewport(self.handle, .{
             .tag = c.GHOSTTY_SCROLL_VIEWPORT_TOP,
             .value = .{ .delta = 0 },
         });
     }
 
+    /// Self-locking.
     pub fn scrollToBottom(self: *Terminal) void {
+        self.lock();
+        defer self.unlock();
         c.ghostty_terminal_scroll_viewport(self.handle, .{
             .tag = c.GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
             .value = .{ .delta = 0 },
@@ -369,7 +446,7 @@ pub const Terminal = struct {
     /// screen-y `screen_y`, where 0 is the top of the scrollback. Used
     /// by selection text extraction to walk rows that aren't currently
     /// in the viewport (and so aren't reachable from the render state
-    /// iterator).
+    /// iterator). Caller holds lock (grid refs dangle across mutation).
     ///
     /// Cost: one O(scrollback) page-list traversal per row + O(cols)
     /// cheap cell reads, by reusing the page node returned from the
@@ -387,9 +464,9 @@ pub const Terminal = struct {
         // Walk the row by mutating ref.x. Same node + same y =
         // same row inside the page; only the column changes. Safe
         // as long as no terminal mutation happens between the
-        // grid_ref lookup and these reads — we hold the main
-        // thread throughout, so callers must not interleave PTY
-        // writes between this call and consuming `out`.
+        // grid_ref lookup and these reads — the caller holds the
+        // terminal lock, so the reader thread can't feed PTY data
+        // mid-walk.
         var col: u16 = 0;
         while (col < out.len) : (col += 1) {
             ref.x = col;
@@ -408,7 +485,10 @@ pub const Terminal = struct {
         return col;
     }
 
+    /// Self-locking.
     pub fn isBracketedPaste(self: *Terminal) bool {
+        self.lock();
+        defer self.unlock();
         var v: bool = false;
         // GHOSTTY_MODE_BRACKETED_PASTE is a non-ANSI mode (DEC 2004);
         // Zig's C translator chokes on the macro because the header
@@ -452,6 +532,7 @@ pub const Terminal = struct {
     // Persistent buffer for encoded key output (avoids dangling stack pointer)
     var encode_buf: [128]u8 = undefined;
 
+    /// Self-locking (reads terminal modes for the encoder).
     pub fn encodeKey(
         self: *Terminal,
         key: c.GhosttyKey,
@@ -459,6 +540,8 @@ pub const Terminal = struct {
         mods: c.GhosttyMods,
         utf8: ?[]const u8,
     ) ?[]const u8 {
+        self.lock();
+        defer self.unlock();
         // Sync encoder settings from terminal state
         _ = c.ghostty_key_encoder_setopt_from_terminal(self.key_encoder, self.handle);
 
@@ -481,6 +564,8 @@ pub const Terminal = struct {
         return encode_buf[0..written];
     }
 
+    /// Caller holds lock — the returned slice borrows ghostty memory that
+    /// the reader thread may replace on the next OSC title write.
     pub fn getTitle(self: *Terminal) []const u8 {
         var title_str: c.GhosttyString = .{ .ptr = null, .len = 0 };
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_TITLE, &title_str);
@@ -506,7 +591,11 @@ pub const Terminal = struct {
     }
 
     fn titleChangedCallback(_: c.GhosttyTerminal, userdata: ?*anyopaque) callconv(.c) void {
+        // Fires on the reader thread, under the terminal lock — defer to
+        // main via the event queue; main re-reads the title under the
+        // lock (coalescing bursts). This is the template for OSC
+        // callbacks: push a variant, handle it in main's drain switch.
         const self: *Terminal = @ptrCast(@alignCast(userdata));
-        if (self.on_title_changed) |cb| cb(self.getTitle());
+        if (self.events) |q| q.push(.title_changed);
     }
 };

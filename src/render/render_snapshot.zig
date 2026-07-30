@@ -7,12 +7,15 @@ const selection_mod = @import("../selection.zig");
 const Rgb = color.Rgb;
 
 // Upper bounds on the rendered grid. The terminal grid is clamped to these
-// (see computeGridSize), so a very wide / zoomed-out window pads on the right
-// rather than silently dropping columns past the limit. The snapshot cell
-// buffer is MaxCols*MaxRows cells (~5 MB each); the render workers that hold
-// them are heap-allocated so this doesn't blow main's stack.
+// (see computeGridSize), so a very wide / zoomed-out window pads on the far
+// edge rather than silently dropping cells past the limit. Rows and columns
+// share one bound so a portrait / rotated monitor gets the same headroom as a
+// landscape one (a tall display needs as many rows as a wide one needs cols).
+// The snapshot cell buffer is MaxCols*MaxRows cells (~16 MB each); the render
+// workers that hold them are heap-allocated (and lazily faulted — only cells
+// actually written touch memory) so this doesn't blow main's stack.
 pub const MaxCols: u16 = 1024;
-pub const MaxRows: u16 = 320;
+pub const MaxRows: u16 = 1024;
 pub const MaxCells: usize = @as(usize, MaxCols) * MaxRows;
 
 pub const CursorStyle = enum(u8) {
@@ -221,7 +224,7 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, _: 
     // each anchored cell. `scrollbar()` returns offset = viewport
     // top in screen-row coords; zero when the viewport sits at the
     // start of an empty scrollback.
-    const sb = term.scrollbar();
+    const sb = term.scrollbarLocked();
     snapshot.header.viewport_offset = @intCast(@min(sb.offset, std.math.maxInt(u32)));
 }
 
@@ -229,6 +232,10 @@ pub fn captureCells(snapshot: *SharedSnapshot, term: *terminal_mod.Terminal, _: 
 /// CPU worker path where snapshot capture already runs after the worker
 /// has been signalled. The GPU path splits the two so iteration can run
 /// off the main thread.
+///
+/// Takes the terminal lock for the whole capture: the PTY reader thread
+/// feeds data concurrently, and both the render-state update and the
+/// row/cell iteration must observe one consistent terminal state.
 pub fn capture(
     snapshot: *SharedSnapshot,
     term: *terminal_mod.Terminal,
@@ -237,6 +244,8 @@ pub fn capture(
     scrollbar: ?ScrollbarOverlay,
     bell: ?BellOverlay,
 ) !void {
+    term.lock();
+    defer term.unlock();
     try prepare(snapshot, term, selection, scrollbar, bell);
     try captureCells(snapshot, term, atlas);
 }

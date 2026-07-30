@@ -216,8 +216,19 @@ pub const AtlasWorker = struct {
         // lazily allocated, so this is a ceiling, not a reservation. Curve
         // pages are 2x wider than before (1<<19) because CJK outlines are
         // curve-heavy (snail 90fce76: ~4x denser records).
+        // `max_pages` is the residency *ceiling*, not a reservation. CPU pages
+        // are allocated lazily; the GPU curve/band buffers start small and grow
+        // toward this ceiling on demand (see vk/device_atlas growPoolBuffers),
+        // so a shell costs a few pages while a full screen of distinct glyphs
+        // (a CJK document, the glyphstorm torture test) grows to fit and renders
+        // complete. 1024 pages ≈ 128k distinct CJK glyphs — far past any real
+        // per-screen working set — and its 1024·131072 = 2^27 curve texels sit
+        // at the common `maxTexelBufferElements` floor, so the curve buffer is
+        // addressable as a uniform texel buffer on any real GPU (device_atlas
+        // clamps growth to the queried limit too). Bookkeeping + planner scratch
+        // for 1024 pages is well under ~1 MB, allocated once.
         const pool = try snail.PagePool.init(alloc, .{
-            .max_pages = 64,
+            .max_pages = 1024,
             .curve_words_per_page = 1 << 19,
             .band_words_per_page = 1 << 15,
         });

@@ -86,8 +86,10 @@ pub const Manager = struct {
 
     /// Set to monotonic-ns deadline when a visual bell is in progress.
     /// Zero when no visual is active. Updated on every ring() so back-
-    /// to-back rings keep the flash visible.
-    visual_until_ns: u64 = 0,
+    /// to-back rings keep the flash visible. Atomic: ring() runs on the
+    /// PTY reader thread while the main loop reads it and clears it on
+    /// expiry.
+    visual_until_ns: std.atomic.Value(u64) = .init(0),
 
     /// Anti-spam gate for the audible path. ring() refuses to enqueue a
     /// fresh tone until this deadline has passed.
@@ -141,7 +143,7 @@ pub const Manager = struct {
         const now = nowNs();
 
         if (self.cfg.mode == .visual or self.cfg.mode == .both) {
-            self.visual_until_ns = now + @as(u64, self.cfg.visual_duration_ms) * std.time.ns_per_ms;
+            self.visual_until_ns.store(now + @as(u64, self.cfg.visual_duration_ms) * std.time.ns_per_ms, .release);
         }
 
         if (self.cfg.mode == .audible or self.cfg.mode == .both) {
@@ -161,18 +163,20 @@ pub const Manager = struct {
     /// True if the renderer should display an inverted snapshot this
     /// frame. False once the deadline elapses.
     pub fn isVisualActive(self: *const Manager) bool {
-        if (self.visual_until_ns == 0) return false;
-        return nowNs() < self.visual_until_ns;
+        const until = self.visual_until_ns.load(.acquire);
+        if (until == 0) return false;
+        return nowNs() < until;
     }
 
     /// Linear-fade opacity for the visual flash, in [0, 1]. Returns 0
     /// when the bell isn't active so renderers can skip the overlay
     /// pass entirely.
     pub fn visualAlpha(self: *const Manager) f32 {
-        if (self.visual_until_ns == 0) return 0;
+        const until = self.visual_until_ns.load(.acquire);
+        if (until == 0) return 0;
         const now = nowNs();
-        if (now >= self.visual_until_ns) return 0;
-        const remaining_ns = self.visual_until_ns - now;
+        if (now >= until) return 0;
+        const remaining_ns = until - now;
         const total_ns: u64 = @as(u64, self.cfg.visual_duration_ms) * std.time.ns_per_ms;
         if (total_ns == 0) return 0;
         const f = @as(f32, @floatFromInt(remaining_ns)) / @as(f32, @floatFromInt(total_ns));
@@ -185,10 +189,11 @@ pub const Manager = struct {
     /// don't sleep past a vsync mid-fade. Returns null when no bell
     /// is active.
     pub fn visualTimeoutMs(self: *const Manager) ?c_int {
-        if (self.visual_until_ns == 0) return null;
+        const until = self.visual_until_ns.load(.acquire);
+        if (until == 0) return null;
         const now = nowNs();
-        if (now >= self.visual_until_ns) return 0;
-        const remaining_ms = (self.visual_until_ns - now) / std.time.ns_per_ms + 1;
+        if (now >= until) return 0;
+        const remaining_ms = (until - now) / std.time.ns_per_ms + 1;
         const frame_ms: u64 = 16;
         return @intCast(@min(remaining_ms, frame_ms));
     }
@@ -196,9 +201,11 @@ pub const Manager = struct {
     /// Clears the visual deadline once consumed. Called after the
     /// renderer has committed a non-bell frame on the trailing edge.
     pub fn clearVisualIfExpired(self: *Manager) void {
-        if (self.visual_until_ns == 0) return;
-        if (nowNs() >= self.visual_until_ns) {
-            self.visual_until_ns = 0;
+        const until = self.visual_until_ns.load(.acquire);
+        if (until == 0) return;
+        if (nowNs() >= until) {
+            // CAS so a concurrent re-ring's fresh deadline survives.
+            _ = self.visual_until_ns.cmpxchgStrong(until, 0, .acq_rel, .acquire);
         }
     }
 

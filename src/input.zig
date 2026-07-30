@@ -603,6 +603,11 @@ fn writePasteToPty(text: []const u8) void {
 /// scrollback walker for rows above or below the visible viewport.
 fn fetchRowCodepoints(target_screen_y: u32, out: []u32) usize {
     const sb = state.refs.term.scrollbar();
+    // Hold the terminal lock across the render-state update + iteration
+    // (and the grid_ref walk on the slow path): the PTY reader thread
+    // mutates the grid concurrently.
+    state.refs.term.lock();
+    defer state.refs.term.unlock();
     // Fast path: row is inside the viewport — iterate the render
     // state, which we already update once per frame.
     if (target_screen_y >= sb.offset and target_screen_y - sb.offset < sb.len) {

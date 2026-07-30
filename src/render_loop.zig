@@ -180,13 +180,15 @@ pub fn currentBellOverlay(s: *app_state.AppState) ?render_snapshot.BellOverlay {
 /// commits.
 pub fn tickBell(s: *app_state.AppState) void {
     const bell = s.refs.bell;
-    if (bell.visual_until_ns == 0) return;
-    if (diagnostics.monotonicNowNs() < bell.visual_until_ns) {
+    const until = bell.visual_until_ns.load(.acquire);
+    if (until == 0) return;
+    if (diagnostics.monotonicNowNs() < until) {
         // Still fading — re-render so the alpha advances.
         markRenderDirty(s);
         return;
     }
-    bell.visual_until_ns = 0;
+    // CAS: the reader thread's ring() may have pushed a fresh deadline.
+    _ = bell.visual_until_ns.cmpxchgStrong(until, 0, .acq_rel, .acquire);
     markRenderDirty(s);
 }
 

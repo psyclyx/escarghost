@@ -18,6 +18,8 @@ const input = @import("input.zig");
 const log = @import("log.zig");
 const cli = @import("cli.zig");
 const bell_mod = @import("bell.zig");
+const pty_reader = @import("pty_reader.zig");
+const term_events = @import("term_events.zig");
 
 const c = @cImport({
     // Disable glibc fortify: its inline _chk wrappers (bits/poll2.h,
@@ -55,52 +57,9 @@ fn parseBool(v: ?[]const u8) bool {
 
 const monotonicNowNs = diagnostics.monotonicNowNs;
 
-// ── PTY drain log coalescing ──
-//
-// The wayland-yield mid-drain (commit c879f1b) splits a producer's
-// single burst into many sub-millisecond per-iteration drains. We
-// want the first one to print so the user sees activity start; the
-// rest get rolled up and emitted as a summary when anything *other*
-// than a pty-drain log fires (via the flush hook below).
-var pty_drain_rollup_rounds: usize = 0;
-var pty_drain_rollup_bytes: usize = 0;
-var pty_drain_rollup_reads: usize = 0;
-var pty_drain_prev_was_drain: bool = false;
-
-fn logPtyDrain(bytes: usize, reads: usize) void {
-    if (!pty_drain_prev_was_drain) {
-        // First drain in a new burst — emit fully.
-        log.debug(.pty, "drained", .{ .reads = reads, .bytes = bytes });
-        pty_drain_prev_was_drain = true;
-        pty_drain_rollup_rounds = 0;
-        pty_drain_rollup_bytes = 0;
-        pty_drain_rollup_reads = 0;
-    } else {
-        // Already in a drain burst — accumulate, don't emit.
-        pty_drain_rollup_rounds += 1;
-        pty_drain_rollup_bytes += bytes;
-        pty_drain_rollup_reads += reads;
-    }
-}
-
-fn flushPtyDrainRollup() void {
-    if (pty_drain_rollup_rounds > 0) {
-        log.debug(.pty, "drained (rolled up)", .{
-            .more_rounds = pty_drain_rollup_rounds,
-            .reads = pty_drain_rollup_reads,
-            .bytes = pty_drain_rollup_bytes,
-        });
-    }
-    pty_drain_rollup_rounds = 0;
-    pty_drain_rollup_bytes = 0;
-    pty_drain_rollup_reads = 0;
-    pty_drain_prev_was_drain = false;
-}
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     log.init(io);
-    log.setFlushHook(flushPtyDrainRollup);
     var state: app_state.AppState = .{};
     state.io = io;
     state.diag.markStart(io);
@@ -451,8 +410,23 @@ pub fn main(init: std.process.Init) !void {
     wl.on_focus = input.onFocus;
     wl.on_text_commit = input.onTextCommit;
 
-    // ── Event loop (frontend Wayland + PTY, gpu/cpu renderer threads) ──
-    var pty_buf: [65536]u8 = undefined;
+    // ── Event loop (frontend Wayland + PTY reader/gpu/cpu/atlas threads) ──
+    //
+    // PTY ingestion runs on a dedicated reader thread (pty_reader.zig):
+    // it feeds the terminal under the terminal lock and rings the event
+    // queue's doorbell. Main never reads the PTY — it wakes on the
+    // doorbell, marks a redraw, and drains typed events (EOF, title,
+    // future OSC callbacks).
+    var events_queue = try term_events.Queue.init();
+    defer events_queue.deinit();
+    term.events = &events_queue;
+
+    var reader: pty_reader.Reader = .{};
+    try reader.start(&pty, &term, &events_queue);
+    // Runs before the pty/term defers above (LIFO): the reader must be
+    // joined while the terminal and master fd are still alive.
+    defer reader.stop();
+
     var child_exited = false;
     // Drain phase: after the child exits we keep looping just long enough
     // to commit a final frame containing its last output. Without this a
@@ -470,14 +444,6 @@ pub fn main(init: std.process.Init) !void {
             state.diag.t_child_exited_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
         }
         if (child_exited and !draining) {
-            // Slurp any bytes still buffered on the master before the kernel
-            // closes the slave side.
-            while (true) {
-                const n = pty.read(&pty_buf) catch break;
-                if (n == 0) break;
-                term.feedData(pty_buf[0..n]);
-                render_loop.notePtyData(&state);
-            }
             draining = true;
             drain_deadline_ns = monotonicNowNs() + drain_timeout_ns;
             log.info(.main, "child exited, draining final frame", .{});
@@ -485,12 +451,17 @@ pub fn main(init: std.process.Init) !void {
 
         if (draining) {
             // Exit as soon as a frame containing the final PTY output has
-            // been committed (or no PTY output was ever produced). We
-            // don't wait for the GPU renderer to overtake CPU — the user
-            // has already seen the content.
+            // been committed (or no PTY output was ever produced). The
+            // reader thread owns residual-byte delivery, so nothing can
+            // be concluded before it reports EOF — child-exit detection
+            // (waitpid) can win the race against the final bytes, and
+            // "no output ever" is only knowable once the master is
+            // drained. The deadline below backstops a child that exits
+            // while something else keeps the pty slave open.
+            const ingested = reader.sawEof() and !reader.dataDirty() and !state.render.needs_redraw;
             const painted = state.lifecycle.first_content_painted or !state.lifecycle.first_pty_data_seen;
             const renderers_idle = !gpu.render_in_flight and !cpu.render_in_flight;
-            if (painted and renderers_idle) break;
+            if (ingested and painted and renderers_idle) break;
             if (monotonicNowNs() >= drain_deadline_ns) {
                 log.warn(.main, "drain timed out", .{});
                 break;
@@ -548,6 +519,10 @@ pub fn main(init: std.process.Init) !void {
         const bell_timeout = bell.visualTimeoutMs();
         const touch_timeout = input.touchTimeoutMs();
         const first_paint_timeout = render_loop.firstPaintHoldTimeoutMs(&state);
+        // While draining after child exit, wake at least every 10 ms so
+        // the drain deadline is enforced even with no fd activity (the
+        // reader thread is gone once it reports EOF).
+        const drain_timeout: ?c_int = if (draining) 10 else null;
         const poll_timeout = render_loop.combineTimeout(
             render_loop.combineTimeout(
                 render_loop.combineTimeout(
@@ -559,7 +534,10 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 touch_timeout,
             ),
-            first_paint_timeout,
+            render_loop.combineTimeout(
+                first_paint_timeout orelse -1,
+                drain_timeout,
+            ),
         );
 
         // The atlas update eventfd wakes us when the prep thread publishes
@@ -568,7 +546,7 @@ pub fn main(init: std.process.Init) !void {
         const atlas_update_fd = atlas_ref_ptr.updateFd();
         var pollfds = [_]c.struct_pollfd{
             .{ .fd = wl.displayFd(), .events = c.POLLIN, .revents = 0 },
-            .{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = events_queue.wakeFd(), .events = c.POLLIN, .revents = 0 },
             .{ .fd = if (gpu.active) gpu.responseFd() else -1, .events = if (gpu.active) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (cpu.active) cpu.responseFd() else -1, .events = if (cpu.active) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (atlas_thread.active) atlas_thread.responseFd() else -1, .events = if (atlas_thread.active) c.POLLIN else 0, .revents = 0 },
@@ -683,7 +661,9 @@ pub fn main(init: std.process.Init) !void {
                             // another render on the next loop iteration.
                             if (resp.serial == state.render.render_serial) {
                                 state.render.needs_redraw = false;
+                                term.lock();
                                 term.resetDirty();
+                                term.unlock();
                             }
                         }
                     },
@@ -742,7 +722,9 @@ pub fn main(init: std.process.Init) !void {
                         // Only clear dirty if no new PTY data arrived
                         // while the renderer was working.
                         if (resp.serial == state.render.render_serial and !state.render.needs_redraw) {
+                            term.lock();
                             term.resetDirty();
+                            term.unlock();
                         }
                     },
                     .failed => {
@@ -762,77 +744,30 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // After zoom/resize, draw before reading PTY so the reflowed
-        // content is presented before the shell's SIGWINCH response
-        // can clear the prompt line.
-        render_loop.maybeQueueGpuFrame(&state);
-        render_loop.renderActivePath(&state);
-
         if (pollfds[1].revents & c.POLLIN != 0) {
-            // Time-bounded drain: read until kernel buffer is empty OR
-            // we've burned the budget. Without the budget cap, a long
-            // stream (`cat largefile`) would hold the main thread for
-            // its full duration and the renderer would only see/commit
-            // the final state. With the cap we yield mid-stream so the
-            // user sees the output scroll by. 4 ms is roughly a
-            // quarter vblank — enough headroom that a slow feedData
-            // call (atlas miss, etc.) won't push past one full frame.
-            //
-            // We also yield as soon as new wayland events arrive
-            // (typically frame_done): otherwise the next commit waits
-            // until the drain completes — up to budget_ns of latency on
-            // the frame callback path. PTY POLLIN is level-triggered,
-            // so a partial drain just continues on the next iteration.
-            const wl_fd = wl.displayFd();
-            const read_start_ns = monotonicNowNs();
-            const read_budget_ns: u64 = 4 * std.time.ns_per_ms;
-            // This iteration's drain stats — folded into the cross-
-            // iteration accumulator at the end so a single burst that
-            // got chopped into many wayland-yielded chunks still
-            // produces just one debug line per ~100ms.
-            var drain_total_bytes: usize = 0;
-            var drain_read_count: usize = 0;
-            while (true) {
-                const read_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
-                const n = pty.read(&pty_buf) catch |e| switch (e) {
-                    error.WouldBlock => break,
-                    else => {
-                        log.err(.pty, "read failed, exiting", .{ .err = e });
-                        child_exited = true;
-                        break;
-                    },
-                };
-                if (n == 0) {
-                    log.info(.pty, "eof, exiting", .{});
-                    child_exited = true;
-                    break;
-                }
-                drain_total_bytes += n;
-                drain_read_count += 1;
-                if (state.diag.trace_commits) {
-                    state.diag.phase_pty_read_ns += monotonicNowNs() - read_t0;
-                    state.diag.phase_bytes_read += @intCast(n);
-                }
-                const feed_t0 = if (state.diag.trace_commits) monotonicNowNs() else 0;
-                term.feedData(pty_buf[0..n]);
-                if (state.diag.trace_commits) {
-                    state.diag.phase_feed_data_ns += monotonicNowNs() - feed_t0;
-                    state.diag.phase_feed_calls += 1;
-                }
-                if (state.diag.trace_commits and state.diag.t_first_pty_ns == 0) {
-                    state.diag.t_first_pty_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
-                }
+            // The reader thread rang the doorbell: PTY data was fed
+            // and/or typed events are queued. One redraw per wake,
+            // however many chunks the reader fed meanwhile.
+            events_queue.drainWake();
+            if (reader.takeDataDirty()) {
                 render_loop.notePtyData(&state);
-                if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
-                // Wayland events queued during the drain? Yield so the
-                // next iteration's prepare_read/poll picks them up
-                // before more PTY pours in.
-                var peek = c.struct_pollfd{ .fd = wl_fd, .events = c.POLLIN, .revents = 0 };
-                if (c.poll(@ptrCast(&peek), 1, 0) > 0 and peek.revents & c.POLLIN != 0) break;
             }
-            if (drain_read_count > 0) {
-                logPtyDrain(drain_total_bytes, drain_read_count);
-            }
+            while (events_queue.pop()) |ev| switch (ev) {
+                .pty_eof => {
+                    if (!child_exited) {
+                        log.info(.pty, "eof, exiting", .{});
+                        child_exited = true;
+                    }
+                },
+                .title_changed => {
+                    // Main-thread side of the OSC title callback. Re-read
+                    // under the terminal lock (coalesces bursts); wire to
+                    // xdg_toplevel_set_title when title support lands.
+                    term.lock();
+                    defer term.unlock();
+                    log.debug(.main, "title changed", .{ .title = term.getTitle() });
+                },
+            };
         }
 
         if (!child_exited) {
@@ -848,12 +783,20 @@ pub fn main(init: std.process.Init) !void {
         render_loop.pollAtlasUpdate(&state);
         render_loop.maybeQueueGpuFrame(&state);
         render_loop.renderActivePath(&state);
-
-        render_loop.maybeQueueGpuFrame(&state);
     }
 
     if (state.diag.trace_commits) {
         state.diag.t_main_loop_exit_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
+        // PTY ingestion phases now accumulate on the reader thread; fold
+        // them into the diag report before dumping.
+        state.diag.phase_pty_read_ns = reader.read_ns.load(.acquire);
+        state.diag.phase_feed_data_ns = reader.feed_ns.load(.acquire);
+        state.diag.phase_bytes_read = reader.bytes_read.load(.acquire);
+        state.diag.phase_feed_calls = reader.read_calls.load(.acquire);
+        const first_pty = reader.first_data_ns.load(.acquire);
+        if (state.diag.t_first_pty_ns == 0 and first_pty > state.diag.commit_trace_start_ns) {
+            state.diag.t_first_pty_ns = first_pty - state.diag.commit_trace_start_ns;
+        }
     }
     log.info(.main, "loop exit", .{});
     state.diag.dumpExitReport(io, .{
