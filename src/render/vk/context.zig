@@ -336,6 +336,26 @@ pub const Context = struct {
             return error.QueueWaitFailed;
         }
     }
+
+    /// Submit a command buffer that signals `signal_sem` on completion, WITHOUT
+    /// waiting. Used by the explicit-sync present path: the compositor waits on
+    /// the exported semaphore (via a DRM syncobj) instead of us draining the
+    /// queue. The caller must not reuse `cmd`/resources until a later fence or
+    /// the buffer's release point says the GPU is done.
+    pub fn submitSignal(self: *const Context, cmd: vk.VkCommandBuffer, signal_sem: vk.VkSemaphore) !void {
+        const submit_info = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &signal_sem,
+        };
+        const sr = vk.vkQueueSubmit(self.queue, 1, &submit_info, null);
+        if (sr != vk.VK_SUCCESS) {
+            log.err(.gpu, "vkQueueSubmit(async)", .{ .result = sr });
+            return error.SubmitFailed;
+        }
+    }
 };
 
 fn hasDeviceExtension(allocator: std.mem.Allocator, dev: vk.VkPhysicalDevice, name: [*:0]const u8) bool {

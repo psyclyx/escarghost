@@ -652,6 +652,7 @@ pub const GpuWorker = struct {
                         device_atlas.?.atlasPageTexels(),
                         pipeline.?.emittedInstances(),
                         pipeline.?.emittedBatches(),
+                        .{},
                     ) catch |e| {
                         log.err(.gpu, "render submit failed", .{ .err = e });
                         writeResponse(self.response_fds[1], self.io, fail);

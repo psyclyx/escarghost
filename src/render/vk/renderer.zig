@@ -589,6 +589,17 @@ fn imageBarrier(
 /// nanoseconds (timestamp queries, top→bottom of pipe), or 0 when the device
 /// doesn't support timestamps. The synchronous submit makes the readback
 /// race-free.
+/// How to submit the recorded frame.
+///  - default (`.{}`): allocate a throwaway command buffer, `submitAndWait`,
+///    read timestamps — the synchronous path (headless + no-explicit-sync).
+///  - explicit sync: pass a caller-owned `cmd` (not freed here; it must outlive
+///    the GPU work) and a `signal_sem` — submit async (no wait, no timestamps),
+///    so the compositor waits on the exported semaphore instead.
+pub const SubmitOpts = struct {
+    cmd: vk.VkCommandBuffer = null,
+    signal_sem: vk.VkSemaphore = null,
+};
+
 pub fn renderToTarget(
     self: *Renderer,
     ctx: *const Context,
@@ -599,12 +610,13 @@ pub fn renderToTarget(
     atlas_page_texels: [2]i32,
     instances: []const snail.render.records.Instance,
     batches: []const snail.render.records.DrawBatch,
+    submit: SubmitOpts,
 ) !u64 {
     const w = target.desc.width;
     const h = target.desc.height;
 
-    const cmd = try ctx.allocCommandBuffer();
-    defer ctx.freeCommandBuffer(cmd);
+    const cmd = submit.cmd orelse try ctx.allocCommandBuffer();
+    defer if (submit.cmd == null) ctx.freeCommandBuffer(cmd);
 
     const begin_info = vk.VkCommandBufferBeginInfo{
         .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -612,7 +624,10 @@ pub fn renderToTarget(
     };
     if (vk.vkBeginCommandBuffer(cmd, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandFailed;
 
-    const ts_pool = ctx.timestamp_query_pool;
+    // Async submit skips timestamps: the query readback needs the frame to
+    // have completed, which the synchronous path guarantees and this one does
+    // not (single shared query pool).
+    const ts_pool = if (submit.signal_sem == null) ctx.timestamp_query_pool else null;
     if (ts_pool != null) {
         vk.vkCmdResetQueryPool(cmd, ts_pool, 0, 2);
         vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool, 0);
@@ -670,6 +685,12 @@ pub fn renderToTarget(
     }
 
     if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.EndCommandFailed;
+    if (submit.signal_sem) |sem| {
+        // Async: the compositor waits on `sem` (bridged to a DRM syncobj); we
+        // don't drain the queue. No timestamp readback (frame isn't done).
+        try ctx.submitSignal(cmd, sem);
+        return 0;
+    }
     try ctx.submitAndWait(cmd);
 
     if (ts_pool != null) {
