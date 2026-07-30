@@ -19,6 +19,11 @@ const Context = @import("context.zig").Context;
 const vk = @import("vulkan.zig").vk;
 
 const c = @cImport({
+    // glibc fortify's inline open()/openat() _chk wrappers (bits/fcntl2.h)
+    // don't survive Zig 0.16 translate-c under ReleaseSafe; disable before any
+    // header pulls <features.h>. See shaping_race_and_fortify.
+    @cUndef("_FORTIFY_SOURCE");
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("time.h");
@@ -33,6 +38,9 @@ pub const ExplicitSync = struct {
     release: u32 = 0, // timeline syncobj handle (compositor signals)
     scratch: u32 = 0, // binary syncobj: staging for SYNC_FD → timeline transfer
     render_done: vk.VkSemaphore = null, // binary, SYNC_FD-exportable
+    // Loaded via vkGetDeviceProcAddr — the loader doesn't statically export
+    // this KHR entry point.
+    get_semaphore_fd: vk.PFN_vkGetSemaphoreFdKHR = null,
 
     pub fn init(ctx: *const Context) !ExplicitSync {
         const fd = c.open("/dev/dri/renderD128", c.O_RDWR | c.O_CLOEXEC);
@@ -60,8 +68,13 @@ pub const ExplicitSync = struct {
         };
         var sem: vk.VkSemaphore = null;
         if (vk.vkCreateSemaphore(ctx.device, &sem_info, null, &sem) != vk.VK_SUCCESS) return error.SemaphoreCreateFailed;
+        errdefer vk.vkDestroySemaphore(ctx.device, sem, null);
 
-        return .{ .ctx = ctx, .drm_fd = fd, .acquire = acquire, .release = release, .scratch = scratch, .render_done = sem };
+        const pfn = vk.vkGetDeviceProcAddr(ctx.device, "vkGetSemaphoreFdKHR");
+        if (pfn == null) return error.MissingGetSemaphoreFd;
+        const get_semaphore_fd: vk.PFN_vkGetSemaphoreFdKHR = @ptrCast(pfn);
+
+        return .{ .ctx = ctx, .drm_fd = fd, .acquire = acquire, .release = release, .scratch = scratch, .render_done = sem, .get_semaphore_fd = get_semaphore_fd };
     }
 
     pub fn deinit(self: *ExplicitSync) void {
@@ -93,7 +106,7 @@ pub const ExplicitSync = struct {
             .semaphore = self.render_done,
             .handleType = vk.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
         };
-        if (vk.vkGetSemaphoreFdKHR(self.ctx.device, &gi, &sync_fd) != vk.VK_SUCCESS) return error.SemaphoreExportFailed;
+        if (self.get_semaphore_fd.?(self.ctx.device, &gi, &sync_fd) != vk.VK_SUCCESS) return error.SemaphoreExportFailed;
         if (sync_fd < 0) return error.SemaphoreExportFailed; // -1 → already signaled/empty
         defer _ = c.close(sync_fd);
         if (c.drmSyncobjImportSyncFile(self.drm_fd, self.scratch, sync_fd) != 0) return error.ImportSyncFileFailed;

@@ -97,6 +97,10 @@ pub const Response = extern struct {
     /// misses (cells skipped pending async prep).
     had_misses: u8 = 0,
     serial: u32 = 0,
+    /// Explicit-sync only: the timeline point the render was signalled at. Main
+    /// sets this as the surface acquire+release point before committing. Zero on
+    /// the synchronous path.
+    acquire_point: u64 = 0,
 };
 
 const RequestTag = enum { configure, render, quit };
@@ -150,6 +154,18 @@ pub const GpuWorker = struct {
     ready: bool = false,
     render_in_flight: bool = false,
     first_frame_presented: bool = false,
+
+    // ── Explicit sync (opt-in, SCRGO_EXPLICIT_SYNC) ──
+    /// Set by main before start(); the worker enables explicit sync only if
+    /// this AND the device capability (ctx.explicit_sync) are both true.
+    want_explicit_sync: bool = false,
+    /// Set true by the worker once the DRM syncobj timelines are live and the
+    /// fds below are exported. Main imports them into the compositor.
+    explicit_sync_ready: bool = false,
+    /// syncobj timeline fds (same process → raw fd ints cross the thread).
+    /// Main imports these via import_timeline and closes them.
+    es_acquire_fd: c_int = -1,
+    es_release_fd: c_int = -1,
 
     pub fn responseFd(self: *const GpuWorker) c_int {
         return self.response_fds[0];
@@ -394,6 +410,19 @@ pub const GpuWorker = struct {
         var cached_atlas_gen: u64 = 0;
         var frame_slot: u32 = 0;
 
+        // Explicit sync: one command buffer per dmabuf target (async submit
+        // needs the cmd to outlive the GPU work), a release point per target,
+        // and a monotonic frame point. `explicit_sync` stays null unless both
+        // the env flag and the device capability are set.
+        var explicit_sync: ?vk.ExplicitSync = null;
+        defer if (explicit_sync) |*es| es.deinit();
+        var es_cmds: [MaxBuffers]vk.VkCommandBuffer = [_]vk.VkCommandBuffer{null} ** MaxBuffers;
+        defer for (es_cmds) |cmd| {
+            if (cmd != null) ctx.freeCommandBuffer(cmd);
+        };
+        var release_points: [MaxBuffers]u64 = [_]u64{0} ** MaxBuffers;
+        var frame_point: u64 = 0;
+
         var worker_wait_accum_ns: u64 = 0;
         var worker_wait_count: u64 = 0;
         var diag_frame_counter: u64 = 0;
@@ -538,10 +567,44 @@ pub const GpuWorker = struct {
                         continue;
                     }
 
+                    // Bring up explicit sync once (opt-in + device capable).
+                    // Export the timeline fds for main to import; alloc one
+                    // command buffer per dmabuf target for the async submits.
+                    if (explicit_sync == null and self.want_explicit_sync and ctx.explicit_sync) {
+                        if (vk.ExplicitSync.init(&ctx)) |es_val| {
+                            explicit_sync = es_val;
+                            const es = &explicit_sync.?;
+                            const afd = es.acquireFd() catch -1;
+                            const rfd = es.releaseFd() catch -1;
+                            var ok = afd >= 0 and rfd >= 0;
+                            for (0..dmabuf_count) |i| {
+                                es_cmds[i] = ctx.allocCommandBuffer() catch blk: {
+                                    ok = false;
+                                    break :blk null;
+                                };
+                            }
+                            if (ok) {
+                                self.es_acquire_fd = afd;
+                                self.es_release_fd = rfd;
+                                self.explicit_sync_ready = true;
+                                log.info(.gpu, "explicit sync ready", .{});
+                            } else {
+                                if (afd >= 0) _ = std.c.close(afd);
+                                if (rfd >= 0) _ = std.c.close(rfd);
+                                explicit_sync.?.deinit();
+                                explicit_sync = null;
+                                log.warn(.gpu, "explicit sync setup failed; using sync path", .{});
+                            }
+                        } else |e| {
+                            log.warn(.gpu, "explicit sync init failed; using sync path", .{ .err = e });
+                        }
+                    }
+
                     log.info(.gpu, "configured", .{
                         .width = request.width,
                         .height = request.height,
                         .buffers = dmabuf_count,
+                        .explicit_sync = explicit_sync != null,
                     });
                     writeResponse(self.response_fds[1], self.io, .{ .tag = .ready });
                 },
@@ -642,22 +705,56 @@ pub const GpuWorker = struct {
                     const clear_color = self.snapshots[snapshot_slot].header.default_bg.toLinearFloat4(1.0);
 
                     phase_t = perf.Timer.now();
-                    const gpu_ns = vk.renderToTarget(
-                        &renderer.?,
-                        &ctx,
-                        &dmabuf_targets[buffer_index],
-                        device_atlas.?.descriptorSet(),
-                        frame_slot,
-                        clear_color,
-                        device_atlas.?.atlasPageTexels(),
-                        pipeline.?.emittedInstances(),
-                        pipeline.?.emittedBatches(),
-                        .{},
-                    ) catch |e| {
-                        log.err(.gpu, "render submit failed", .{ .err = e });
-                        writeResponse(self.response_fds[1], self.io, fail);
-                        continue;
-                    };
+                    var acquire_point: u64 = 0;
+                    var gpu_ns: u64 = 0;
+                    if (explicit_sync) |*es| {
+                        // Wait for the compositor to release this buffer's prior
+                        // frame (implies that render + its cmd buffer are done),
+                        // render async signalling render_done, then place that
+                        // completion on the acquire timeline for the compositor.
+                        es.waitRelease(release_points[buffer_index], std.time.ns_per_s);
+                        frame_point += 1;
+                        gpu_ns = vk.renderToTarget(
+                            &renderer.?,
+                            &ctx,
+                            &dmabuf_targets[buffer_index],
+                            device_atlas.?.descriptorSet(),
+                            frame_slot,
+                            clear_color,
+                            device_atlas.?.atlasPageTexels(),
+                            pipeline.?.emittedInstances(),
+                            pipeline.?.emittedBatches(),
+                            .{ .cmd = es_cmds[buffer_index], .signal_sem = es.render_done },
+                        ) catch |e| {
+                            log.err(.gpu, "render submit failed", .{ .err = e });
+                            writeResponse(self.response_fds[1], self.io, fail);
+                            continue;
+                        };
+                        es.signalAcquire(frame_point) catch |e| {
+                            log.err(.gpu, "acquire signal failed", .{ .err = e });
+                            writeResponse(self.response_fds[1], self.io, fail);
+                            continue;
+                        };
+                        release_points[buffer_index] = frame_point;
+                        acquire_point = frame_point;
+                    } else {
+                        gpu_ns = vk.renderToTarget(
+                            &renderer.?,
+                            &ctx,
+                            &dmabuf_targets[buffer_index],
+                            device_atlas.?.descriptorSet(),
+                            frame_slot,
+                            clear_color,
+                            device_atlas.?.atlasPageTexels(),
+                            pipeline.?.emittedInstances(),
+                            pipeline.?.emittedBatches(),
+                            .{},
+                        ) catch |e| {
+                            log.err(.gpu, "render submit failed", .{ .err = e });
+                            writeResponse(self.response_fds[1], self.io, fail);
+                            continue;
+                        };
+                    }
                     const render_ns = phase_t.elapsedNs();
                     phaseRenderNs += render_ns;
                     phaseGpuNs += gpu_ns;
@@ -670,6 +767,7 @@ pub const GpuWorker = struct {
                         .snapshot_slot = snapshot_slot,
                         .had_misses = @intFromBool(had_misses),
                         .serial = request.serial,
+                        .acquire_point = acquire_point,
                     });
 
                     // Per-frame phase split (mirrors the CPU worker's "frame

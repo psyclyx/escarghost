@@ -340,6 +340,12 @@ pub fn main(init: std.process.Init) !void {
     }
     log.info(.cpu, "started", .{});
 
+    // Explicit sync (opt-in via SCRGO_EXPLICIT_SYNC): the GPU worker sets up
+    // DRM syncobj timelines during configure when this is set + the device is
+    // capable; main imports them into the compositor once the worker reports
+    // them ready. Gated on the compositor advertising the manager.
+    gpu.want_explicit_sync = parseBool(getenv("SCRGO_EXPLICIT_SYNC")) and wl.syncobj_manager != null;
+
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr);
         gpu.requestConfigure(wl.width, wl.height, state.metrics.font_size, state.metrics.cell_width, state.metrics.cell_height, state.metrics.baseline_offset, state.metrics.descent) catch |e| {
@@ -436,6 +442,10 @@ pub fn main(init: std.process.Init) !void {
     var draining = false;
     var drain_deadline_ns: u64 = 0;
     const drain_timeout_ns: u64 = 250 * std.time.ns_per_ms;
+
+    // True once the compositor-side explicit-sync surface + timelines are up.
+    // Set in the gpu `.ready` handler; gates per-frame set_acquire/release_point.
+    var explicit_sync_active = false;
 
     log.info(.main, "loop entry", .{});
 
@@ -608,6 +618,26 @@ pub fn main(init: std.process.Init) !void {
                             state.render.gpu_snapshot_dirty = true;
                             state.render.gpu_restart.clear();
                             log.info(.gpu, "ready", .{});
+
+                            // Bring up the compositor side of explicit sync once
+                            // the worker has exported its timeline fds. libwayland
+                            // dups the fds on import, so we close ours after.
+                            if (!explicit_sync_active and gpu.explicit_sync_ready and wl.syncobj_manager != null) {
+                                if (wl.setupExplicitSync(gpu.es_acquire_fd, gpu.es_release_fd)) {
+                                    explicit_sync_active = true;
+                                    log.info(.gpu, "explicit sync active", .{});
+                                } else {
+                                    log.warn(.gpu, "explicit-sync wl setup failed; sync present", .{});
+                                }
+                                if (gpu.es_acquire_fd >= 0) {
+                                    _ = std.c.close(gpu.es_acquire_fd);
+                                    gpu.es_acquire_fd = -1;
+                                }
+                                if (gpu.es_release_fd >= 0) {
+                                    _ = std.c.close(gpu.es_release_fd);
+                                    gpu.es_release_fd = -1;
+                                }
+                            }
                         } else {
                             render_loop.noteGpuUnavailable(&state);
                         }
@@ -637,6 +667,10 @@ pub fn main(init: std.process.Init) !void {
                                     // prior render is discarded, but
                                     // there's no latency penalty for the
                                     // newer content.
+                                    // Explicit sync: set the acquire/release
+                                    // timeline points on the surface before the
+                                    // commit picks them up atomically.
+                                    if (explicit_sync_active) wl.setSyncPoints(resp.acquire_point);
                                     gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                                     state.diag.recordCommit('g');
                                     state.diag.recordCommitSerial('g', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);

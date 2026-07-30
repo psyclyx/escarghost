@@ -177,6 +177,9 @@ pub const Wayland = struct {
     /// Explicit-sync (Wayland). Null when the compositor doesn't advertise it,
     /// in which case the GPU worker keeps the synchronous present path.
     syncobj_manager: ?*wl.wp_linux_drm_syncobj_manager_v1 = null,
+    syncobj_surface: ?*wl.wp_linux_drm_syncobj_surface_v1 = null,
+    acquire_timeline: ?*wl.wp_linux_drm_syncobj_timeline_v1 = null,
+    release_timeline: ?*wl.wp_linux_drm_syncobj_timeline_v1 = null,
     data_device_manager: ?*wl.wl_data_device_manager = null,
     data_device: ?*wl.wl_data_device = null,
     primary_selection_manager: ?*wl.zwp_primary_selection_device_manager_v1 = null,
@@ -454,6 +457,31 @@ pub const Wayland = struct {
         _ = egl.eglSwapInterval(self.egl_display, 0);
     }
 
+    /// Bring up explicit sync for the main surface: wrap it in a syncobj
+    /// surface and import the GPU worker's acquire/release timeline fds (dup'd
+    /// by libwayland, so the caller closes them after). Returns false if the
+    /// manager or surface isn't available. See [[sync.zig]].
+    pub fn setupExplicitSync(self: *Wayland, acquire_fd: c_int, release_fd: c_int) bool {
+        const mgr = self.syncobj_manager orelse return false;
+        const surf = self.surface orelse return false;
+        self.syncobj_surface = wl.wp_linux_drm_syncobj_manager_v1_get_surface(mgr, surf);
+        self.acquire_timeline = wl.wp_linux_drm_syncobj_manager_v1_import_timeline(mgr, acquire_fd);
+        self.release_timeline = wl.wp_linux_drm_syncobj_manager_v1_import_timeline(mgr, release_fd);
+        return self.syncobj_surface != null and self.acquire_timeline != null and self.release_timeline != null;
+    }
+
+    /// Set the acquire + release timeline points for the next surface commit
+    /// (both at `point`: the GPU worker signals acquire@point when the render
+    /// completes and the compositor signals release@point when done). Must be
+    /// called before the buffer commit. No-op if explicit sync isn't up.
+    pub fn setSyncPoints(self: *Wayland, point: u64) void {
+        const s = self.syncobj_surface orelse return;
+        const hi: u32 = @intCast(point >> 32);
+        const lo: u32 = @truncate(point);
+        wl.wp_linux_drm_syncobj_surface_v1_set_acquire_point(s, self.acquire_timeline, hi, lo);
+        wl.wp_linux_drm_syncobj_surface_v1_set_release_point(s, self.release_timeline, hi, lo);
+    }
+
     pub fn deinit(self: *Wayland) void {
         if (self.xkb_state) |s| xkb.xkb_state_unref(s);
         if (self.xkb_keymap) |k| xkb.xkb_keymap_unref(k);
@@ -478,6 +506,9 @@ pub const Wayland = struct {
         if (self.cursor_shape_device) |d| wl.wp_cursor_shape_device_v1_destroy(d);
         if (self.cursor_shape_manager) |mgr| wl.wp_cursor_shape_manager_v1_destroy(mgr);
         if (self.single_pixel_buffer_manager) |mgr| wl.wp_single_pixel_buffer_manager_v1_destroy(mgr);
+        if (self.acquire_timeline) |t| wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
+        if (self.release_timeline) |t| wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
+        if (self.syncobj_surface) |s| wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
         if (self.syncobj_manager) |m| wl.wp_linux_drm_syncobj_manager_v1_destroy(m);
         if (self.linux_dmabuf) |linux_dmabuf| wl.zwp_linux_dmabuf_v1_destroy(linux_dmabuf);
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
