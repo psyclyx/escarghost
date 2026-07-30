@@ -121,6 +121,25 @@ pub const RenderState = struct {
     /// re-render to fill in glyphs that were missing last frame, even if the
     /// terminal state itself hasn't changed.
     last_atlas_gen: u64 = 0,
+    /// Whether the most recently committed frame was rendered with glyph
+    /// misses (cells left blank pending async prep), and its serial. Feeds
+    /// the anti-pop-in bypass: if the atlas catches up while that commit is
+    /// still pending in the compositor, we render again inside the same
+    /// vsync window and replace it (latest-commit-wins) so the incomplete
+    /// frame is never latched.
+    committed_had_misses: bool = false,
+    committed_miss_serial: u32 = 0,
+    /// One-shot permission for the next render to bypass the frame_pending
+    /// vsync gate. Armed by pollAtlasUpdate when the atlas catches up to a
+    /// pending miss-y commit; consumed when a render is queued. Each bypass
+    /// costs one atlas publish to arm, so it cannot spin.
+    atlas_catchup_bypass: bool = false,
+    /// First-paint hold: before first content paint the screen shows the
+    /// solid bg surface, which is already correct — so a miss-y first frame
+    /// is withheld (never committed) until the atlas catches up or this
+    /// monotonic-ns deadline passes. 0 = not armed.
+    first_paint_hold_until_ns: u64 = 0,
+    first_paint_hold_expired: bool = false,
     target_render_path: RenderPath = .gpu,
     active_render_path: RenderPath = .cpu,
     gpu_restart: GpuRestartBackoff = .{},
@@ -197,6 +216,13 @@ pub const TouchState = struct {
 pub const Lifecycle = struct {
     first_pty_data_seen: bool = false,
     first_content_painted: bool = false,
+    /// render_serial stamped by the markRenderDirty that accompanied the
+    /// first PTY data. A commit only counts as the first *content* paint
+    /// when its serial is at or past this — a frame snapshotted before the
+    /// data arrived (empty screen) committing after it must not count, or
+    /// the first-paint hold loses its window and the real first content
+    /// frame pops in with missing glyphs.
+    first_content_serial: u32 = 0,
 };
 
 pub const DebugFlags = struct {

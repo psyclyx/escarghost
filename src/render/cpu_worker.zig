@@ -25,7 +25,9 @@ pub const Response = extern struct {
     tag: ResponseTag,
     buffer_index: u8 = 0,
     snapshot_slot: u8 = 0,
-    reserved: [1]u8 = [_]u8{0} ** 1,
+    /// Frame responses only: nonzero when the frame was built with glyph
+    /// misses (cells skipped pending async prep).
+    had_misses: u8 = 0,
     serial: u32 = 0,
 };
 
@@ -393,6 +395,7 @@ pub const Frontend = struct {
                         .tag = .frame,
                         .buffer_index = buffer_index,
                         .snapshot_slot = snapshot_slot,
+                        .had_misses = @intFromBool(!pipeline.misses.isEmpty()),
                         .serial = request.serial,
                     });
                     if (warn_slow_budget_ms) |budget_ms| {

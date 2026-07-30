@@ -12,12 +12,25 @@ const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
 /// with missing glyphs must be redrawn once the atlas catches up, or those
 /// cells stay blank until the next terminal change. No-op when the atlas is
 /// warm (generation stable → no spurious redraws).
+///
+/// Anti-pop-in: if the frame we most recently committed had glyph misses and
+/// nothing else has changed since (serial match), arm a one-shot bypass of
+/// the frame_pending vsync gate. The re-render then commits inside the same
+/// vsync window, replacing the pending miss-y buffer in the compositor
+/// (latest-commit-wins) — if it lands before the latch, the incomplete frame
+/// is never shown. During floods the serial keeps advancing, so the bypass
+/// never fires and pacing stays one frame per vsync.
 pub fn pollAtlasUpdate(s: *app_state.AppState) void {
     const gen = s.refs.atlas_ref.loadGeneration();
     if (gen != s.render.last_atlas_gen) {
         s.render.last_atlas_gen = gen;
         s.render.gpu_snapshot_dirty = true;
         s.render.needs_redraw = true;
+        if (s.render.committed_had_misses and
+            s.render.committed_miss_serial == s.render.render_serial)
+        {
+            s.render.atlas_catchup_bypass = true;
+        }
     }
 }
 
@@ -28,9 +41,76 @@ pub fn markRenderDirty(s: *app_state.AppState) void {
     s.render.gpu_snapshot_dirty = true;
 }
 
-pub fn markFirstContentPaint(s: *app_state.AppState) void {
-    if (s.lifecycle.first_content_painted or !s.lifecycle.first_pty_data_seen) return;
+/// Record PTY data arrival: dirty the frame and, on the first data,
+/// stamp which serial will contain it (see Lifecycle.first_content_serial).
+pub fn notePtyData(s: *app_state.AppState) void {
+    markRenderDirty(s);
+    if (!s.lifecycle.first_pty_data_seen) {
+        s.lifecycle.first_pty_data_seen = true;
+        s.lifecycle.first_content_serial = s.render.render_serial;
+    }
+}
+
+/// Wrapping serial comparison: true when `serial` is at or past the first
+/// content-bearing serial (i.e. the frame's snapshot includes PTY output).
+fn serialHasContent(s: *const app_state.AppState, serial: u32) bool {
+    if (!s.lifecycle.first_pty_data_seen) return false;
+    return serial -% s.lifecycle.first_content_serial < 1 << 31;
+}
+
+pub fn markFirstContentPaint(s: *app_state.AppState, committed_serial: u32) void {
+    if (s.lifecycle.first_content_painted) return;
+    if (!serialHasContent(s, committed_serial)) return;
     s.lifecycle.first_content_painted = true;
+}
+
+/// Cap on how long the first content paint may be withheld waiting for
+/// glyph prep. Prep normally publishes within a few ms; this only bites
+/// when a glyph can't be prepped at all, and bounds how long the user
+/// stares at the bare bg surface.
+const FIRST_PAINT_HOLD_MAX_NS: u64 = 100 * std.time.ns_per_ms;
+
+/// Decide whether to withhold a rendered-but-miss-y frame instead of
+/// committing it, called from the frame-response handlers. Only before
+/// first content paint: the screen still shows the solid bg surface —
+/// which is correct — so holding costs nothing visually, and the first
+/// thing the user sees is a complete frame instead of glyph pop-in.
+/// Arms a deadline on first hold; once it expires (or the frame is
+/// clean) frames commit unconditionally. The held frame is simply
+/// dropped — its buffer was never committed, so it stays free — and the
+/// re-render is driven by the atlas update eventfd (or the deadline
+/// wake, see tickFirstPaintHold).
+pub fn shouldHoldFirstPaint(s: *app_state.AppState, had_misses: bool) bool {
+    if (s.lifecycle.first_content_painted or !had_misses) return false;
+    if (s.render.first_paint_hold_expired) return false;
+    const now = diagnostics.monotonicNowNs();
+    if (s.render.first_paint_hold_until_ns == 0) {
+        s.render.first_paint_hold_until_ns = now + FIRST_PAINT_HOLD_MAX_NS;
+    }
+    return now < s.render.first_paint_hold_until_ns;
+}
+
+/// Called once per loop iteration. If the first-paint hold deadline
+/// passed without the atlas catching up, force a redraw so the held
+/// content finally commits (with whatever glyphs exist).
+pub fn tickFirstPaintHold(s: *app_state.AppState) void {
+    if (s.lifecycle.first_content_painted) return;
+    if (s.render.first_paint_hold_until_ns == 0 or s.render.first_paint_hold_expired) return;
+    if (diagnostics.monotonicNowNs() < s.render.first_paint_hold_until_ns) return;
+    s.render.first_paint_hold_expired = true;
+    log.warn(.frame, "first-paint hold expired, committing with misses", .{});
+    markRenderDirty(s);
+}
+
+/// Poll timeout so the main loop wakes at the hold deadline even if the
+/// prep thread never publishes. Null when no hold is armed.
+pub fn firstPaintHoldTimeoutMs(s: *app_state.AppState) ?c_int {
+    if (s.lifecycle.first_content_painted) return null;
+    if (s.render.first_paint_hold_until_ns == 0 or s.render.first_paint_hold_expired) return null;
+    const now = diagnostics.monotonicNowNs();
+    if (now >= s.render.first_paint_hold_until_ns) return 0;
+    const delta_ms = (s.render.first_paint_hold_until_ns - now) / std.time.ns_per_ms + 1;
+    return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
 }
 
 pub fn bumpScrollbarVisibility(s: *app_state.AppState) void {
@@ -122,7 +202,9 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     const wl = s.refs.wayland;
     if (s.render.target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !s.render.gpu_snapshot_dirty) return;
-    if (wl.frame_pending) return;
+    // atlas_catchup_bypass lets one render through mid-vsync so its commit
+    // can replace a pending miss-y frame before the compositor latches.
+    if (wl.frame_pending and !s.render.atlas_catchup_bypass) return;
     gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), currentBellOverlay(s)) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer so
@@ -160,6 +242,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     log.setFrame(.frame, s.render.render_serial);
     log.debug(.frame, "queued gpu frame", .{});
     s.render.gpu_snapshot_dirty = false;
+    s.render.atlas_catchup_bypass = false;
 }
 
 pub fn renderActivePath(s: *app_state.AppState) void {
@@ -169,8 +252,10 @@ pub fn renderActivePath(s: *app_state.AppState) void {
     if (s.render.active_render_path != .cpu or !s.render.needs_redraw) return;
     if (s.render.target_render_path == .gpu and gpu.active and gpu.ready) return;
     // Same vsync throttle as the GPU path — wait for the compositor to
-    // ack the previous commit before queueing the next one.
-    if (wl.frame_pending) return;
+    // ack the previous commit before queueing the next one. The atlas
+    // catch-up bypass punches through so a miss-y pending commit can be
+    // replaced before the latch (see pollAtlasUpdate).
+    if (wl.frame_pending and !s.render.atlas_catchup_bypass) return;
     if (cpu.active) {
         const shm = wl.shm orelse return;
         cpu.ensureBuffers(@ptrCast(shm), wl.width, wl.height) catch |err| switch (err) {
@@ -195,6 +280,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             else => return,
         };
         s.render.needs_redraw = false;
+        s.render.atlas_catchup_bypass = false;
         log.setFrame(.frame, s.render.render_serial);
         log.debug(.frame, "queued cpu frame", .{ .width = wl.width, .height = wl.height });
         return;

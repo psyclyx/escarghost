@@ -470,8 +470,7 @@ pub fn main(init: std.process.Init) !void {
                 const n = pty.read(&pty_buf) catch break;
                 if (n == 0) break;
                 term.feedData(pty_buf[0..n]);
-                state.lifecycle.first_pty_data_seen = true;
-                render_loop.markRenderDirty(&state);
+                render_loop.notePtyData(&state);
             }
             draining = true;
             drain_deadline_ns = monotonicNowNs() + drain_timeout_ns;
@@ -525,6 +524,7 @@ pub fn main(init: std.process.Init) !void {
 
         render_loop.maybeScheduleScrollbarHide(&state);
         render_loop.tickBell(&state);
+        render_loop.tickFirstPaintHold(&state);
         input.tickTouch();
         input.tickFling();
         render_loop.pollAtlasUpdate(&state);
@@ -541,15 +541,19 @@ pub fn main(init: std.process.Init) !void {
         const scroll_timeout = render_loop.scrollbarTimeoutMs(&state);
         const bell_timeout = bell.visualTimeoutMs();
         const touch_timeout = input.touchTimeoutMs();
+        const first_paint_timeout = render_loop.firstPaintHoldTimeoutMs(&state);
         const poll_timeout = render_loop.combineTimeout(
             render_loop.combineTimeout(
                 render_loop.combineTimeout(
-                    render_loop.combineTimeout(repeat_timeout, restart_timeout),
-                    scroll_timeout,
+                    render_loop.combineTimeout(
+                        render_loop.combineTimeout(repeat_timeout, restart_timeout),
+                        scroll_timeout,
+                    ),
+                    bell_timeout,
                 ),
-                bell_timeout,
+                touch_timeout,
             ),
-            touch_timeout,
+            first_paint_timeout,
         );
 
         // The atlas update eventfd wakes us when the prep thread publishes
@@ -632,26 +636,39 @@ pub fn main(init: std.process.Init) !void {
                             log.setFrame(.frame, resp.serial);
                             log.debug(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
-                                // Commit immediately. If the compositor
-                                // still has the prior frame pending,
-                                // this commit replaces it in the
-                                // compositor's pending state — the
-                                // prior render is discarded, but
-                                // there's no latency penalty for the
-                                // newer content.
-                                gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
-                                state.diag.recordCommit('g');
-                                state.diag.recordCommitSerial('g', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
-                                if (!wl.frame_pending) wl.requestFrame();
-                                if (state.render.active_render_path != .gpu) {
-                                    log.info(.frame, "path switch", .{ .from = "cpu", .to = "gpu" });
-                                    state.render.active_render_path = .gpu;
+                                if (render_loop.shouldHoldFirstPaint(&state, resp.had_misses != 0)) {
+                                    // Withhold the miss-y first frame — the bg
+                                    // surface on screen is already correct, so
+                                    // we wait for the atlas to catch up (or
+                                    // the hold deadline) and commit a complete
+                                    // frame instead. Buffer stays free (never
+                                    // committed → never busy).
+                                    state.diag.recordCommit('h');
+                                    log.debug(.gpu, "frame held for first paint", .{ .buffer = resp.buffer_index });
+                                } else {
+                                    // Commit immediately. If the compositor
+                                    // still has the prior frame pending,
+                                    // this commit replaces it in the
+                                    // compositor's pending state — the
+                                    // prior render is discarded, but
+                                    // there's no latency penalty for the
+                                    // newer content.
+                                    gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
+                                    state.diag.recordCommit('g');
+                                    state.diag.recordCommitSerial('g', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
+                                    if (!wl.frame_pending) wl.requestFrame();
+                                    state.render.committed_had_misses = resp.had_misses != 0;
+                                    state.render.committed_miss_serial = resp.serial;
+                                    if (state.render.active_render_path != .gpu) {
+                                        log.info(.frame, "path switch", .{ .from = "cpu", .to = "gpu" });
+                                        state.render.active_render_path = .gpu;
+                                    }
+                                    if (!gpu.first_frame_presented) {
+                                        log.info(.gpu, "first paint", .{});
+                                        gpu.first_frame_presented = true;
+                                    }
+                                    render_loop.markFirstContentPaint(&state, resp.serial);
                                 }
-                                if (!gpu.first_frame_presented) {
-                                    log.info(.gpu, "first paint", .{});
-                                    gpu.first_frame_presented = true;
-                                }
-                                render_loop.markFirstContentPaint(&state);
                             }
                             // Only clear the dirty bit if the snapshot we
                             // committed reflects the latest state. If PTY
@@ -686,14 +703,24 @@ pub fn main(init: std.process.Init) !void {
                         const buffer_ok = resp.buffer_index < cpu.buffer_count;
                         const path_ok = state.render.active_render_path == .cpu;
                         const size_ok = cpu.width == wl.width and cpu.height == wl.height;
-                        if (buffer_ok and path_ok and size_ok) {
+                        if (buffer_ok and path_ok and size_ok and
+                            render_loop.shouldHoldFirstPaint(&state, resp.had_misses != 0))
+                        {
+                            // Withhold the miss-y first frame; the bg surface
+                            // on screen is already correct. Re-render comes
+                            // from the atlas eventfd or the hold deadline.
+                            state.diag.recordCommit('h');
+                            log.debug(.cpu, "frame held for first paint", .{ .buffer = resp.buffer_index });
+                        } else if (buffer_ok and path_ok and size_ok) {
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                             state.diag.recordCommit('c');
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
+                            state.render.committed_had_misses = resp.had_misses != 0;
+                            state.render.committed_miss_serial = resp.serial;
                             log.setFrame(.frame, resp.serial);
                             log.debug(.cpu, "frame committed", .{ .buffer = resp.buffer_index });
-                            render_loop.markFirstContentPaint(&state);
+                            render_loop.markFirstContentPaint(&state, resp.serial);
                         } else {
                             const reason: []const u8 = if (!buffer_ok)
                                 "bad_buffer_index"
@@ -789,8 +816,7 @@ pub fn main(init: std.process.Init) !void {
                 if (state.diag.trace_commits and state.diag.t_first_pty_ns == 0) {
                     state.diag.t_first_pty_ns = monotonicNowNs() - state.diag.commit_trace_start_ns;
                 }
-                state.lifecycle.first_pty_data_seen = true;
-                render_loop.markRenderDirty(&state);
+                render_loop.notePtyData(&state);
                 if (monotonicNowNs() - read_start_ns >= read_budget_ns) break;
                 // Wayland events queued during the drain? Yield so the
                 // next iteration's prepare_read/poll picks them up

@@ -349,7 +349,7 @@ pub const Diagnostics = struct {
 
         if (self.trace_commits and self.commit_trace_len > 0) {
             log.info(.diag, "commit trace", .{ .commits = self.commit_trace_len });
-            const Path = enum { gpu, cpu, bg, dis, unknown };
+            const Path = enum { gpu, cpu, bg, dis, held, unknown };
             var prev_ms: f32 = 0;
             for (self.commit_trace[0..self.commit_trace_len], 0..) |entry, i| {
                 const path: Path = switch (entry.path) {
@@ -357,6 +357,7 @@ pub const Diagnostics = struct {
                     'c' => .cpu,
                     'b' => .bg,
                     'd' => .dis,
+                    'h' => .held,
                     else => .unknown,
                 };
                 log.cont("", .{
