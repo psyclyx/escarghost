@@ -20,6 +20,11 @@ pub const Context = struct {
     command_pool: vk.VkCommandPool,
     render_pass: vk.VkRenderPass,
     supports_dual_source_blend: bool,
+    /// True when the device supports the extensions + timelineSemaphore feature
+    /// needed to bridge a render-completion semaphore to a DRM syncobj (for
+    /// Wayland explicit sync). When false, callers keep the synchronous
+    /// (`submitAndWait`) present path.
+    explicit_sync: bool = false,
     /// GPU-side frame timing via timestamp queries (2 slots: top/bottom of
     /// the frame command buffer). Null when the queue family doesn't support
     /// timestamps. Single pool is safe: rendering is fully synchronous
@@ -36,6 +41,7 @@ pub const Context = struct {
         // ── Instance ──
         const instance_extensions = [_][*:0]const u8{
             vk.VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+            vk.VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
             vk.VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
             vk.VK_KHR_SURFACE_EXTENSION_NAME,
         };
@@ -96,7 +102,9 @@ pub const Context = struct {
         if (physical_device == null) return error.NoSuitableDevice;
 
         // ── Device ──
-        const device_extensions = [_][*:0]const u8{
+        var device_extensions: std.ArrayListUnmanaged([*:0]const u8) = .empty;
+        defer device_extensions.deinit(allocator);
+        try device_extensions.appendSlice(allocator, &.{
             vk.VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
             vk.VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             vk.VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
@@ -104,7 +112,20 @@ pub const Context = struct {
             // Required by VK_EXT_image_drm_format_modifier.
             vk.VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
             vk.VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        });
+
+        // Explicit-sync bridge: opt in only if every piece is supported, else
+        // fall back to submitAndWait. SYNC_FD-exportable semaphores link a
+        // render submit to a DRM syncobj timeline point (see sync.zig).
+        const sync_exts = [_][*:0]const u8{
+            vk.VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+            vk.VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+            vk.VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         };
+        var explicit_sync = true;
+        for (sync_exts) |e| {
+            if (!hasDeviceExtension(allocator, physical_device, e)) explicit_sync = false;
+        }
 
         const queue_priorities = [_]f32{1.0};
         const queue_create_info = vk.VkDeviceQueueCreateInfo{
@@ -123,17 +144,31 @@ pub const Context = struct {
             .sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_FEATURES_EXT,
             .advancedBlendCoherentOperations = vk.VK_FALSE,
         };
-        features2.pNext = &blend_features;
+        var timeline_features = vk.VkPhysicalDeviceTimelineSemaphoreFeatures{
+            .sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+            .timelineSemaphore = vk.VK_FALSE,
+            .pNext = &blend_features,
+        };
+        features2.pNext = &timeline_features;
         vk.vkGetPhysicalDeviceFeatures2(physical_device, &features2);
 
         const supports_dual_source_blend = features2.features.dualSrcBlend == vk.VK_TRUE;
+        if (timeline_features.timelineSemaphore != vk.VK_TRUE) explicit_sync = false;
+        if (explicit_sync) {
+            try device_extensions.appendSlice(allocator, &sync_exts);
+        } else {
+            // Don't enable the timeline feature we won't use (and whose
+            // extension we won't request).
+            timeline_features.timelineSemaphore = vk.VK_FALSE;
+            features2.pNext = &blend_features;
+        }
 
         const device_create_info = vk.VkDeviceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &queue_create_info,
-            .enabledExtensionCount = device_extensions.len,
-            .ppEnabledExtensionNames = @ptrCast(&device_extensions),
+            .enabledExtensionCount = @intCast(device_extensions.items.len),
+            .ppEnabledExtensionNames = device_extensions.items.ptr,
             .enabledLayerCount = 0,
             .ppEnabledLayerNames = null,
             .pNext = &features2,
@@ -235,6 +270,7 @@ pub const Context = struct {
             .queue_family = queue_family_index,
             .dual_src_blend = supports_dual_source_blend,
             .gpu_timestamps = timestamp_query_pool != null,
+            .explicit_sync = explicit_sync,
         });
 
         return .{
@@ -246,6 +282,7 @@ pub const Context = struct {
             .command_pool = command_pool,
             .render_pass = render_pass,
             .supports_dual_source_blend = supports_dual_source_blend,
+            .explicit_sync = explicit_sync,
             .timestamp_query_pool = timestamp_query_pool,
             .timestamp_period = timestamp_period,
             .timestamp_valid_bits = timestamp_valid_bits,
@@ -300,6 +337,20 @@ pub const Context = struct {
         }
     }
 };
+
+fn hasDeviceExtension(allocator: std.mem.Allocator, dev: vk.VkPhysicalDevice, name: [*:0]const u8) bool {
+    var count: u32 = 0;
+    if (vk.vkEnumerateDeviceExtensionProperties(dev, null, &count, null) != vk.VK_SUCCESS) return false;
+    const props = allocator.alloc(vk.VkExtensionProperties, count) catch return false;
+    defer allocator.free(props);
+    if (vk.vkEnumerateDeviceExtensionProperties(dev, null, &count, props.ptr) != vk.VK_SUCCESS) return false;
+    const want = std.mem.span(name);
+    for (props[0..count]) |p| {
+        const have = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&p.extensionName)), 0);
+        if (std.mem.eql(u8, have, want)) return true;
+    }
+    return false;
+}
 
 fn findGraphicsQueue(dev: vk.VkPhysicalDevice) ?u32 {
     var count: u32 = 0;
