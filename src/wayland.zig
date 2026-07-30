@@ -10,6 +10,7 @@ const wl = @cImport({
     @cInclude("single-pixel-buffer-v1-client-protocol.h");
     @cInclude("cursor-shape-v1-client-protocol.h");
     @cInclude("linux-dmabuf-unstable-v1-client-protocol.h");
+    @cInclude("linux-drm-syncobj-v1-client-protocol.h");
     @cInclude("primary-selection-unstable-v1-client-protocol.h");
     @cInclude("text-input-unstable-v3-client-protocol.h");
 });
@@ -173,6 +174,9 @@ pub const Wayland = struct {
     cursor_shape_manager: ?*wl.wp_cursor_shape_manager_v1 = null,
     cursor_shape_device: ?*wl.wp_cursor_shape_device_v1 = null,
     linux_dmabuf: ?*wl.zwp_linux_dmabuf_v1 = null,
+    /// Explicit-sync (Wayland). Null when the compositor doesn't advertise it,
+    /// in which case the GPU worker keeps the synchronous present path.
+    syncobj_manager: ?*wl.wp_linux_drm_syncobj_manager_v1 = null,
     data_device_manager: ?*wl.wl_data_device_manager = null,
     data_device: ?*wl.wl_data_device = null,
     primary_selection_manager: ?*wl.zwp_primary_selection_device_manager_v1 = null,
@@ -474,6 +478,7 @@ pub const Wayland = struct {
         if (self.cursor_shape_device) |d| wl.wp_cursor_shape_device_v1_destroy(d);
         if (self.cursor_shape_manager) |mgr| wl.wp_cursor_shape_manager_v1_destroy(mgr);
         if (self.single_pixel_buffer_manager) |mgr| wl.wp_single_pixel_buffer_manager_v1_destroy(mgr);
+        if (self.syncobj_manager) |m| wl.wp_linux_drm_syncobj_manager_v1_destroy(m);
         if (self.linux_dmabuf) |linux_dmabuf| wl.zwp_linux_dmabuf_v1_destroy(linux_dmabuf);
         if (self.viewporter) |viewporter| wl.wp_viewporter_destroy(viewporter);
         if (self.text_input) |ti| wl.zwp_text_input_v3_destroy(ti);
@@ -673,6 +678,8 @@ pub const Wayland = struct {
             self.cursor_shape_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_cursor_shape_manager_v1_interface, @min(version, 1)));
         } else if (std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
             self.linux_dmabuf = @ptrCast(wl.wl_registry_bind(registry, name, &wl.zwp_linux_dmabuf_v1_interface, @min(version, 3)));
+        } else if (std.mem.eql(u8, iface, "wp_linux_drm_syncobj_manager_v1")) {
+            self.syncobj_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wp_linux_drm_syncobj_manager_v1_interface, 1));
         } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
             self.data_device_manager = @ptrCast(wl.wl_registry_bind(registry, name, &wl.wl_data_device_manager_interface, @min(version, 3)));
         } else if (std.mem.eql(u8, iface, "zwp_primary_selection_device_manager_v1")) {

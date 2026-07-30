@@ -149,6 +149,7 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "staging/single-pixel-buffer/single-pixel-buffer-v1.xml", "single-pixel-buffer-v1-client-protocol.h", "single-pixel-buffer-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "staging/cursor-shape/cursor-shape-v1.xml", "cursor-shape-v1-client-protocol.h", "cursor-shape-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml", "linux-dmabuf-unstable-v1-client-protocol.h", "linux-dmabuf-unstable-v1-protocol.c");
+    addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml", "linux-drm-syncobj-v1-client-protocol.h", "linux-drm-syncobj-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/primary-selection/primary-selection-unstable-v1.xml", "primary-selection-unstable-v1-client-protocol.h", "primary-selection-unstable-v1-protocol.c");
     addStagingProtocol(b, mod, opts.wayland_scanner, opts.wayland_protocols_dir, "unstable/text-input/text-input-unstable-v3.xml", "text-input-unstable-v3-client-protocol.h", "text-input-unstable-v3-protocol.c");
 
