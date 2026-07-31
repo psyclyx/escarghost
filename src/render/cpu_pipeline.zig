@@ -180,13 +180,20 @@ pub const CpuPipeline = struct {
             .device_atlas = device_atlas,
         };
         self.misses.lifo = std.c.getenv("SCRGO_MISS_LIFO") != null;
-        // Spawn the raster thread pool at up to 4 threads — enough to
-        // parallelize a full-screen software frame while leaving most cores for
-        // the prep thread + GPU worker. Best-effort: on failure we fall back to
-        // single-threaded rasterization.
+        // Fan the full-screen software raster across a couple of cores. The
+        // software path is only the pre-GPU fallback, and it competes with the
+        // prep workers during a flood, so a small pool wins; override with
+        // SCRGO_RASTER_THREADS for tuning. Clamped to the core count.
+        // Best-effort: on failure we raster single-threaded.
         const cpu_count = std.Thread.getCpuCount() catch 4;
-        const pool_threads = @min(cpu_count, 4);
-        if (self.thread_pool.init(allocator, .{ .threads = pool_threads })) |_| {
+        var pool_threads: usize = @min(cpu_count, 2);
+        if (std.c.getenv("SCRGO_RASTER_THREADS")) |env| {
+            if (std.fmt.parseInt(usize, std.mem.sliceTo(env, 0), 10) catch null) |v| {
+                if (v > 0) pool_threads = @min(cpu_count, v);
+            }
+        }
+        log.info(.cpu, "raster thread pool", .{ .threads = pool_threads, .cores = cpu_count });
+        if (self.thread_pool.init(allocator, .{ .threads = @intCast(pool_threads) })) |_| {
             self.pool_ready = true;
         } else |err| {
             log.warn(.cpu, "raster thread pool init failed; single-threaded", .{ .err = err });
