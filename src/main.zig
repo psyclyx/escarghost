@@ -619,25 +619,13 @@ pub fn main(init: std.process.Init) !void {
                             state.render.gpu_restart.clear();
                             log.info(.gpu, "ready", .{});
 
-                            // Bring up the compositor side of explicit sync once
-                            // the worker has exported its timeline fds. libwayland
-                            // dups the fds on import, so we close ours after.
-                            if (!explicit_sync_active and gpu.explicit_sync_ready and wl.syncobj_manager != null) {
-                                if (wl.setupExplicitSync(gpu.es_acquire_fd, gpu.es_release_fd)) {
-                                    explicit_sync_active = true;
-                                    log.info(.gpu, "explicit sync active", .{});
-                                } else {
-                                    log.warn(.gpu, "explicit-sync wl setup failed; sync present", .{});
-                                }
-                                if (gpu.es_acquire_fd >= 0) {
-                                    _ = std.c.close(gpu.es_acquire_fd);
-                                    gpu.es_acquire_fd = -1;
-                                }
-                                if (gpu.es_release_fd >= 0) {
-                                    _ = std.c.close(gpu.es_release_fd);
-                                    gpu.es_release_fd = -1;
-                                }
-                            }
+                            // Compositor-side explicit sync is brought up lazily at
+                            // the first GPU commit (see the `.frame` branch), not
+                            // here: creating the syncobj surface binds it to the
+                            // wl_surface, after which every commit needs sync points
+                            // — but the CPU path is still presenting until the first
+                            // GPU frame lands, and its SHM commits set none. Setting
+                            // up now would make those CPU commits a protocol error.
                         } else {
                             render_loop.noteGpuUnavailable(&state);
                         }
@@ -667,9 +655,28 @@ pub fn main(init: std.process.Init) !void {
                                     // prior render is discarded, but
                                     // there's no latency penalty for the
                                     // newer content.
-                                    // Explicit sync: set the acquire/release
-                                    // timeline points on the surface before the
-                                    // commit picks them up atomically.
+                                    // Explicit sync: bring up the syncobj surface
+                                    // lazily on the first GPU commit (now that CPU
+                                    // frames are about to stop presenting), then set
+                                    // the acquire/release points before the commit
+                                    // picks them up atomically. libwayland dups the
+                                    // timeline fds on import, so close ours after.
+                                    if (!explicit_sync_active and gpu.explicit_sync_ready and wl.syncobj_manager != null) {
+                                        if (wl.setupExplicitSync(gpu.es_acquire_fd, gpu.es_release_fd)) {
+                                            explicit_sync_active = true;
+                                            log.info(.gpu, "explicit sync active", .{});
+                                        } else {
+                                            log.warn(.gpu, "explicit-sync wl setup failed; sync present", .{});
+                                        }
+                                        if (gpu.es_acquire_fd >= 0) {
+                                            _ = std.c.close(gpu.es_acquire_fd);
+                                            gpu.es_acquire_fd = -1;
+                                        }
+                                        if (gpu.es_release_fd >= 0) {
+                                            _ = std.c.close(gpu.es_release_fd);
+                                            gpu.es_release_fd = -1;
+                                        }
+                                    }
                                     if (explicit_sync_active) wl.setSyncPoints(resp.acquire_point);
                                     gpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                                     state.diag.recordCommit('g');
@@ -732,6 +739,17 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommit('h');
                             log.debug(.cpu, "frame held for first paint", .{ .buffer = resp.buffer_index });
                         } else if (buffer_ok and path_ok and size_ok) {
+                            // If we fell back to the CPU path after the GPU had
+                            // brought up explicit sync (e.g. GPU loss), the syncobj
+                            // surface is still bound to the wl_surface — an SHM
+                            // commit with no sync points is a protocol error. Drop
+                            // it so plain commits are legal again; the next GPU
+                            // commit re-creates it.
+                            if (explicit_sync_active) {
+                                wl.teardownExplicitSync();
+                                explicit_sync_active = false;
+                                log.info(.gpu, "explicit sync torn down for cpu path", .{});
+                            }
                             cpu.buffers[resp.buffer_index].commit(@ptrCast(wl.surface.?), @ptrCast(wl.display));
                             state.diag.recordCommit('c');
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);

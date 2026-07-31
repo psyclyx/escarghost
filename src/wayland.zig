@@ -462,12 +462,28 @@ pub const Wayland = struct {
     /// by libwayland, so the caller closes them after). Returns false if the
     /// manager or surface isn't available. See [[sync.zig]].
     pub fn setupExplicitSync(self: *Wayland, acquire_fd: c_int, release_fd: c_int) bool {
+        if (self.syncobj_surface != null) return true; // already up
         const mgr = self.syncobj_manager orelse return false;
         const surf = self.surface orelse return false;
         self.syncobj_surface = wl.wp_linux_drm_syncobj_manager_v1_get_surface(mgr, surf);
         self.acquire_timeline = wl.wp_linux_drm_syncobj_manager_v1_import_timeline(mgr, acquire_fd);
         self.release_timeline = wl.wp_linux_drm_syncobj_manager_v1_import_timeline(mgr, release_fd);
         return self.syncobj_surface != null and self.acquire_timeline != null and self.release_timeline != null;
+    }
+
+    /// Destroy the syncobj surface + timelines so plain (SHM) commits to this
+    /// `wl_surface` are legal again. Once the syncobj surface exists, the
+    /// protocol requires an acquire+release point on every buffer-attaching
+    /// commit; the CPU path sets none, so it must tear this down before it
+    /// commits. Idempotent; `setupExplicitSync` re-creates them on the next
+    /// GPU commit.
+    pub fn teardownExplicitSync(self: *Wayland) void {
+        if (self.syncobj_surface) |s| wl.wp_linux_drm_syncobj_surface_v1_destroy(s);
+        if (self.acquire_timeline) |t| wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
+        if (self.release_timeline) |t| wl.wp_linux_drm_syncobj_timeline_v1_destroy(t);
+        self.syncobj_surface = null;
+        self.acquire_timeline = null;
+        self.release_timeline = null;
     }
 
     /// Set the acquire + release timeline points for the next surface commit
