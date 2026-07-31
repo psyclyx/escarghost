@@ -511,7 +511,6 @@ pub fn main(init: std.process.Init) !void {
 
         render_loop.maybeScheduleScrollbarHide(&state);
         render_loop.tickBell(&state);
-        render_loop.tickFirstPaintHold(&state);
         input.tickTouch();
         input.tickFling();
         render_loop.pollAtlasUpdate(&state);
@@ -528,7 +527,6 @@ pub fn main(init: std.process.Init) !void {
         const scroll_timeout = render_loop.scrollbarTimeoutMs(&state);
         const bell_timeout = bell.visualTimeoutMs();
         const touch_timeout = input.touchTimeoutMs();
-        const first_paint_timeout = render_loop.firstPaintHoldTimeoutMs(&state);
         // While draining after child exit, wake at least every 10 ms so
         // the drain deadline is enforced even with no fd activity (the
         // reader thread is gone once it reports EOF).
@@ -544,10 +542,7 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 touch_timeout,
             ),
-            render_loop.combineTimeout(
-                first_paint_timeout orelse -1,
-                drain_timeout,
-            ),
+            drain_timeout,
         );
 
         // The atlas update eventfd wakes us when the prep thread publishes
@@ -638,23 +633,17 @@ pub fn main(init: std.process.Init) !void {
                             log.setFrame(.frame, resp.serial);
                             log.debug(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
                             if (resp.buffer_index < gpu.frontend_buffer_count) {
-                                if (render_loop.shouldHoldFirstPaint(&state, resp.had_misses != 0)) {
-                                    // Withhold the miss-y first frame — the bg
-                                    // surface on screen is already correct, so
-                                    // we wait for the atlas to catch up (or
-                                    // the hold deadline) and commit a complete
-                                    // frame instead. Buffer stays free (never
-                                    // committed → never busy).
-                                    state.diag.recordCommit('h');
-                                    log.debug(.gpu, "frame held for first paint", .{ .buffer = resp.buffer_index });
-                                } else {
-                                    // Commit immediately. If the compositor
-                                    // still has the prior frame pending,
-                                    // this commit replaces it in the
-                                    // compositor's pending state — the
-                                    // prior render is discarded, but
-                                    // there's no latency penalty for the
-                                    // newer content.
+                                {
+                                    // Commit immediately — lowest latency wins:
+                                    // paint the first frame we have, misses and
+                                    // all, and let atlas updates re-render it.
+                                    // Never withhold; a blank frame is worse than
+                                    // a frame with missing glyphs. If the
+                                    // compositor still has the prior frame
+                                    // pending, this commit replaces it in the
+                                    // compositor's pending state — the prior
+                                    // render is discarded, no latency penalty for
+                                    // the newer content.
                                     // Explicit sync: bring up the syncobj surface
                                     // lazily on the first GPU commit (now that CPU
                                     // frames are about to stop presenting), then set
@@ -730,15 +719,7 @@ pub fn main(init: std.process.Init) !void {
                         const buffer_ok = resp.buffer_index < cpu.buffer_count;
                         const path_ok = state.render.active_render_path == .cpu;
                         const size_ok = cpu.width == wl.width and cpu.height == wl.height;
-                        if (buffer_ok and path_ok and size_ok and
-                            render_loop.shouldHoldFirstPaint(&state, resp.had_misses != 0))
-                        {
-                            // Withhold the miss-y first frame; the bg surface
-                            // on screen is already correct. Re-render comes
-                            // from the atlas eventfd or the hold deadline.
-                            state.diag.recordCommit('h');
-                            log.debug(.cpu, "frame held for first paint", .{ .buffer = resp.buffer_index });
-                        } else if (buffer_ok and path_ok and size_ok) {
+                        if (buffer_ok and path_ok and size_ok) {
                             // If we fell back to the CPU path after the GPU had
                             // brought up explicit sync (e.g. GPU loss), the syncobj
                             // surface is still bound to the wl_surface — an SHM

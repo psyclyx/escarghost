@@ -134,12 +134,6 @@ pub const RenderState = struct {
     /// pending miss-y commit; consumed when a render is queued. Each bypass
     /// costs one atlas publish to arm, so it cannot spin.
     atlas_catchup_bypass: bool = false,
-    /// First-paint hold: before first content paint the screen shows the
-    /// solid bg surface, which is already correct — so a miss-y first frame
-    /// is withheld (never committed) until the atlas catches up or this
-    /// monotonic-ns deadline passes. 0 = not armed.
-    first_paint_hold_until_ns: u64 = 0,
-    first_paint_hold_expired: bool = false,
     target_render_path: RenderPath = .gpu,
     active_render_path: RenderPath = .cpu,
     gpu_restart: GpuRestartBackoff = .{},

@@ -64,55 +64,6 @@ pub fn markFirstContentPaint(s: *app_state.AppState, committed_serial: u32) void
     s.lifecycle.first_content_painted = true;
 }
 
-/// Cap on how long the first content paint may be withheld waiting for
-/// glyph prep. Prep normally publishes within a few ms; this only bites
-/// when a glyph can't be prepped at all, and bounds how long the user
-/// stares at the bare bg surface.
-const FIRST_PAINT_HOLD_MAX_NS: u64 = 100 * std.time.ns_per_ms;
-
-/// Decide whether to withhold a rendered-but-miss-y frame instead of
-/// committing it, called from the frame-response handlers. Only before
-/// first content paint: the screen still shows the solid bg surface —
-/// which is correct — so holding costs nothing visually, and the first
-/// thing the user sees is a complete frame instead of glyph pop-in.
-/// Arms a deadline on first hold; once it expires (or the frame is
-/// clean) frames commit unconditionally. The held frame is simply
-/// dropped — its buffer was never committed, so it stays free — and the
-/// re-render is driven by the atlas update eventfd (or the deadline
-/// wake, see tickFirstPaintHold).
-pub fn shouldHoldFirstPaint(s: *app_state.AppState, had_misses: bool) bool {
-    if (s.lifecycle.first_content_painted or !had_misses) return false;
-    if (s.render.first_paint_hold_expired) return false;
-    const now = diagnostics.monotonicNowNs();
-    if (s.render.first_paint_hold_until_ns == 0) {
-        s.render.first_paint_hold_until_ns = now + FIRST_PAINT_HOLD_MAX_NS;
-    }
-    return now < s.render.first_paint_hold_until_ns;
-}
-
-/// Called once per loop iteration. If the first-paint hold deadline
-/// passed without the atlas catching up, force a redraw so the held
-/// content finally commits (with whatever glyphs exist).
-pub fn tickFirstPaintHold(s: *app_state.AppState) void {
-    if (s.lifecycle.first_content_painted) return;
-    if (s.render.first_paint_hold_until_ns == 0 or s.render.first_paint_hold_expired) return;
-    if (diagnostics.monotonicNowNs() < s.render.first_paint_hold_until_ns) return;
-    s.render.first_paint_hold_expired = true;
-    log.warn(.frame, "first-paint hold expired, committing with misses", .{});
-    markRenderDirty(s);
-}
-
-/// Poll timeout so the main loop wakes at the hold deadline even if the
-/// prep thread never publishes. Null when no hold is armed.
-pub fn firstPaintHoldTimeoutMs(s: *app_state.AppState) ?c_int {
-    if (s.lifecycle.first_content_painted) return null;
-    if (s.render.first_paint_hold_until_ns == 0 or s.render.first_paint_hold_expired) return null;
-    const now = diagnostics.monotonicNowNs();
-    if (now >= s.render.first_paint_hold_until_ns) return 0;
-    const delta_ms = (s.render.first_paint_hold_until_ns - now) / std.time.ns_per_ms + 1;
-    return @intCast(@min(delta_ms, @as(u64, std.math.maxInt(c_int))));
-}
-
 pub fn bumpScrollbarVisibility(s: *app_state.AppState) void {
     s.input.scrollbar_visible_until_ns = diagnostics.monotonicNowNs() + SCROLLBAR_HIDE_DELAY_NS;
 }
