@@ -5,7 +5,7 @@
 //! decoration rects.
 //!
 //! In snail 0.13, the flow is:
-//!   cells → snail.shape → snail.recordUnhintedRun → snail.placeCellRunAlloc
+//!   cells → snail.shape → snail.planRuns/prepare/apply → snail.placeCellRunAlloc
 //!   → snail.Shape[] → (caller) snail.emit.emit → Instance[] + DrawBatch[]
 //!
 //! Background/decoration rects are produced as ColoredRect values; the

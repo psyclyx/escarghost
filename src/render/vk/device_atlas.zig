@@ -104,6 +104,7 @@ pub const DeviceAtlas = struct {
     plan_slots: []upload_plan.Slot,
     plan_info_free: []upload_plan.Range,
     plan_image_free: []upload_plan.Range,
+    plan_page_rollbacks: []upload_plan.PageRollback,
     plan_regions: []upload_plan.Region,
     plan_info_scratch: []f32,
     info_scratch_stride: usize,
@@ -131,6 +132,8 @@ pub const DeviceAtlas = struct {
         errdefer allocator.free(info_free);
         const image_free = try allocator.alloc(upload_plan.Range, sz.image_free);
         errdefer allocator.free(image_free);
+        const page_rollbacks = try allocator.alloc(upload_plan.PageRollback, sz.page_rollbacks);
+        errdefer allocator.free(page_rollbacks);
         const regions = try allocator.alloc(upload_plan.Region, sz.regions);
         errdefer allocator.free(regions);
         const info_scratch = try allocator.alloc(f32, info_scratch_len);
@@ -152,13 +155,14 @@ pub const DeviceAtlas = struct {
             .flat = flat,
             .max_gpu_pages = max_gpu_pages,
             .capacity_pages = @min(@max(1, options.initial_pages), max_gpu_pages),
-            .planner = try upload_plan.Planner.init(pool, opts, gen, curve_words, band_words, slots, info_free, image_free),
+            .planner = try upload_plan.Planner.init(pool, opts, gen, curve_words, band_words, slots, info_free, image_free, page_rollbacks),
             .plan_gen = gen,
             .plan_curve = curve_words,
             .plan_band = band_words,
             .plan_slots = slots,
             .plan_info_free = info_free,
             .plan_image_free = image_free,
+            .plan_page_rollbacks = page_rollbacks,
             .plan_regions = regions,
             .plan_info_scratch = info_scratch,
             .info_scratch_stride = sz.layer_info_scratch,
@@ -180,6 +184,7 @@ pub const DeviceAtlas = struct {
         self.allocator.free(self.plan_slots);
         self.allocator.free(self.plan_info_free);
         self.allocator.free(self.plan_image_free);
+        self.allocator.free(self.plan_page_rollbacks);
         self.allocator.free(self.plan_regions);
         self.allocator.free(self.plan_info_scratch);
     }
@@ -212,8 +217,12 @@ pub const DeviceAtlas = struct {
 
         var len: usize = 0;
         const info_scratch = self.plan_info_scratch[0..self.info_scratch_stride];
-        const binding = try self.planner.plan(atlas, self.plan_regions, &len, info_scratch);
-        errdefer _ = self.planner.release(binding);
+        // `plan` reserves provisional residency and hands back a PendingUpload;
+        // `commit` (after the GPU copies land) turns its provisional binding
+        // into a persistently-live one. On any failure before that, release
+        // the provisional binding.
+        var pending = try self.planner.plan(atlas, self.plan_regions, &len, info_scratch);
+        errdefer _ = self.planner.release(pending.binding());
         const regions = self.plan_regions[0..len];
 
         // Grow the curve/band buffers if this atlas references a page beyond
@@ -227,7 +236,7 @@ pub const DeviceAtlas = struct {
 
         var total: usize = 0;
         for (regions) |r| total = std.math.add(usize, total, r.src.len) catch return error.UploadSizeOverflow;
-        if (total == 0) return binding; // everything already resident
+        if (total == 0) return self.planner.commit(&pending); // everything already resident
 
         // Stage every region source into one host-visible buffer.
         var staging_buf: vk.VkBuffer = null;
@@ -239,7 +248,7 @@ pub const DeviceAtlas = struct {
         }
         var mapped: ?*anyopaque = null;
         if (vk.vkMapMemory(self.ctx.device, staging_mem, 0, total, 0, &mapped) != vk.VK_SUCCESS) {
-            self.planner.invalidateUploads();
+            self.planner.invalidateUploads() catch {};
             return error.VulkanError;
         }
         const dst: [*]u8 = @ptrCast(mapped.?);
@@ -331,7 +340,7 @@ pub const DeviceAtlas = struct {
 
         if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.VulkanError;
         try self.ctx.submitAndWait(cmd);
-        return binding;
+        return self.planner.commit(&pending);
     }
 
     pub fn releaseBinding(self: *Self, binding: Binding) void {

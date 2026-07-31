@@ -90,7 +90,7 @@ pub const AtlasRef = struct {
 
     // ── Async glyph prep ──
     //
-    // Glyph prep (shape + `recordUnhintedRun` curve extraction) is the bulk
+    // Glyph prep (shape + `planRuns`/prepare/apply curve extraction) is the bulk
     // of a flood frame (~60ms). It runs on a dedicated thread so the render
     // workers never block on it: they post miss text via `requestPrep` and
     // render the current atlas; newly-prepped glyphs appear a frame or two
@@ -111,12 +111,12 @@ pub const AtlasRef = struct {
     /// `startPrep` to min(nproc, 8); the prep thread runs one stripe itself
     /// and spawns the rest per batch (prep batches are infrequent).
     prep_workers: usize = 1,
-    /// One persistent `ExtractContext` per worker, reused across prep
+    /// One persistent `OutlineContext` per worker, reused across prep
     /// batches so per-font HarfBuzz Instances (expensive to build for large
     /// CJK variable fonts) and scratch capacity survive between batches
     /// instead of being rebuilt each time. Owned; allocated at `startPrep`,
     /// freed at `stopPrep` after the prep thread joins.
-    prep_contexts: []snail.ExtractContext = &.{},
+    prep_contexts: []snail.OutlineContext = &.{},
     /// eventfd the prep thread bumps on `publish` so the main loop can wake
     /// and re-render newly-prepped glyphs without polling. Stays quiet when
     /// the atlas is warm, so an idle terminal burns no CPU/GPU.
@@ -262,8 +262,8 @@ pub const AtlasRef = struct {
         // Cap at 8: enough to clear a glyph flood in a frame or two while
         // leaving cores for the render loop, GPU worker, and CPU raster pool.
         self.prep_workers = @max(1, @min(std.Thread.getCpuCount() catch 4, 8));
-        self.prep_contexts = try self.allocator.alloc(snail.ExtractContext, self.prep_workers);
-        for (self.prep_contexts) |*cx| cx.* = snail.ExtractContext.init(self.allocator, self.allocator);
+        self.prep_contexts = try self.allocator.alloc(snail.OutlineContext, self.prep_workers);
+        for (self.prep_contexts) |*cx| cx.* = snail.OutlineContext.init(self.allocator, self.allocator);
         self.prep_active = true;
         self.prep_thread = std.Thread.spawn(.{}, prepLoop, .{self}) catch |err| {
             self.prep_active = false;
@@ -357,7 +357,7 @@ pub const AtlasRef = struct {
         // prep thread extends, so there is no concurrent page-pool mutation.
         var lease = self.acquire();
         defer lease.release();
-        var next = lease.get().extend(self.allocator, &.{}) catch return;
+        var next = lease.get().extend(self.allocator, .{}) catch return;
         self.recordParallel(&next, faces, &shaped) catch |err| {
             if (err == error.OutOfLayers) {
                 // Pool exhausted: new glyphs can't be prepped and render as
@@ -390,8 +390,13 @@ pub const AtlasRef = struct {
     /// self-balance across glyphs whose extraction cost varies and clusters
     /// by script. Owns its `ExtractContext` (per-thread scratch + Instances).
     const PrepTask = struct {
-        plan: *snail.UnhintedExtractPlan,
-        ctx: *snail.ExtractContext,
+        requests: []const snail.PrepareRequest,
+        /// Owned prepared artifacts (freed after apply); `results` are views
+        /// into them. Distinct indices are written by distinct workers, so no
+        /// synchronization is needed on the slices themselves.
+        owned: []?snail.prepared.OwnedRecord,
+        results: []?snail.prepared.RecordView,
+        ctx: *snail.OutlineContext,
         cursor: *std.atomic.Value(usize),
         err: ?anyerror = null,
 
@@ -403,36 +408,89 @@ pub const AtlasRef = struct {
         fn run(self: *PrepTask) void {
             // `ctx` is a persistent per-worker context (Instances + scratch
             // survive across batches); do not deinit it here.
-            const count = self.plan.requestCount();
+            const count = self.requests.len;
             while (true) {
                 const start = self.cursor.fetchAdd(chunk, .monotonic);
                 if (start >= count) break;
                 const end = @min(start + chunk, count);
                 for (start..end) |i| {
-                    self.plan.extractOne(i, self.ctx) catch |e| {
+                    // Unhinted runs are all `.outline` operations with no
+                    // inter-request dependencies, so any worker can prepare any
+                    // index in any order.
+                    const record = self.ctx.prepare(self.requests[i]) catch |e| {
                         self.err = e;
                         return;
                     };
+                    self.owned[i] = record;
+                    self.results[i] = self.owned[i].?.view();
                 }
             }
         }
     };
 
-    /// Plan → parallel-extract → apply. Extraction fans across up to
-    /// `prep_workers` workers (this thread runs one, spawns the rest);
-    /// planning and insertion stay serial. Any extraction error aborts before
-    /// `apply`, so `next` is left unchanged (the caller deinits it).
+    /// A cheap, process-unique cache key per font. It feeds only the prepared
+    /// artifact's archive-lookup `Key`, never the atlas `RecordKey` (which is
+    /// `record_key.unhintedGlyph(font_id, glyph_id)`), and scrgo does not
+    /// persist prepared archives — so uniqueness in-process is all that's
+    /// required. If disk archives are ever added, switch to a content hash of
+    /// the font bytes + face index + variations.
+    fn fontCacheKey(spec: snail.Face) snail.prepared.FontKey {
+        var key: snail.prepared.FontKey = [_]u8{0} ** 16;
+        std.mem.writeInt(u32, key[0..4], spec.font_id, .little);
+        std.mem.writeInt(u32, key[4..8], spec.font.faceIndex(), .little);
+        return key;
+    }
+
+    /// Plan → parallel-prepare → apply. Outline preparation (the ~90% curve
+    /// cost) fans across up to `prep_workers` workers (this thread runs one,
+    /// spawns the rest); planning and insertion stay serial. Any prepare error
+    /// aborts before `applyInPlace`, so `next` is left unchanged.
     fn recordParallel(
         self: *AtlasRef,
         next: *snail.Atlas,
         faces: *const snail.Faces,
         shaped: *const snail.ShapedText,
     ) !void {
-        var plan = try snail.planUnhintedRuns(next, self.allocator, faces, &.{shaped}, .{});
+        _ = faces; // planRuns enumerates glyphs from `shaped` by font_id.
+
+        // FontSource selection set: every distinct font the runs may reference.
+        // `planRuns` skips glyphs whose font_id isn't listed and rejects
+        // duplicate ids, so dedup by font_id here.
+        var sources: std.ArrayList(snail.FontSource) = .empty;
+        defer sources.deinit(self.allocator);
+        for (self.face_specs.items) |spec| {
+            var dup = false;
+            for (sources.items) |s| {
+                if (s.font_id == spec.font_id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try sources.append(self.allocator, .{
+                .font_id = spec.font_id,
+                .font = spec.font,
+                .cache_key = fontCacheKey(spec),
+            });
+        }
+
+        var plan = try snail.planRuns(next, self.allocator, sources.items, &.{shaped}, .{ .unhinted = .{} });
         defer plan.deinit();
 
-        const count = plan.requestCount();
-        if (count == 0) return plan.apply(next);
+        const requests = plan.requests();
+        const count = requests.len;
+        if (count == 0) return plan.applyInPlace(self.allocator, next, &.{});
+
+        // One owned artifact + one result view per request.
+        const owned = try self.allocator.alloc(?snail.prepared.OwnedRecord, count);
+        defer {
+            for (owned) |*rec| if (rec.*) |*value| value.deinit();
+            self.allocator.free(owned);
+        }
+        @memset(owned, null);
+        const results = try self.allocator.alloc(?snail.prepared.RecordView, count);
+        defer self.allocator.free(results);
+        @memset(results, null);
 
         const n = @max(1, @min(self.prep_workers, count));
         var cursor = std.atomic.Value(usize).init(0);
@@ -440,7 +498,13 @@ pub const AtlasRef = struct {
         defer self.allocator.free(tasks);
         const threads = try self.allocator.alloc(?std.Thread, n);
         defer self.allocator.free(threads);
-        for (tasks, 0..) |*t, ti| t.* = .{ .plan = &plan, .ctx = &self.prep_contexts[ti], .cursor = &cursor };
+        for (tasks, 0..) |*t, ti| t.* = .{
+            .requests = requests,
+            .owned = owned,
+            .results = results,
+            .ctx = &self.prep_contexts[ti],
+            .cursor = &cursor,
+        };
 
         // Spawn workers 1..n; run worker 0 on this thread. A failed spawn just
         // runs that worker inline here — parallelism is best-effort, and all
@@ -455,7 +519,7 @@ pub const AtlasRef = struct {
         for (1..n) |ti| if (threads[ti]) |th| th.join();
 
         for (tasks) |t| if (t.err) |e| return e;
-        return plan.apply(next);
+        try plan.applyInPlace(self.allocator, next, results);
     }
 
     /// Seed the auto-fallback machinery with the bootstrap chain and the
@@ -589,15 +653,15 @@ pub const AtlasRef = struct {
             .b = 0,
             .c = 0,
         };
-        const entry = snail.AtlasEntry{
+        const entry = snail.AtlasEntry{ .geometry = .{
             .key = key,
-            .curves = curves,
+            .curves = curves.view(),
             .paint = try prep.paintForDesign(.{ .solid = .{ 1, 1, 1, 1 } }),
-        };
+        } };
 
         self.lock();
         defer self.unlock();
-        try self.current.?.atlas.extendInPlace(alloc, &.{entry});
+        try self.current.?.atlas.extendInPlace(alloc, .{ .entries = &.{entry} });
         self.rect_key = key;
         self.rect_xform = prep.design_to_source;
         self.has_rect = true;
@@ -631,16 +695,16 @@ pub const AtlasRef = struct {
                 .b = 0,
                 .c = 0,
             };
-            const entry = snail.AtlasEntry{
+            const entry = snail.AtlasEntry{ .geometry = .{
                 .key = key,
-                .curves = curves,
+                .curves = curves.view(),
                 .paint = try prep.paintForDesign(.{ .solid = .{ 1, 1, 1, 1 } }),
-            };
+            } };
 
             {
                 self.lock();
                 defer self.unlock();
-                try self.current.?.atlas.extendInPlace(alloc, &.{entry});
+                try self.current.?.atlas.extendInPlace(alloc, .{ .entries = &.{entry} });
                 self.current.?.generation = self.generation.fetchAdd(1, .release) + 1;
             }
             self.powerline.set(cp, .{ .key = key, .xform = prep.design_to_source });
