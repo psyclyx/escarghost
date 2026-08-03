@@ -88,17 +88,31 @@ pub const AtlasRef = struct {
     /// instead of an `FcFontMatch` per uncovered codepoint.
     fallback_resolve_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const u32) []*const snail.Font = null,
 
-    // ── Async glyph prep ──
+    // ── Async glyph prep (two-stage pipeline) ──
     //
-    // Glyph prep (shape + `planRuns`/prepare/apply curve extraction) is the bulk
-    // of a flood frame (~60ms). It runs on a dedicated thread so the render
-    // workers never block on it: they post miss text via `requestPrep` and
-    // render the current atlas; newly-prepped glyphs appear a frame or two
-    // later (sample-and-present, see [[render_perf]]). Only the shape step
-    // needs `shape_lock` (shared hb_buffer); the heavy record step reads
-    // immutable font data and runs unlocked, in parallel with render-side
-    // shaping. A single-slot mailbox (latest misses win) is enough: misses
-    // are re-detected every frame, so a dropped batch just reappears.
+    // Glyph prep is the bulk of a flood frame (~60ms), so it runs off the
+    // render workers: they post miss text via `requestPrep` and render the
+    // current atlas; newly-prepped glyphs appear a frame or two later
+    // (sample-and-present, see [[render_perf]]). Prep itself is split across
+    // two threads so the next batch bakes while the current one commits:
+    //
+    //   extract thread (`prepLoop`) — shape + plan + bake curves. Reads only
+    //     immutable font data + the current atlas snapshot; never mutates the
+    //     shared atlas/page pool. The ~90% cost, fanned across `prep_workers`.
+    //   apply thread (`applyLoop`) — extend the freshest atlas with the baked
+    //     records + publish. The only page-pool mutator; the ~10% cost.
+    //
+    // The two touch disjoint state, so they overlap safely, and the extract
+    // workers no longer idle behind the serial commit. Legality: a baked batch
+    // is welded to the atlas it was planned against only by snail's
+    // `required_records` ("must still contain these keys"); since `extend` only
+    // adds keys, a plan built against snapshot N applies cleanly onto N+1, and
+    // resident keys are skipped idempotently — so the apply thread always
+    // targets the latest snapshot regardless of which one extract planned on.
+    //
+    // Only the shape step needs `shape_lock` (shared hb_buffer). The input
+    // mailbox is single-slot (latest misses win): misses are re-detected every
+    // frame, so a dropped batch just reappears.
     prep_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
     prep_cond: c.pthread_cond_t = std.mem.zeroes(c.pthread_cond_t),
     prep_thread: ?std.Thread = null,
@@ -126,10 +140,21 @@ pub const AtlasRef = struct {
     /// instead of being rebuilt each time. Owned; allocated at `startPrep`,
     /// freed at `stopPrep` after the prep thread joins.
     prep_contexts: []snail.OutlineContext = &.{},
-    /// eventfd the prep thread bumps on `publish` so the main loop can wake
+    /// eventfd the apply thread bumps on `publish` so the main loop can wake
     /// and re-render newly-prepped glyphs without polling. Stays quiet when
     /// the atlas is warm, so an idle terminal burns no CPU/GPU.
     update_fd: c_int = -1,
+
+    /// Apply-stage handoff: the extract thread hands one baked `ExtractedBatch`
+    /// to the apply thread here. Single-slot and back-pressured — the extract
+    /// thread blocks in `submitApply` while a batch is still un-applied. Since
+    /// the apply stage is far cheaper than extraction it is near-always idle,
+    /// so this rarely blocks and nothing is dropped.
+    apply_mutex: c.pthread_mutex_t = std.mem.zeroes(c.pthread_mutex_t),
+    apply_cond: c.pthread_cond_t = std.mem.zeroes(c.pthread_cond_t),
+    apply_thread: ?std.Thread = null,
+    apply_stop: bool = false,
+    apply_pending: ?ExtractedBatch = null,
 
     /// A unit filled-rectangle path record (namespace `path_fill`) baked into
     /// the atlas at bootstrap. Renderers instance it — varying `local_transform`
@@ -188,6 +213,24 @@ pub const AtlasRef = struct {
         }
     };
 
+    /// One miss batch's baked glyph records, produced by the extract stage and
+    /// consumed by the apply stage. `results` are views into `owned`; `plan`
+    /// carries the insert recipe and the required-record weld. Freed by
+    /// `deinit` once the apply stage has committed (or dropped) it.
+    const ExtractedBatch = struct {
+        plan: snail.PreparePlan,
+        owned: []?snail.prepared.OwnedRecord,
+        results: []?snail.prepared.RecordView,
+        allocator: std.mem.Allocator,
+
+        fn deinit(self: *ExtractedBatch) void {
+            for (self.owned) |*rec| if (rec.*) |*view| view.deinit();
+            self.allocator.free(self.owned);
+            self.allocator.free(self.results);
+            self.plan.deinit();
+        }
+    };
+
     /// Create an AtlasRef with an initial empty atlas on the heap.
     /// The pool is owned by the AtlasRef and destroyed in deinit.
     pub fn init(allocator: std.mem.Allocator, pool: *snail.PagePool, faces: *snail.Faces) !AtlasRef {
@@ -209,6 +252,8 @@ pub const AtlasRef = struct {
         if (c.pthread_mutex_init(&ref.shape_lock, null) != 0) return error.MutexInitFailed;
         if (c.pthread_mutex_init(&ref.prep_mutex, null) != 0) return error.MutexInitFailed;
         if (c.pthread_cond_init(&ref.prep_cond, null) != 0) return error.MutexInitFailed;
+        if (c.pthread_mutex_init(&ref.apply_mutex, null) != 0) return error.MutexInitFailed;
+        if (c.pthread_cond_init(&ref.apply_cond, null) != 0) return error.MutexInitFailed;
         ref.update_fd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
         return ref;
     }
@@ -285,7 +330,21 @@ pub const AtlasRef = struct {
         self.prep_contexts = try self.allocator.alloc(snail.OutlineContext, self.prep_workers);
         for (self.prep_contexts) |*cx| cx.* = snail.OutlineContext.init(self.allocator, self.allocator);
         self.prep_active = true;
+        // Apply thread first so it's ready to consume the extract thread's
+        // first handoff.
+        self.apply_stop = false;
+        self.apply_thread = std.Thread.spawn(.{}, applyLoop, .{self}) catch |err| {
+            self.prep_active = false;
+            return err;
+        };
         self.prep_thread = std.Thread.spawn(.{}, prepLoop, .{self}) catch |err| {
+            // Unwind the apply thread we already started.
+            _ = c.pthread_mutex_lock(&self.apply_mutex);
+            self.apply_stop = true;
+            _ = c.pthread_cond_broadcast(&self.apply_cond);
+            _ = c.pthread_mutex_unlock(&self.apply_mutex);
+            if (self.apply_thread) |t| t.join();
+            self.apply_thread = null;
             self.prep_active = false;
             return err;
         };
@@ -298,10 +357,18 @@ pub const AtlasRef = struct {
         self.prep_stop = true;
         _ = c.pthread_cond_signal(&self.prep_cond);
         _ = c.pthread_mutex_unlock(&self.prep_mutex);
+        // Wake the apply thread and any extract thread parked in `submitApply`
+        // waiting for the handoff slot (broadcast: both may be waiting).
+        _ = c.pthread_mutex_lock(&self.apply_mutex);
+        self.apply_stop = true;
+        _ = c.pthread_cond_broadcast(&self.apply_cond);
+        _ = c.pthread_mutex_unlock(&self.apply_mutex);
         if (self.prep_thread) |t| t.join();
         self.prep_thread = null;
+        if (self.apply_thread) |t| t.join();
+        self.apply_thread = null;
         self.prep_active = false;
-        // Safe now that the only user (the prep thread) has joined.
+        // Safe now that the only user (the extract thread) has joined.
         for (self.prep_contexts) |*cx| cx.deinit();
         self.allocator.free(self.prep_contexts);
         self.prep_contexts = &.{};
@@ -370,47 +437,113 @@ pub const AtlasRef = struct {
             // render-side reshape) sees the coverage. `ensureFallbackCoverage`
             // dedups via `fallback_tried`, so this is ~free once warm.
             if (warm_have) _ = self.ensureFallbackCoverage(warm_work[0..warm_n]);
-            if (prep_have) self.runPrep(work[0..prep_n]);
+            if (prep_have) {
+                if (self.extractBatch(work[0..prep_n])) |batch| self.submitApply(batch);
+            }
         }
     }
 
-    /// Extend the current atlas to cover `miss_text`, then publish it.
-    /// Runs on the prep thread. Phase A (fallback + shape) holds `shape_lock`
-    /// because it touches the shared HarfBuzz buffer; Phase B (`recordUnhinted`
-    /// curve extraction) reads only immutable font data, so it runs unlocked —
-    /// in parallel with render-side shaping. Only the prep thread extends, so
-    /// there is no concurrent page-pool mutation.
-    fn runPrep(self: *AtlasRef, miss_text: []const u8) void {
+    /// Extract stage (prep thread): shape `miss_text`, then plan + bake its
+    /// glyph curves against the current snapshot. Reads only immutable font
+    /// data + the atlas HAMT; it does NOT extend the atlas or touch the page
+    /// pool — that is the apply thread's job. Returns the baked batch, or null
+    /// when there is nothing to commit (shape failed, or every glyph is
+    /// already resident).
+    fn extractBatch(self: *AtlasRef, miss_text: []const u8) ?ExtractedBatch {
         // Phase A1 — fallback coverage, UNLOCKED. Resolving/mmapping/parsing a
         // covering font and rebuilding `Faces` (per-font HarfBuzz face/shaper
         // objects) touches only immutable font data, not the shared shaping
         // buffer — so it must NOT hold shape_lock, or a single big fallback
         // load (unifont, CJK-VF, …) would block every render-side shape for
         // tens of ms and stall frames. ensureFallbackCoverage takes shape_lock
-        // only for the brief `faces` pointer swap.
+        // only for the brief `faces` pointer swap. Only the extract thread
+        // mutates `face_specs`/`faces`, so the subsequent plan sees a stable set.
         _ = self.ensureFallbackCoverage(miss_text);
 
         // Phase A2 — shape under shape_lock (Faces has one shared hb_buffer).
         _ = c.pthread_mutex_lock(&self.shape_lock);
         const faces = self.faces orelse {
             _ = c.pthread_mutex_unlock(&self.shape_lock);
-            return;
+            return null;
         };
         var shaped = snail.shape(self.allocator, faces, miss_text, .{}) catch {
             _ = c.pthread_mutex_unlock(&self.shape_lock);
-            return;
+            return null;
         };
         _ = c.pthread_mutex_unlock(&self.shape_lock);
         defer shaped.deinit();
 
-        // Phase B — clone the current atlas + record, no lock. Extraction
-        // (the ~90% curve-baking cost) fans across the prep worker stripes;
-        // planning (dedup) and insertion stay serial on this thread. Only the
-        // prep thread extends, so there is no concurrent page-pool mutation.
+        // Phase B — plan + bake curves against the current snapshot, no lock.
+        // Extraction (the ~90% cost) fans across the prep worker stripes.
         var lease = self.acquire();
         defer lease.release();
-        var next = lease.get().extend(self.allocator, .{}) catch return;
-        self.recordParallel(&next, faces, &shaped) catch |err| {
+        return self.planAndExtract(lease.get(), &shaped) catch {
+            prepErrCount += 1;
+            return null;
+        };
+    }
+
+    /// Hand a baked batch to the apply thread. Single-slot and back-pressured:
+    /// blocks only while the previous batch is still un-applied — rare, since
+    /// applying is far cheaper than extraction. Drops (frees) the batch if the
+    /// prep threads are being torn down.
+    fn submitApply(self: *AtlasRef, batch: ExtractedBatch) void {
+        _ = c.pthread_mutex_lock(&self.apply_mutex);
+        while (self.apply_pending != null and !self.apply_stop) {
+            _ = c.pthread_cond_wait(&self.apply_cond, &self.apply_mutex);
+        }
+        if (self.apply_stop) {
+            _ = c.pthread_mutex_unlock(&self.apply_mutex);
+            var b = batch;
+            b.deinit();
+            return;
+        }
+        self.apply_pending = batch;
+        _ = c.pthread_cond_signal(&self.apply_cond);
+        _ = c.pthread_mutex_unlock(&self.apply_mutex);
+    }
+
+    /// Apply stage. Consumes baked batches from `submitApply` and commits each
+    /// onto the freshest atlas, running concurrently with the extract thread's
+    /// work on the next batch.
+    fn applyLoop(self: *AtlasRef) void {
+        log.info(.atlas, "apply thread running", .{});
+        while (true) {
+            _ = c.pthread_mutex_lock(&self.apply_mutex);
+            while (self.apply_pending == null and !self.apply_stop) {
+                _ = c.pthread_cond_wait(&self.apply_cond, &self.apply_mutex);
+            }
+            if (self.apply_stop) {
+                const leftover = self.apply_pending;
+                self.apply_pending = null;
+                _ = c.pthread_mutex_unlock(&self.apply_mutex);
+                if (leftover) |batch| {
+                    var b = batch;
+                    b.deinit();
+                }
+                return;
+            }
+            const batch = self.apply_pending.?;
+            self.apply_pending = null;
+            // Wake the extract thread if it's parked waiting for the slot.
+            _ = c.pthread_cond_signal(&self.apply_cond);
+            _ = c.pthread_mutex_unlock(&self.apply_mutex);
+            self.applyBatch(batch);
+        }
+    }
+
+    /// Commit a baked batch: extend the freshest atlas with its records and
+    /// publish. The sole page-pool mutator once prep is running. Resident keys
+    /// (added by an intervening batch) are skipped idempotently by snail, so
+    /// planning against an older snapshot than we commit onto is harmless.
+    fn applyBatch(self: *AtlasRef, batch: ExtractedBatch) void {
+        var b = batch;
+        defer b.deinit();
+
+        var lease = self.acquire();
+        defer lease.release();
+
+        var next = b.plan.apply(self.allocator, lease.get(), b.results) catch |err| {
             if (err == error.OutOfLayers) {
                 // Pool exhausted: new glyphs can't be prepped and render as
                 // gaps. Warn once — sustained hits on a *real* workload (not
@@ -419,7 +552,6 @@ pub const AtlasRef = struct {
                 if (prepFullCount == 0) log.warn(.atlas, "atlas full — new glyphs dropped (raise max_layers or add eviction)", .{});
                 prepFullCount += 1;
             } else prepErrCount += 1;
-            next.deinit();
             return;
         };
         prepOkCount += 1;
@@ -493,18 +625,17 @@ pub const AtlasRef = struct {
         return key;
     }
 
-    /// Plan → parallel-prepare → apply. Outline preparation (the ~90% curve
-    /// cost) fans across up to `prep_workers` workers (this thread runs one,
-    /// spawns the rest); planning and insertion stay serial. Any prepare error
-    /// aborts before `applyInPlace`, so `next` is left unchanged.
-    fn recordParallel(
+    /// Plan → parallel-prepare. Enumerates the miss glyphs not already resident
+    /// in `base` and bakes their outlines across up to `prep_workers` workers
+    /// (this thread runs one, spawns the rest); planning stays serial. Does NOT
+    /// mutate the atlas — the baked records are returned as an `ExtractedBatch`
+    /// for the apply thread to commit. Returns null when nothing new needs
+    /// baking. Any prepare error frees the partial work and propagates.
+    fn planAndExtract(
         self: *AtlasRef,
-        next: *snail.Atlas,
-        faces: *const snail.Faces,
+        base: *const snail.Atlas,
         shaped: *const snail.ShapedText,
-    ) !void {
-        _ = faces; // planRuns enumerates glyphs from `shaped` by font_id.
-
+    ) !?ExtractedBatch {
         // FontSource selection set: every distinct font the runs may reference.
         // `planRuns` skips glyphs whose font_id isn't listed and rejects
         // duplicate ids, so dedup by font_id here.
@@ -526,22 +657,27 @@ pub const AtlasRef = struct {
             });
         }
 
-        var plan = try snail.planRuns(next, self.allocator, sources.items, &.{shaped}, .{ .unhinted = .{} });
-        defer plan.deinit();
+        var plan = try snail.planRuns(base, self.allocator, sources.items, &.{shaped}, .{ .unhinted = .{} });
+        errdefer plan.deinit();
 
         const requests = plan.requests();
         const count = requests.len;
-        if (count == 0) return plan.applyInPlace(self.allocator, next, &.{});
+        if (count == 0) {
+            // Every glyph is already resident: nothing to bake or publish.
+            plan.deinit();
+            return null;
+        }
 
-        // One owned artifact + one result view per request.
+        // One owned artifact + one result view per request. On success these
+        // become the batch's; on error the errdefers free them.
         const owned = try self.allocator.alloc(?snail.prepared.OwnedRecord, count);
-        defer {
+        errdefer {
             for (owned) |*rec| if (rec.*) |*value| value.deinit();
             self.allocator.free(owned);
         }
         @memset(owned, null);
         const results = try self.allocator.alloc(?snail.prepared.RecordView, count);
-        defer self.allocator.free(results);
+        errdefer self.allocator.free(results);
         @memset(results, null);
 
         const n = @max(1, @min(self.prep_workers, count));
@@ -571,7 +707,13 @@ pub const AtlasRef = struct {
         for (1..n) |ti| if (threads[ti]) |th| th.join();
 
         for (tasks) |t| if (t.err) |e| return e;
-        try plan.applyInPlace(self.allocator, next, results);
+
+        return ExtractedBatch{
+            .plan = plan,
+            .owned = owned,
+            .results = results,
+            .allocator = self.allocator,
+        };
     }
 
     /// Seed the auto-fallback machinery with the bootstrap chain and the
@@ -782,8 +924,8 @@ pub const AtlasRef = struct {
 
     /// Clean up all held snapshots. Call only when no threads are reading.
     pub fn deinit(self: *AtlasRef) void {
-        // Stop the prep thread first — it publishes/retires snapshots and
-        // must not race the teardown below.
+        // Stop the prep threads first — the apply thread publishes/retires
+        // snapshots and must not race the teardown below.
         self.stopPrep();
         {
             self.lock();
@@ -813,6 +955,8 @@ pub const AtlasRef = struct {
         _ = c.pthread_mutex_destroy(&self.shape_lock);
         _ = c.pthread_cond_destroy(&self.prep_cond);
         _ = c.pthread_mutex_destroy(&self.prep_mutex);
+        _ = c.pthread_cond_destroy(&self.apply_cond);
+        _ = c.pthread_mutex_destroy(&self.apply_mutex);
         if (self.update_fd >= 0) _ = c.close(self.update_fd);
     }
 
