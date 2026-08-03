@@ -164,9 +164,12 @@ pub const CpuPipeline = struct {
     pool_ready: bool = false,
     instances: std.ArrayList(Instance) = .empty,
     batches: std.ArrayList(DrawBatch) = .empty,
-    /// Live binding from the last `device_atlas.upload`, released and
-    /// re-issued each frame.
+    /// Live binding from the last `device_atlas.upload`. Reused across frames
+    /// while the atlas snapshot is unchanged — re-uploading flattens the whole
+    /// (growing) atlas, which is pure waste when nothing new was prepped.
     cache_binding: ?Binding = null,
+    /// `snapshot_id` the `cache_binding` was built from; 0 = none uploaded.
+    cache_snapshot_id: u64 = 0,
 
     /// Initialize in place. `self` must point at allocated (uninitialized)
     /// storage — CpuPipeline embeds several-MB scratch arrays, so returning
@@ -362,6 +365,16 @@ pub const CpuPipeline = struct {
         }
     }
 
+    /// Flatten the whole `atlas` into a fresh cache binding. Used only on the
+    /// first frame or when a delta is impossible; steady state and floods go
+    /// through `uploadDelta`.
+    fn fullAtlasUpload(self: *CpuPipeline, atlas: *const snail.Atlas, snap_id: u64) !void {
+        var bindings: [1]Binding = undefined;
+        try self.device_atlas.upload(self.allocator, &[_]*const snail.Atlas{atlas}, &bindings);
+        self.cache_binding = bindings[0];
+        self.cache_snapshot_id = snap_id;
+    }
+
     /// Emit every row's placed glyph shapes and rasterize them over the buffer.
     fn drawText(
         self: *CpuPipeline,
@@ -373,17 +386,31 @@ pub const CpuPipeline = struct {
         for (rows) |row| total_shapes += row.shapes.len;
         if (total_shapes == 0) return;
 
-        // Refresh the software atlas cache for the current atlas snapshot.
-        // The prepared pages are cache-owned copies, so the binding stays
-        // valid across the frame regardless of atlas republication.
-        if (self.cache_binding) |b| {
-            self.device_atlas.release(b);
-            self.cache_binding = null;
+        // Refresh the software atlas cache. A binding's prepared pages are
+        // cache-owned copies, so it stays valid across frames:
+        //  - snapshot unchanged  → reuse the binding, upload nothing.
+        //  - snapshot advanced   → `uploadDelta` uploads only the new pages
+        //    (a flood extends the atlas with append-only children, which reuse
+        //    the resident pages) instead of re-flattening the whole, possibly
+        //    100+MB, atlas — the dominant CPU-path cost under a flood.
+        //  - first use / incompatible snapshot (post eviction/compaction) →
+        //    full `upload`.
+        const snap_id = atlas.snapshotIdentity().snapshot_id;
+        if (self.cache_binding) |prev| {
+            if (self.cache_snapshot_id != snap_id) {
+                if (self.device_atlas.uploadDelta(self.allocator, prev, atlas)) |updated| {
+                    self.cache_binding = updated;
+                    self.cache_snapshot_id = snap_id;
+                } else |_| {
+                    self.device_atlas.release(prev);
+                    self.cache_binding = null;
+                    try self.fullAtlasUpload(atlas, snap_id);
+                }
+            }
+        } else {
+            try self.fullAtlasUpload(atlas, snap_id);
         }
-        var bindings: [1]Binding = undefined;
-        try self.device_atlas.upload(self.allocator, &[_]*const snail.Atlas{atlas}, &bindings);
-        self.cache_binding = bindings[0];
-        const binding = bindings[0];
+        const binding = self.cache_binding.?;
 
         // Generous upper bound: emit may expand a shape into several
         // per-layer instances (COLR / hinted).
