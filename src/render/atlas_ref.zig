@@ -268,9 +268,20 @@ pub const AtlasRef = struct {
     /// fallback resolver are set (i.e. after bootstrap).
     pub fn startPrep(self: *AtlasRef) !void {
         if (self.prep_active) return;
-        // Cap at 8: enough to clear a glyph flood in a frame or two while
-        // leaving cores for the render loop, GPU worker, and CPU raster pool.
-        self.prep_workers = @max(1, @min(std.Thread.getCpuCount() catch 4, 8));
+        // Glyph extraction is memory-bandwidth-bound, not core-bound: past ~8
+        // workers throughput barely rises AND the workers starve the render
+        // (the CPU raster's full-surface clear + the GPU's init pound the same
+        // bus). So cap modestly by default. Override with SCRGO_PREP_WORKERS to
+        // probe the knee on a given machine. Clamped to the core count.
+        const cpu = std.Thread.getCpuCount() catch 4;
+        var workers: usize = @min(cpu, 8);
+        if (std.c.getenv("SCRGO_PREP_WORKERS")) |env| {
+            if (std.fmt.parseInt(usize, std.mem.sliceTo(env, 0), 10) catch null) |v| {
+                if (v > 0) workers = @min(cpu, v);
+            }
+        }
+        self.prep_workers = @max(1, workers);
+        log.info(.atlas, "prep workers", .{ .workers = self.prep_workers, .cores = cpu });
         self.prep_contexts = try self.allocator.alloc(snail.OutlineContext, self.prep_workers);
         for (self.prep_contexts) |*cx| cx.* = snail.OutlineContext.init(self.allocator, self.allocator);
         self.prep_active = true;

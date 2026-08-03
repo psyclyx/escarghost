@@ -9,6 +9,7 @@ const std = @import("std");
 const snail = @import("snail");
 const shaders = @import("snail-shaders");
 const log = @import("../../log.zig");
+const perf = @import("../../perf.zig");
 const Context = @import("context.zig").Context;
 const DmabufTarget = @import("dmabuf.zig").DmabufTarget;
 const memtrack = @import("memtrack.zig");
@@ -512,11 +513,15 @@ fn buildPipeline(ctx: *const Context, layout: vk.VkPipelineLayout, r: PipelineRe
     };
 
     var pipeline: vk.VkPipeline = null;
-    const result = vk.vkCreateGraphicsPipelines(ctx.device, null, 1, &pipeline_info, null, &pipeline);
+    const pipe_t = perf.Timer.now();
+    // Seed from the disk-backed pipeline cache so the driver reuses compiled
+    // shaders across launches instead of recompiling every time.
+    const result = vk.vkCreateGraphicsPipelines(ctx.device, ctx.pipeline_cache, 1, &pipeline_info, null, &pipeline);
     if (result != vk.VK_SUCCESS) {
         log.err(.gpu, "pipeline creation failed", .{ .err = result });
         return error.PipelineCreationFailed;
     }
+    log.info(.gpu, "pipeline compiled", .{ .ms = log.fmt("{d:.1}", .{pipe_t.elapsedMs()}), .cached = ctx.pipeline_cache != null });
     return pipeline;
 }
 

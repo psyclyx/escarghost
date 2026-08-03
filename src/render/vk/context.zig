@@ -7,7 +7,9 @@
 
 const std = @import("std");
 const log = @import("../../log.zig");
+const perf = @import("../../perf.zig");
 const memtrack = @import("memtrack.zig");
+const pipeline_cache = @import("pipeline_cache.zig");
 
 const vk = @import("vulkan.zig").vk;
 
@@ -19,6 +21,11 @@ pub const Context = struct {
     queue_family_index: u32,
     command_pool: vk.VkCommandPool,
     render_pass: vk.VkRenderPass,
+    /// Disk-backed pipeline cache, seeded from a prior run so NVIDIA's driver
+    /// doesn't recompile the graphics pipeline's shaders from scratch every
+    /// launch. Passed to `vkCreateGraphicsPipelines`; persisted by
+    /// `savePipelineCache`. Null if the cache dir is unavailable.
+    pipeline_cache: vk.VkPipelineCache = null,
     supports_dual_source_blend: bool,
     /// True when the device supports the extensions + timelineSemaphore feature
     /// needed to bridge a render-completion semaphore to a DRM syncobj (for
@@ -38,6 +45,7 @@ pub const Context = struct {
     timestamp_valid_bits: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !Context {
+        const t0 = perf.Timer.now();
         // ── Instance ──
         const instance_extensions = [_][*:0]const u8{
             vk.VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
@@ -69,6 +77,7 @@ pub const Context = struct {
             return error.InstanceCreationFailed;
         }
         errdefer vk.vkDestroyInstance(instance, null);
+        const instance_ms = t0.elapsedMs();
 
         // ── Physical device selection ──
         var physical_device_count: u32 = 0;
@@ -174,11 +183,16 @@ pub const Context = struct {
             .pNext = &features2,
         };
 
+        // Time from instance-done to here = physical-device enumeration +
+        // feature queries.
+        const enumerate_ms = t0.elapsedMs() - instance_ms;
+        const device_create_t = perf.Timer.now();
         var device: vk.VkDevice = null;
         if (vk.vkCreateDevice(physical_device, &device_create_info, null, &device) != vk.VK_SUCCESS) {
             return error.DeviceCreationFailed;
         }
         errdefer vk.vkDestroyDevice(device, null);
+        const device_create_ms = device_create_t.elapsedMs();
 
         // ── Queue ──
         var queue: vk.VkQueue = null;
@@ -266,11 +280,19 @@ pub const Context = struct {
             }
         }
 
+        // ── Pipeline cache (disk-backed) ──
+        const pcache = pipeline_cache.create(device, allocator);
+
         log.info(.gpu, "vulkan context ready", .{
             .queue_family = queue_family_index,
             .dual_src_blend = supports_dual_source_blend,
             .gpu_timestamps = timestamp_query_pool != null,
             .explicit_sync = explicit_sync,
+            .instance_ms = log.fmt("{d:.1}", .{instance_ms}),
+            .enumerate_ms = log.fmt("{d:.1}", .{enumerate_ms}),
+            .device_ms = log.fmt("{d:.1}", .{device_create_ms}),
+            .total_ms = log.fmt("{d:.1}", .{t0.elapsedMs()}),
+            .cache = pcache != null,
         });
 
         return .{
@@ -281,6 +303,7 @@ pub const Context = struct {
             .queue_family_index = queue_family_index,
             .command_pool = command_pool,
             .render_pass = render_pass,
+            .pipeline_cache = pcache,
             .supports_dual_source_blend = supports_dual_source_blend,
             .explicit_sync = explicit_sync,
             .timestamp_query_pool = timestamp_query_pool,
@@ -289,7 +312,14 @@ pub const Context = struct {
         };
     }
 
+    /// Persist the pipeline cache to disk (call once after the pipeline is
+    /// compiled). Best-effort; a failure just means the next launch recompiles.
+    pub fn savePipelineCache(self: *const Context, allocator: std.mem.Allocator) void {
+        if (self.pipeline_cache != null) pipeline_cache.save(self.device, self.pipeline_cache, allocator);
+    }
+
     pub fn deinit(self: *Context) void {
+        if (self.pipeline_cache != null) vk.vkDestroyPipelineCache(self.device, self.pipeline_cache, null);
         if (self.timestamp_query_pool != null) vk.vkDestroyQueryPool(self.device, self.timestamp_query_pool, null);
         vk.vkDestroyRenderPass(self.device, self.render_pass, null);
         vk.vkDestroyCommandPool(self.device, self.command_pool, null);

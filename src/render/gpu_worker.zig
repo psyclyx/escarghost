@@ -528,6 +528,9 @@ pub const GpuWorker = struct {
                             writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                             continue;
                         };
+                        // Persist the freshly-compiled pipeline so subsequent
+                        // launches seed from it instead of recompiling.
+                        ctx.savePipelineCache(std.heap.smp_allocator);
                     } else {
                         renderer.?.ensureSlotCapacity(&ctx, slot_bytes) catch |e| {
                             log.err(.gpu, "vertex ring resize failed", .{ .err = e });
