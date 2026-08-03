@@ -107,6 +107,15 @@ pub const AtlasRef = struct {
     prep_stop: bool = false,
     prep_len: usize = 0,
     prep_text: [glyph_misses.MaxBytes]u8 = undefined,
+    /// Warm-fallback mailbox: raw PTY text fed straight from the reader thread
+    /// so covering fonts start loading the moment content arrives, in parallel
+    /// with the first frame — instead of waiting for a frame to build and
+    /// detect misses. The prep thread runs only `ensureFallbackCoverage` on it
+    /// (no shape/prep), so escape-sequence bytes are harmless (ASCII → no
+    /// fallback). Separate slot from `prep_text`; latest wins.
+    warm_pending: bool = false,
+    warm_len: usize = 0,
+    warm_text: [glyph_misses.MaxBytes]u8 = undefined,
     /// Number of worker stripes for parallel glyph extraction. Set at
     /// `startPrep` to min(nproc, 8); the prep thread runs one stripe itself
     /// and spawns the rest per batch (prep batches are infrequent).
@@ -302,23 +311,55 @@ pub const AtlasRef = struct {
         _ = c.pthread_mutex_unlock(&self.prep_mutex);
     }
 
+    /// Warm covering fonts for the codepoints in `text` ahead of the render
+    /// path. Called from the PTY reader with each fresh chunk of raw output,
+    /// so fontconfig resolution + font mmap/parse overlap the first frame
+    /// rather than waiting for miss detection. Only the fallback-coverage step
+    /// runs on this text (no shape/prep), so escape/control bytes cost
+    /// nothing. Single-slot, latest-wins; no-op before `startPrep`.
+    pub fn requestWarmFallback(self: *AtlasRef, text: []const u8) void {
+        if (!self.prep_active or text.len == 0) return;
+        const n = @min(text.len, self.warm_text.len);
+        _ = c.pthread_mutex_lock(&self.prep_mutex);
+        @memcpy(self.warm_text[0..n], text[0..n]);
+        self.warm_len = n;
+        self.warm_pending = true;
+        _ = c.pthread_cond_signal(&self.prep_cond);
+        _ = c.pthread_mutex_unlock(&self.prep_mutex);
+    }
+
     fn prepLoop(self: *AtlasRef) void {
         log.info(.atlas, "prep thread running", .{});
         var work: [glyph_misses.MaxBytes]u8 = undefined;
+        var warm_work: [glyph_misses.MaxBytes]u8 = undefined;
         while (true) {
             _ = c.pthread_mutex_lock(&self.prep_mutex);
-            while (!self.prep_pending and !self.prep_stop) {
+            while (!self.prep_pending and !self.warm_pending and !self.prep_stop) {
                 _ = c.pthread_cond_wait(&self.prep_cond, &self.prep_mutex);
             }
             if (self.prep_stop) {
                 _ = c.pthread_mutex_unlock(&self.prep_mutex);
                 return;
             }
-            const n = self.prep_len;
-            @memcpy(work[0..n], self.prep_text[0..n]);
-            self.prep_pending = false;
+            const warm_have = self.warm_pending;
+            const warm_n = self.warm_len;
+            if (warm_have) {
+                @memcpy(warm_work[0..warm_n], self.warm_text[0..warm_n]);
+                self.warm_pending = false;
+            }
+            const prep_have = self.prep_pending;
+            const prep_n = self.prep_len;
+            if (prep_have) {
+                @memcpy(work[0..prep_n], self.prep_text[0..prep_n]);
+                self.prep_pending = false;
+            }
             _ = c.pthread_mutex_unlock(&self.prep_mutex);
-            self.runPrep(work[0..n]);
+
+            // Warm covering fonts first so the subsequent prep (and any
+            // render-side reshape) sees the coverage. `ensureFallbackCoverage`
+            // dedups via `fallback_tried`, so this is ~free once warm.
+            if (warm_have) _ = self.ensureFallbackCoverage(warm_work[0..warm_n]);
+            if (prep_have) self.runPrep(work[0..prep_n]);
         }
     }
 

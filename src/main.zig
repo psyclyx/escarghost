@@ -428,7 +428,7 @@ pub fn main(init: std.process.Init) !void {
     term.events = &events_queue;
 
     var reader: pty_reader.Reader = .{};
-    try reader.start(&pty, &term, &events_queue);
+    try reader.start(&pty, &term, &events_queue, atlas_ref_ptr);
     // Runs before the pty/term defers above (LIFO): the reader must be
     // joined while the terminal and master fd are still alive.
     defer reader.stop();
@@ -672,7 +672,6 @@ pub fn main(init: std.process.Init) !void {
                                     state.diag.recordCommitSerial('g', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                                     if (!wl.frame_pending) wl.requestFrame();
                                     state.render.committed_had_misses = resp.had_misses != 0;
-                                    state.render.committed_miss_serial = resp.serial;
                                     if (state.render.active_render_path != .gpu) {
                                         log.info(.frame, "path switch", .{ .from = "cpu", .to = "gpu" });
                                         state.render.active_render_path = .gpu;
@@ -736,7 +735,6 @@ pub fn main(init: std.process.Init) !void {
                             state.diag.recordCommitSerial('c', resp.serial, state.render.render_serial, state.render.gpu_snapshot_dirty or state.render.needs_redraw);
                             if (!wl.frame_pending) wl.requestFrame();
                             state.render.committed_had_misses = resp.had_misses != 0;
-                            state.render.committed_miss_serial = resp.serial;
                             log.setFrame(.frame, resp.serial);
                             log.debug(.cpu, "frame committed", .{ .buffer = resp.buffer_index });
                             render_loop.markFirstContentPaint(&state, resp.serial);

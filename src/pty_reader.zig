@@ -19,6 +19,7 @@ const pty_mod = @import("pty.zig");
 const terminal_mod = @import("terminal.zig");
 const term_events = @import("term_events.zig");
 const diagnostics = @import("diagnostics.zig");
+const atlas_ref_mod = @import("render/atlas_ref.zig");
 const log = @import("log.zig");
 
 const c = @cImport({
@@ -41,6 +42,10 @@ pub const Reader = struct {
     pty: *pty_mod.Pty = undefined,
     term: *terminal_mod.Terminal = undefined,
     events: *term_events.Queue = undefined,
+    /// Warm covering fonts from raw output as it lands (see
+    /// `AtlasRef.requestWarmFallback`). Fired on the same data-arrival edge
+    /// that wakes main, so it's naturally coalesced during a flood.
+    atlas_ref: *atlas_ref_mod.AtlasRef = undefined,
     stop_fd: c_int = -1,
     stop_requested: std.atomic.Value(bool) = .init(false),
 
@@ -66,11 +71,13 @@ pub const Reader = struct {
         pty: *pty_mod.Pty,
         term: *terminal_mod.Terminal,
         events: *term_events.Queue,
+        atlas_ref: *atlas_ref_mod.AtlasRef,
     ) !void {
         if (self.thread != null) return;
         self.pty = pty;
         self.term = term;
         self.events = events;
+        self.atlas_ref = atlas_ref;
         self.stop_fd = c.eventfd(0, c.EFD_CLOEXEC);
         if (self.stop_fd < 0) return error.EventfdFailed;
         errdefer {
@@ -168,6 +175,11 @@ pub const Reader = struct {
                 // poll cycles).
                 if (!self.data_dirty.swap(true, .acq_rel)) {
                     self.events.wake();
+                    // Warm covering fonts from this chunk in parallel with the
+                    // first frame. Coalesced to the wake edge: during a flood
+                    // main consumes the flag ~per frame, so we warm ~per frame
+                    // rather than per 64 KB read.
+                    self.atlas_ref.requestWarmFallback(buf[0..n]);
                 }
 
                 log_bytes += n;

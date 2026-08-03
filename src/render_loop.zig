@@ -24,12 +24,17 @@ pub fn pollAtlasUpdate(s: *app_state.AppState) void {
     const gen = s.refs.atlas_ref.loadGeneration();
     if (gen != s.render.last_atlas_gen) {
         s.render.last_atlas_gen = gen;
-        s.render.gpu_snapshot_dirty = true;
-        s.render.needs_redraw = true;
-        if (s.render.committed_had_misses and
-            s.render.committed_miss_serial == s.render.render_serial)
-        {
-            s.render.atlas_catchup_bypass = true;
+        // The atlas grew (prep filled glyphs). Re-render to pick them up ONLY
+        // if the last frame we showed was missing glyphs — that's the
+        // `last_frame_missing_glyphs` trigger. If the last frame was complete,
+        // the newly-prepped glyphs are for content not yet on screen; the
+        // redraw for that content (new_state) will pick them up. Gating here
+        // converges: once every shaped glyph is prepped (incl. notdef for
+        // uncoverable codepoints) `committed_had_misses` clears, so a static
+        // screen stops re-rendering even with permanently-missing glyphs.
+        if (s.render.committed_had_misses) {
+            s.render.gpu_snapshot_dirty = true;
+            s.render.needs_redraw = true;
         }
     }
 }
@@ -152,12 +157,12 @@ pub fn tickBell(s: *app_state.AppState) void {
 /// the whole budget is available for the work.
 pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     const gpu = s.refs.gpu;
-    const wl = s.refs.wayland;
     if (s.render.target_render_path != .gpu) return;
     if (!gpu.active or !gpu.ready or gpu.render_in_flight or !s.render.gpu_snapshot_dirty) return;
-    // atlas_catchup_bypass lets one render through mid-vsync so its commit
-    // can replace a pending miss-y frame before the compositor latches.
-    if (wl.frame_pending and !s.render.atlas_catchup_bypass) return;
+    // Render as fast as free buffers allow — NOT vsync-gated. We draw whenever
+    // the state changed (new content) or we owe a miss-fill, sampling the
+    // latest state each time; the compositor latches the most recent commit at
+    // vsync (no tearing). `NoFreeBuffer` below is the real backpressure.
     gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), currentBellOverlay(s)) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer so
@@ -195,7 +200,6 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     log.setFrame(.frame, s.render.render_serial);
     log.debug(.frame, "queued gpu frame", .{});
     s.render.gpu_snapshot_dirty = false;
-    s.render.atlas_catchup_bypass = false;
 }
 
 pub fn renderActivePath(s: *app_state.AppState) void {
@@ -204,11 +208,9 @@ pub fn renderActivePath(s: *app_state.AppState) void {
     const wl = s.refs.wayland;
     if (s.render.active_render_path != .cpu or !s.render.needs_redraw) return;
     if (s.render.target_render_path == .gpu and gpu.active and gpu.ready) return;
-    // Same vsync throttle as the GPU path — wait for the compositor to
-    // ack the previous commit before queueing the next one. The atlas
-    // catch-up bypass punches through so a miss-y pending commit can be
-    // replaced before the latch (see pollAtlasUpdate).
-    if (wl.frame_pending and !s.render.atlas_catchup_bypass) return;
+    // Not vsync-gated (see maybeQueueGpuFrame): render whenever there's a free
+    // buffer and state changed / a miss to fill; the compositor shows the
+    // latest commit at vsync.
     if (cpu.active) {
         const shm = wl.shm orelse return;
         cpu.ensureBuffers(@ptrCast(shm), wl.width, wl.height) catch |err| switch (err) {
@@ -233,7 +235,6 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             else => return,
         };
         s.render.needs_redraw = false;
-        s.render.atlas_catchup_bypass = false;
         log.setFrame(.frame, s.render.render_serial);
         log.debug(.frame, "queued cpu frame", .{ .width = wl.width, .height = wl.height });
         return;
