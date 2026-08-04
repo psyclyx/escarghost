@@ -340,11 +340,22 @@ pub fn main(init: std.process.Init) !void {
     }
     log.info(.cpu, "started", .{});
 
-    // Explicit sync (opt-in via SCRGO_EXPLICIT_SYNC): the GPU worker sets up
-    // DRM syncobj timelines during configure when this is set + the device is
-    // capable; main imports them into the compositor once the worker reports
-    // them ready. Gated on the compositor advertising the manager.
-    gpu.want_explicit_sync = parseBool(getenv("SCRGO_EXPLICIT_SYNC")) and wl.syncobj_manager != null;
+    // Explicit sync is REQUIRED for the GPU present path (the synchronous /
+    // implicit-sync present path was removed): the worker renders async and the
+    // compositor waits on a DRM syncobj, letting atlas upload run decoupled from
+    // present. Default-on when the compositor advertises the manager; opt out
+    // with SCRGO_NO_EXPLICIT_SYNC. Without it, the GPU path is disabled and the
+    // CPU/SHM path renders instead — no silent fallback to a draining present.
+    gpu.want_explicit_sync = wl.syncobj_manager != null and !parseBool(getenv("SCRGO_NO_EXPLICIT_SYNC"));
+    if (gpu_allowed and !gpu.want_explicit_sync) {
+        // Keep the CPU/SHM path: every GPU gate checks target_render_path, so
+        // this leaves the already-spawned worker idle (it can't be stopped here
+        // — stop() _exits when the context isn't ready yet — and reordering the
+        // spawn past wl.init would break the NVIDIA pthread-hook timing).
+        const reason = if (wl.syncobj_manager == null) "compositor lacks wp_linux_drm_syncobj" else "SCRGO_NO_EXPLICIT_SYNC";
+        log.info(.gpu, "disabled", .{ .reason = reason });
+        state.render.target_render_path = .cpu;
+    }
 
     if (gpu.active and gpu.context_ready) {
         gpu.setSharedState(atlas_ref_ptr);

@@ -413,7 +413,6 @@ pub const GpuWorker = struct {
         // Atlas GPU upload is cached by snapshot generation; the binding is
         // reissued only when the atlas owner publishes a new snapshot.
         var atlas_binding: ?snail.render.records.Binding = null;
-        var cached_atlas_gen: u64 = 0;
         var frame_slot: u32 = 0;
 
         // Explicit sync: one command buffer per dmabuf target (async submit
@@ -694,6 +693,13 @@ pub const GpuWorker = struct {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
                     }
+                    // GPU present requires explicit sync. Main only selects the
+                    // GPU path when the compositor advertises wp_linux_drm_syncobj
+                    // (else it stays on the CPU/SHM path), so this is defensive.
+                    const es = if (explicit_sync) |*e| e else {
+                        writeResponse(self.response_fds[1], self.io, fail);
+                        continue;
+                    };
 
                     const atlas_ref = self.atlas_ref.?;
                     // Re-read faces each frame: auto-fallback (in extend) can
@@ -707,7 +713,7 @@ pub const GpuWorker = struct {
                     // advance the resident generation to it. The render below
                     // draws from whatever is resident, never gated by upload.
                     var atlas_uploaded = false;
-                    if (explicit_sync != null and upload_in_flight and ctx.fenceReady(upload_fence)) {
+                    if (upload_in_flight and ctx.fenceReady(upload_fence)) {
                         if (device_atlas.?.commitUpload(&upload_pending.?)) |new_binding| {
                             if (atlas_binding) |b| device_atlas.?.releaseBinding(b);
                             atlas_binding = new_binding;
@@ -724,35 +730,27 @@ pub const GpuWorker = struct {
                         upload_in_flight = false;
                     }
 
-                    // Pick the atlas to render against: the resident generation
-                    // (async path; bootstrapped synchronously on the first frame)
-                    // or the latest snapshot (sync path, uploaded inline below).
-                    var owns_render_lease = false;
-                    var render_lease: atlas_ref_mod.AtlasRef.Lease = undefined;
-                    if (explicit_sync != null) {
-                        if (resident_lease == null) {
-                            var boot = atlas_ref.acquire();
-                            if (device_atlas.?.upload(boot.get())) |b| {
-                                if (atlas_binding) |old| device_atlas.?.releaseBinding(old);
-                                atlas_binding = b;
-                                resident_lease = boot;
-                                atlas_uploaded = true;
-                            } else |e| {
-                                log.err(.gpu, "atlas bootstrap upload failed", .{ .err = e });
-                                boot.release();
-                            }
+                    // Render from the resident generation — whatever is fully
+                    // uploaded — bootstrapped synchronously on the very first
+                    // frame. Newer generations upload asynchronously (kick below,
+                    // reaped above); the render never waits on an upload.
+                    if (resident_lease == null) {
+                        var boot = atlas_ref.acquire();
+                        if (device_atlas.?.upload(boot.get())) |b| {
+                            if (atlas_binding) |old| device_atlas.?.releaseBinding(old);
+                            atlas_binding = b;
+                            resident_lease = boot;
+                            atlas_uploaded = true;
+                        } else |e| {
+                            log.err(.gpu, "atlas bootstrap upload failed", .{ .err = e });
+                            boot.release();
                         }
-                        if (resident_lease == null) {
-                            writeResponse(self.response_fds[1], self.io, fail);
-                            continue;
-                        }
-                        render_lease = resident_lease.?;
-                    } else {
-                        render_lease = atlas_ref.acquire();
-                        owns_render_lease = true;
                     }
-                    defer if (owns_render_lease) render_lease.release();
-                    const cur_atlas = render_lease.get();
+                    if (resident_lease == null) {
+                        writeResponse(self.response_fds[1], self.io, fail);
+                        continue;
+                    }
+                    const cur_atlas = resident_lease.?.get();
 
                     log.setFrame(.gpu, request.serial);
                     var render_ok = true;
@@ -774,26 +772,9 @@ pub const GpuWorker = struct {
                     if (render_ok and had_misses) atlas_ref.requestPrep(pipeline.?.misses.text());
                     phasePrepNs += phase_t.elapsedNs();
 
-                    // Sync path only: upload the leased generation inline. The
-                    // async path advanced residency above (reap) and kicks the
-                    // next upload after the render, off the critical path.
-                    phase_t = perf.Timer.now();
-                    if (render_ok and explicit_sync == null) {
-                        const cur_gen = render_lease.generation();
-                        if (atlas_binding == null or cur_gen != cached_atlas_gen) {
-                            if (atlas_binding) |b| device_atlas.?.releaseBinding(b);
-                            atlas_binding = device_atlas.?.upload(cur_atlas) catch |e| blk: {
-                                log.err(.gpu, "atlas upload failed", .{ .err = e });
-                                render_ok = false;
-                                break :blk null;
-                            };
-                            if (render_ok) {
-                                cached_atlas_gen = cur_gen;
-                                atlas_uploaded = true;
-                            }
-                        }
-                    }
-                    const upload_ns = phase_t.elapsedNs();
+                    // Upload is off the render critical path now (async, below),
+                    // so the render frame's own upload time is zero.
+                    const upload_ns: u64 = 0;
                     phaseUploadNs += upload_ns;
                     phase_t = perf.Timer.now();
                     if (render_ok) {
@@ -816,7 +797,7 @@ pub const GpuWorker = struct {
                     phase_t = perf.Timer.now();
                     var acquire_point: u64 = 0;
                     var gpu_ns: u64 = 0;
-                    if (explicit_sync) |*es| {
+                    {
                         // Wait for the compositor to release this buffer's prior
                         // frame (implies that render + its cmd buffer are done),
                         // render async signalling render_done, then place that
@@ -850,23 +831,6 @@ pub const GpuWorker = struct {
                         };
                         release_points[buffer_index] = frame_point;
                         acquire_point = frame_point;
-                    } else {
-                        gpu_ns = vk.renderToTarget(
-                            &renderer.?,
-                            &ctx,
-                            &dmabuf_targets[buffer_index],
-                            device_atlas.?.descriptorSet(),
-                            frame_slot,
-                            clear_color,
-                            device_atlas.?.atlasPageTexels(),
-                            pipeline.?.emittedInstances(),
-                            pipeline.?.emittedBatches(),
-                            .{},
-                        ) catch |e| {
-                            log.err(.gpu, "render submit failed", .{ .err = e });
-                            writeResponse(self.response_fds[1], self.io, fail);
-                            continue;
-                        };
                     }
                     const render_ns = phase_t.elapsedNs();
                     phaseRenderNs += render_ns;
@@ -878,8 +842,7 @@ pub const GpuWorker = struct {
                     // an older resident generation — the kick below (or a prior
                     // one still in flight) will advance it, so ask main to
                     // re-render and show the result.
-                    const residency_behind = explicit_sync != null and
-                        resident_lease != null and
+                    const residency_behind = resident_lease != null and
                         resident_lease.?.generation() < atlas_ref.loadGeneration();
                     writeResponse(self.response_fds[1], self.io, .{
                         .tag = .frame,
@@ -897,7 +860,7 @@ pub const GpuWorker = struct {
                     // present is never gated by it; delta copies target disjoint
                     // new pages and same-queue order keeps it safe against the
                     // in-flight render. Reaped at the top of a later frame.
-                    if (explicit_sync != null and !upload_in_flight and resident_lease != null) {
+                    if (!upload_in_flight and resident_lease != null) {
                         var latest = atlas_ref.acquire();
                         var adopted = false;
                         defer if (!adopted) latest.release();
