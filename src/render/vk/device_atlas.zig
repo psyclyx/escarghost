@@ -264,12 +264,22 @@ pub const DeviceAtlas = struct {
         }
         vk.vkUnmapMemory(self.ctx.device, staging_mem);
 
-        // Record copies.
+        // Record copies + barriers, then submit-and-wait (synchronous path).
         const cmd = try self.ctx.allocCommandBuffer();
         defer self.ctx.freeCommandBuffer(cmd);
         const begin = vk.VkCommandBufferBeginInfo{ .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
         if (vk.vkBeginCommandBuffer(cmd, &begin) != vk.VK_SUCCESS) return error.VulkanError;
+        try self.recordCopies(cmd, regions, offsets, staging_buf);
+        if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.VulkanError;
+        try self.ctx.submitAndWait(cmd);
+        return self.planner.commit(&pending);
+    }
 
+    /// Record the staging→device copies + surrounding layout transitions and
+    /// the transfer→shader barrier for `regions` into `cmd` (already in the
+    /// recording state). Pure command recording — no submit, no ownership.
+    /// Shared by the synchronous `upload` and the async `recordUpload`.
+    fn recordCopies(self: *Self, cmd: vk.VkCommandBuffer, regions: []const upload_plan.Region, offsets: []const usize, staging_buf: vk.VkBuffer) !void {
         var has_curve = false;
         var has_band = false;
         var has_image = false;
@@ -337,10 +347,92 @@ pub const DeviceAtlas = struct {
             transitionImageLayout(cmd, self.layer_info_image, 1, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
             self.layer_info_layout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
+    }
 
-        if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.VulkanError;
-        try self.ctx.submitAndWait(cmd);
-        return self.planner.commit(&pending);
+    /// A planned-but-not-yet-committed upload: the snail planner's residency
+    /// reservation plus the host-visible staging buffer whose copies were
+    /// recorded into the caller's command buffer. The staging buffer must stay
+    /// alive until that command buffer's submit completes (fence / release
+    /// point); then call `commitUpload` (finalizes residency → live `Binding`)
+    /// and `freeStaging`. Only ONE may be outstanding at a time — the planner
+    /// enforces this (`error.PendingUploadExists`).
+    pub const PendingUpload = struct {
+        pending: upload_plan.PendingUpload,
+        staging_buf: vk.VkBuffer = null,
+        staging_mem: vk.VkDeviceMemory = null,
+        /// No copies were recorded (everything already resident) — nothing to
+        /// submit, but `commitUpload` must still finalize the reservation.
+        empty: bool = false,
+    };
+
+    /// Record `atlas`'s dirty regions into `cmd` (caller-owned, already in the
+    /// recording state) WITHOUT submitting — the async decoupled-present path.
+    /// The caller submits `cmd` (signalling a fence), and once the GPU copies
+    /// land calls `commitUpload` + `freeStaging`. On error here the provisional
+    /// binding is released. Growth still submits synchronously (rare; repoints
+    /// the descriptor).
+    pub fn recordUpload(self: *Self, atlas: *const snail.Atlas, cmd: vk.VkCommandBuffer) !PendingUpload {
+        try self.ensureGpuResources();
+
+        var len: usize = 0;
+        const info_scratch = self.plan_info_scratch[0..self.info_scratch_stride];
+        var pending = try self.planner.plan(atlas, self.plan_regions, &len, info_scratch);
+        errdefer _ = self.planner.release(pending.binding());
+        const regions = self.plan_regions[0..len];
+
+        var max_page: u32 = 0;
+        for (regions) |r| switch (r.target) {
+            .curve, .band => max_page = @max(max_page, r.page + 1),
+            else => {},
+        };
+        if (max_page > self.capacity_pages) try self.growPoolBuffers(max_page);
+
+        var total: usize = 0;
+        for (regions) |r| total = std.math.add(usize, total, r.src.len) catch return error.UploadSizeOverflow;
+        if (total == 0) return .{ .pending = pending, .empty = true };
+
+        var staging_buf: vk.VkBuffer = null;
+        var staging_mem: vk.VkDeviceMemory = null;
+        try createBuffer(self.ctx, total, vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &staging_buf, &staging_mem);
+        errdefer {
+            vk.vkDestroyBuffer(self.ctx.device, staging_buf, null);
+            vk.vkFreeMemory(self.ctx.device, staging_mem, null);
+        }
+        var mapped: ?*anyopaque = null;
+        if (vk.vkMapMemory(self.ctx.device, staging_mem, 0, total, 0, &mapped) != vk.VK_SUCCESS) {
+            self.planner.invalidateUploads() catch {};
+            return error.VulkanError;
+        }
+        const dst: [*]u8 = @ptrCast(mapped.?);
+        const offsets = try self.allocator.alloc(usize, regions.len);
+        defer self.allocator.free(offsets);
+        {
+            var cursor: usize = 0;
+            for (regions, 0..) |r, i| {
+                @memcpy(dst[cursor..][0..r.src.len], r.src);
+                offsets[i] = cursor;
+                cursor += r.src.len;
+            }
+        }
+        vk.vkUnmapMemory(self.ctx.device, staging_mem);
+
+        try self.recordCopies(cmd, regions, offsets, staging_buf);
+        return .{ .pending = pending, .staging_buf = staging_buf, .staging_mem = staging_mem };
+    }
+
+    /// Finalize a recorded upload's residency into a live binding. Call only
+    /// after the command buffer that carried its copies has completed on the
+    /// GPU.
+    pub fn commitUpload(self: *Self, p: *PendingUpload) !Binding {
+        return self.planner.commit(&p.pending);
+    }
+
+    /// Free a pending upload's staging buffer (after its submit completes).
+    pub fn freeStaging(self: *Self, p: *PendingUpload) void {
+        if (p.staging_buf != null) vk.vkDestroyBuffer(self.ctx.device, p.staging_buf, null);
+        if (p.staging_mem != null) vk.vkFreeMemory(self.ctx.device, p.staging_mem, null);
+        p.staging_buf = null;
+        p.staging_mem = null;
     }
 
     pub fn releaseBinding(self: *Self, binding: Binding) void {
