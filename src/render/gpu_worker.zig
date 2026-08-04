@@ -107,6 +107,11 @@ pub const Response = extern struct {
     /// This is what keeps drawing "additional frames until complete" without a
     /// terminal-state or atlas-generation change to trigger it.
     residency_behind: u8 = 0,
+    /// Freshest-complete present (R3): nonzero when the worker HELD this frame —
+    /// kept the last complete frame on screen rather than present an incomplete
+    /// one — so main must not commit; it just retries until the frame completes
+    /// or the staleness deadline forces it.
+    held: u8 = 0,
 };
 
 const RequestTag = enum { configure, render, quit };
@@ -435,6 +440,25 @@ pub const GpuWorker = struct {
         };
         var release_points: [MaxBuffers]u64 = [_]u64{0} ** MaxBuffers;
         var frame_point: u64 = 0;
+
+        // Freshest-complete present (R3): present the newest all-resident serial;
+        // hold an incomplete one (keep the last complete frame on screen, retry
+        // as residency fills) until this staleness deadline, then present it with
+        // gaps. `SCRGO_HOLD_DEADLINE_MS=0` disables holding (present newest
+        // always — the pre-R3 behaviour).
+        const hold_deadline_ns: u64 = blk: {
+            var ms: u64 = 33; // ~2 frames at 60 Hz
+            if (std.c.getenv("SCRGO_HOLD_DEADLINE_MS")) |env| {
+                if (std.fmt.parseInt(u64, std.mem.sliceTo(env, 0), 10) catch null) |v| ms = v;
+            }
+            break :blk ms * std.time.ns_per_ms;
+        };
+        // Nonzero once we've presented at least one frame (so the first frame is
+        // never held — nothing complete is on screen yet), and the monotonic time
+        // the current incomplete streak began (reset on every present) — the
+        // deadline is measured from there.
+        var last_present_ns: u64 = 0;
+        var incomplete_since_ns: u64 = 0;
 
         // Decoupled atlas upload (async present path). The render draws from the
         // RESIDENT generation — whatever is fully uploaded — while a newer
@@ -772,7 +796,73 @@ pub const GpuWorker = struct {
                     if (render_ok and had_misses) atlas_ref.requestPrep(pipeline.?.misses.text());
                     phasePrepNs += phase_t.elapsedNs();
 
-                    // Upload is off the render critical path now (async, below),
+                    // Advance residency: kick the next async upload if a newer
+                    // generation exists and none is in flight. Runs before the
+                    // present/hold decision so a HELD frame still advances toward
+                    // completeness. Its delta copies target disjoint new pages
+                    // and same-queue order keeps it safe against this frame's
+                    // render below; reaped at the top of a later frame.
+                    if (!upload_in_flight and resident_lease != null) {
+                        var latest = atlas_ref.acquire();
+                        var adopted = false;
+                        defer if (!adopted) latest.release();
+                        if (latest.generation() > resident_lease.?.generation()) kick: {
+                            ctx.beginOneTime(upload_cmd) catch break :kick;
+                            var p = device_atlas.?.recordUpload(latest.get(), upload_cmd) catch |e| {
+                                log.err(.gpu, "atlas record upload failed", .{ .err = e });
+                                ctx.endCmd(upload_cmd) catch {};
+                                break :kick;
+                            };
+                            ctx.endCmd(upload_cmd) catch {
+                                device_atlas.?.abortUpload(&p);
+                                device_atlas.?.freeStaging(&p);
+                                break :kick;
+                            };
+                            ctx.resetFence(upload_fence);
+                            ctx.submitFenced(upload_cmd, upload_fence) catch |e| {
+                                log.err(.gpu, "atlas upload submit failed", .{ .err = e });
+                                device_atlas.?.abortUpload(&p);
+                                device_atlas.?.freeStaging(&p);
+                                break :kick;
+                            };
+                            upload_pending = p;
+                            upload_lease = latest;
+                            upload_in_flight = true;
+                            adopted = true;
+                        }
+                    }
+
+                    // Residency lags the latest atlas when this frame drew from an
+                    // older resident generation — the kick above (or a prior one
+                    // in flight) advances it, so main should re-render.
+                    const residency_behind = resident_lease != null and
+                        resident_lease.?.generation() < atlas_ref.loadGeneration();
+
+                    // R3 present policy: present the newest all-resident serial.
+                    // If this frame is incomplete and we presented recently, HOLD
+                    // — keep the last complete frame on screen and retry as
+                    // residency fills — until the staleness deadline, then present
+                    // with gaps. A held frame skips render+present, so no buffer
+                    // is consumed and no release point is left dangling.
+                    if (render_ok and had_misses and hold_deadline_ns != 0 and last_present_ns != 0) {
+                        const now = monotonicNs();
+                        if (incomplete_since_ns == 0) incomplete_since_ns = now;
+                        if ((now -% incomplete_since_ns) < hold_deadline_ns) {
+                            writeResponse(self.response_fds[1], self.io, .{
+                                .tag = .frame,
+                                .buffer_index = buffer_index,
+                                .snapshot_slot = snapshot_slot,
+                                .had_misses = 1,
+                                .serial = request.serial,
+                                .residency_behind = @intFromBool(residency_behind),
+                                .held = 1,
+                            });
+                            continue;
+                        }
+                        // Deadline exceeded — present with gaps (fall through).
+                    }
+
+                    // Upload is off the render critical path now (async, above),
                     // so the render frame's own upload time is zero.
                     const upload_ns: u64 = 0;
                     phaseUploadNs += upload_ns;
@@ -837,13 +927,9 @@ pub const GpuWorker = struct {
                     phaseGpuNs += gpu_ns;
                     phaseFrameCount += 1;
                     frame_slot +%= 1;
+                    last_present_ns = monotonicNs();
+                    incomplete_since_ns = 0; // presented — next incomplete streak restarts the deadline
 
-                    // Residency lags the latest atlas when this frame drew from
-                    // an older resident generation — the kick below (or a prior
-                    // one still in flight) will advance it, so ask main to
-                    // re-render and show the result.
-                    const residency_behind = resident_lease != null and
-                        resident_lease.?.generation() < atlas_ref.loadGeneration();
                     writeResponse(self.response_fds[1], self.io, .{
                         .tag = .frame,
                         .buffer_index = buffer_index,
@@ -852,43 +938,8 @@ pub const GpuWorker = struct {
                         .serial = request.serial,
                         .acquire_point = acquire_point,
                         .residency_behind = @intFromBool(residency_behind),
+                        .held = 0,
                     });
-
-                    // Kick the next residency-advancing upload (async path): if a
-                    // newer generation exists and none is in flight, record +
-                    // submit it on its own fence. Submitted AFTER the present so
-                    // present is never gated by it; delta copies target disjoint
-                    // new pages and same-queue order keeps it safe against the
-                    // in-flight render. Reaped at the top of a later frame.
-                    if (!upload_in_flight and resident_lease != null) {
-                        var latest = atlas_ref.acquire();
-                        var adopted = false;
-                        defer if (!adopted) latest.release();
-                        if (latest.generation() > resident_lease.?.generation()) kick: {
-                            ctx.beginOneTime(upload_cmd) catch break :kick;
-                            var p = device_atlas.?.recordUpload(latest.get(), upload_cmd) catch |e| {
-                                log.err(.gpu, "atlas record upload failed", .{ .err = e });
-                                ctx.endCmd(upload_cmd) catch {};
-                                break :kick;
-                            };
-                            ctx.endCmd(upload_cmd) catch {
-                                device_atlas.?.abortUpload(&p);
-                                device_atlas.?.freeStaging(&p);
-                                break :kick;
-                            };
-                            ctx.resetFence(upload_fence);
-                            ctx.submitFenced(upload_cmd, upload_fence) catch |e| {
-                                log.err(.gpu, "atlas upload submit failed", .{ .err = e });
-                                device_atlas.?.abortUpload(&p);
-                                device_atlas.?.freeStaging(&p);
-                                break :kick;
-                            };
-                            upload_pending = p;
-                            upload_lease = latest;
-                            upload_in_flight = true;
-                            adopted = true;
-                        }
-                    }
 
                     // Per-frame phase split (mirrors the CPU worker's "frame
                     // complete"). `render` is CPU wall time around the

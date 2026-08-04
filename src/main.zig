@@ -640,6 +640,12 @@ pub fn main(init: std.process.Init) !void {
                         if (state.render.target_render_path != .gpu) {
                             // Target switched away from gpu; drop this frame.
                             state.diag.recordCommit('d');
+                        } else if (resp.held != 0) {
+                            // R3 freshest-complete: the worker held this frame —
+                            // the last complete frame stays on screen while
+                            // residency fills. Don't commit; re-render so it can
+                            // complete (or hit the worker's staleness deadline).
+                            state.render.gpu_snapshot_dirty = true;
                         } else {
                             log.setFrame(.frame, resp.serial);
                             log.debug(.gpu, "frame ready", .{ .buffer = resp.buffer_index });
