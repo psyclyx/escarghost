@@ -694,6 +694,15 @@ pub fn main(init: std.process.Init) !void {
                                 term.resetDirty();
                                 term.unlock();
                             }
+                            // Decoupled present: the resident atlas is still
+                            // catching up to the latest prepped generation, so
+                            // keep rendering to advance residency and fill glyphs
+                            // — even with no terminal-state change. Bounded: each
+                            // re-render advances residency by one generation, so
+                            // it stops once resident == latest (no spin).
+                            if (resp.residency_behind != 0) {
+                                state.render.gpu_snapshot_dirty = true;
+                            }
                         }
                     },
                     .retry => {

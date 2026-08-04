@@ -101,6 +101,12 @@ pub const Response = extern struct {
     /// sets this as the surface acquire+release point before committing. Zero on
     /// the synchronous path.
     acquire_point: u64 = 0,
+    /// Decoupled present: nonzero when the resident atlas generation this frame
+    /// drew from is behind the latest published one — i.e. an async upload is
+    /// (or should be) advancing residency, so main should re-render to show it.
+    /// This is what keeps drawing "additional frames until complete" without a
+    /// terminal-state or atlas-generation change to trigger it.
+    residency_behind: u8 = 0,
 };
 
 const RequestTag = enum { configure, render, quit };
@@ -868,6 +874,13 @@ pub const GpuWorker = struct {
                     phaseFrameCount += 1;
                     frame_slot +%= 1;
 
+                    // Residency lags the latest atlas when this frame drew from
+                    // an older resident generation — the kick below (or a prior
+                    // one still in flight) will advance it, so ask main to
+                    // re-render and show the result.
+                    const residency_behind = explicit_sync != null and
+                        resident_lease != null and
+                        resident_lease.?.generation() < atlas_ref.loadGeneration();
                     writeResponse(self.response_fds[1], self.io, .{
                         .tag = .frame,
                         .buffer_index = buffer_index,
@@ -875,6 +888,7 @@ pub const GpuWorker = struct {
                         .had_misses = @intFromBool(had_misses),
                         .serial = request.serial,
                         .acquire_point = acquire_point,
+                        .residency_behind = @intFromBool(residency_behind),
                     });
 
                     // Kick the next residency-advancing upload (async path): if a
