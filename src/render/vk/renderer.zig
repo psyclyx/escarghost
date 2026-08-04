@@ -603,6 +603,10 @@ fn imageBarrier(
 pub const SubmitOpts = struct {
     cmd: vk.VkCommandBuffer = null,
     signal_sem: vk.VkSemaphore = null,
+    /// Async path only: a fence signaled alongside `signal_sem` so the caller
+    /// can wait on exactly this submission (resize/teardown) without a device
+    /// drain. Caller resets it before the submit.
+    fence: vk.VkFence = null,
 };
 
 pub fn renderToTarget(
@@ -693,7 +697,8 @@ pub fn renderToTarget(
     if (submit.signal_sem) |sem| {
         // Async: the compositor waits on `sem` (bridged to a DRM syncobj); we
         // don't drain the queue. No timestamp readback (frame isn't done).
-        try ctx.submitSignal(cmd, sem);
+        // `fence` (if any) signals our-side completion for teardown waits.
+        try ctx.submitSignal(cmd, sem, submit.fence);
         return 0;
     }
     try ctx.submitAndWait(cmd);

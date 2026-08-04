@@ -420,6 +420,14 @@ pub const GpuWorker = struct {
         defer for (es_cmds) |cmd| {
             if (cmd != null) ctx.freeCommandBuffer(cmd);
         };
+        // Per-buffer fence signaled by each async render submit — our-side
+        // completion signal, used to wait on exactly the outstanding frames
+        // before freeing dmabuf targets (resize/teardown) instead of draining
+        // the whole device. Created signaled so unused slots don't block.
+        var es_fences: [MaxBuffers]vk.VkFence = [_]vk.VkFence{null} ** MaxBuffers;
+        defer for (es_fences) |f| {
+            if (f != null) ctx.destroyFence(f);
+        };
         var release_points: [MaxBuffers]u64 = [_]u64{0} ** MaxBuffers;
         var frame_point: u64 = 0;
 
@@ -444,7 +452,10 @@ pub const GpuWorker = struct {
             _ = c.pthread_mutex_lock(&self.mutex);
             if (self.stop_requested) {
                 _ = c.pthread_mutex_unlock(&self.mutex);
-                // Cleanup dmabuf targets
+                // Cleanup dmabuf targets. Wait for the outstanding async frames
+                // first (see the configure handler) — precise per-buffer fences,
+                // not a device drain.
+                if (explicit_sync != null) ctx.waitFences(es_fences[0..dmabuf_count], std.time.ns_per_s);
                 for (0..dmabuf_count) |i| dmabuf_targets[i].destroy(&ctx);
                 return;
             }
@@ -458,11 +469,24 @@ pub const GpuWorker = struct {
 
             switch (request.tag) {
                 .quit => {
+                    // Wait for outstanding async frames before teardown (see
+                    // configure handler below).
+                    if (explicit_sync != null) ctx.waitFences(es_fences[0..dmabuf_count], std.time.ns_per_s);
                     for (0..dmabuf_count) |i| dmabuf_targets[i].destroy(&ctx);
                     return;
                 },
                 .configure => {
-                    // Allocate dmabuf targets via Vulkan
+                    // Free the old dmabuf targets, then reallocate at the new
+                    // size. In the async explicit-sync path renderToTarget
+                    // submits without draining the queue (submitSignal), so a
+                    // prior frame's command buffer may still be reading these
+                    // VkImages on the GPU. Destroying them here would free the
+                    // backing memory mid-flight → GPU MMU fault (NVRM Xid 31,
+                    // FAULT_PDE) and a lost device that wedges the whole session.
+                    // Wait on the outstanding frames' fences first — precise
+                    // per-buffer waits, not a device drain, and only the
+                    // in-flight ones block (unused fences are signaled).
+                    if (explicit_sync != null) ctx.waitFences(es_fences[0..dmabuf_count], std.time.ns_per_s);
                     for (0..dmabuf_count) |i| dmabuf_targets[i].destroy(&ctx);
                     dmabuf_count = 0;
 
@@ -582,6 +606,10 @@ pub const GpuWorker = struct {
                             var ok = afd >= 0 and rfd >= 0;
                             for (0..dmabuf_count) |i| {
                                 es_cmds[i] = ctx.allocCommandBuffer() catch blk: {
+                                    ok = false;
+                                    break :blk null;
+                                };
+                                es_fences[i] = ctx.createSignaledFence() catch blk: {
                                     ok = false;
                                     break :blk null;
                                 };
@@ -716,6 +744,10 @@ pub const GpuWorker = struct {
                         // render async signalling render_done, then place that
                         // completion on the acquire timeline for the compositor.
                         es.waitRelease(release_points[buffer_index], std.time.ns_per_s);
+                        // The release wait implies the prior render into this
+                        // buffer completed, so its fence is signaled — safe to
+                        // reset for this frame's submission.
+                        ctx.resetFence(es_fences[buffer_index]);
                         frame_point += 1;
                         gpu_ns = vk.renderToTarget(
                             &renderer.?,
@@ -727,7 +759,7 @@ pub const GpuWorker = struct {
                             device_atlas.?.atlasPageTexels(),
                             pipeline.?.emittedInstances(),
                             pipeline.?.emittedBatches(),
-                            .{ .cmd = es_cmds[buffer_index], .signal_sem = es.render_done },
+                            .{ .cmd = es_cmds[buffer_index], .signal_sem = es.render_done, .fence = es_fences[buffer_index] },
                         ) catch |e| {
                             log.err(.gpu, "render submit failed", .{ .err = e });
                             writeResponse(self.response_fds[1], self.io, fail);

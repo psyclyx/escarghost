@@ -367,12 +367,53 @@ pub const Context = struct {
         }
     }
 
-    /// Submit a command buffer that signals `signal_sem` on completion, WITHOUT
-    /// waiting. Used by the explicit-sync present path: the compositor waits on
-    /// the exported semaphore (via a DRM syncobj) instead of us draining the
-    /// queue. The caller must not reuse `cmd`/resources until a later fence or
-    /// the buffer's release point says the GPU is done.
-    pub fn submitSignal(self: *const Context, cmd: vk.VkCommandBuffer, signal_sem: vk.VkSemaphore) !void {
+    /// Block until the device finishes all outstanding work. The async
+    /// explicit-sync present path (`submitSignal`) never drains the queue, so
+    /// callers that free GPU resources still referenced by in-flight command
+    /// buffers (e.g. dmabuf targets on resize/teardown) must call this first —
+    /// otherwise the GPU reads freed memory and faults (NVRM Xid 31).
+    // (No device-wait-idle helper by design: the async present path never
+    // drains the queue. Wait on precise per-frame fences via `waitFences`.)
+
+    /// Create a fence, initially signaled so an unused fence's `waitFences`
+    /// returns immediately (teardown can wait on the whole per-buffer array
+    /// without tracking which slots ever ran).
+    pub fn createSignaledFence(self: *const Context) !vk.VkFence {
+        const info = vk.VkFenceCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = vk.VK_FENCE_CREATE_SIGNALED_BIT,
+        };
+        var fence: vk.VkFence = null;
+        if (vk.vkCreateFence(self.device, &info, null, &fence) != vk.VK_SUCCESS) return error.FenceCreateFailed;
+        return fence;
+    }
+
+    pub fn destroyFence(self: *const Context, fence: vk.VkFence) void {
+        if (fence != null) vk.vkDestroyFence(self.device, fence, null);
+    }
+
+    pub fn resetFence(self: *const Context, fence: vk.VkFence) void {
+        var f = fence;
+        _ = vk.vkResetFences(self.device, 1, &f);
+    }
+
+    /// Block until every fence in `fences` is signaled (or `timeout_ns`
+    /// elapses). The precise, non-shortcut replacement for `vkDeviceWaitIdle`
+    /// before freeing GPU resources on the async present path: waits for
+    /// exactly the outstanding frame submissions, not the whole device.
+    pub fn waitFences(self: *const Context, fences: []const vk.VkFence, timeout_ns: u64) void {
+        if (fences.len == 0) return;
+        _ = vk.vkWaitForFences(self.device, @intCast(fences.len), fences.ptr, vk.VK_TRUE, timeout_ns);
+    }
+
+    /// Submit a command buffer that signals `signal_sem` (compositor-side, via a
+    /// DRM syncobj) and `fence` (our-side completion) on completion, WITHOUT
+    /// waiting. The explicit-sync present path: the compositor waits on the
+    /// exported semaphore instead of us draining the queue; `fence` lets us
+    /// wait on exactly this submission at resize/teardown. The caller must not
+    /// reuse `cmd`/resources until the buffer's release point (or `fence`) says
+    /// the GPU is done.
+    pub fn submitSignal(self: *const Context, cmd: vk.VkCommandBuffer, signal_sem: vk.VkSemaphore, fence: vk.VkFence) !void {
         const submit_info = vk.VkSubmitInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .commandBufferCount = 1,
@@ -380,7 +421,7 @@ pub const Context = struct {
             .signalSemaphoreCount = 1,
             .pSignalSemaphores = &signal_sem,
         };
-        const sr = vk.vkQueueSubmit(self.queue, 1, &submit_info, null);
+        const sr = vk.vkQueueSubmit(self.queue, 1, &submit_info, fence);
         if (sr != vk.VK_SUCCESS) {
             log.err(.gpu, "vkQueueSubmit(async)", .{ .result = sr });
             return error.SubmitFailed;
