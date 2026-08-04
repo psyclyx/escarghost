@@ -427,6 +427,13 @@ pub const DeviceAtlas = struct {
         return self.planner.commit(&p.pending);
     }
 
+    /// Discard a recorded-but-not-committed upload (submit/record error path):
+    /// drops the planner's provisional reservation so the single-pending slot
+    /// is free again. Caller still calls `freeStaging`.
+    pub fn abortUpload(self: *Self, p: *PendingUpload) void {
+        self.planner.abort(&p.pending) catch {};
+    }
+
     /// Free a pending upload's staging buffer (after its submit completes).
     pub fn freeStaging(self: *Self, p: *PendingUpload) void {
         if (p.staging_buf != null) vk.vkDestroyBuffer(self.ctx.device, p.staging_buf, null);

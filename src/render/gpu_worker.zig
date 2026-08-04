@@ -431,6 +431,24 @@ pub const GpuWorker = struct {
         var release_points: [MaxBuffers]u64 = [_]u64{0} ** MaxBuffers;
         var frame_point: u64 = 0;
 
+        // Decoupled atlas upload (async present path). The render draws from the
+        // RESIDENT generation — whatever is fully uploaded — while a newer
+        // generation uploads on its own async submit, so present cost is
+        // draw-only and never gated by upload size (see /tmp/glyphstorm.txt).
+        // `resident_lease` + `atlas_binding` are the resident pair; at most one
+        // upload is in flight (the planner allows a single PendingUpload) and it
+        // advances the pair when its fence signals.
+        var resident_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
+        defer if (resident_lease) |*l| l.release();
+        var upload_cmd: vk.VkCommandBuffer = null;
+        defer if (upload_cmd != null) ctx.freeCommandBuffer(upload_cmd);
+        var upload_fence: vk.VkFence = null;
+        defer if (upload_fence != null) ctx.destroyFence(upload_fence);
+        var upload_pending: ?vk.DeviceAtlas.PendingUpload = null;
+        var upload_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
+        defer if (upload_lease) |*l| l.release();
+        var upload_in_flight = false;
+
         var worker_wait_accum_ns: u64 = 0;
         var worker_wait_count: u64 = 0;
         var diag_frame_counter: u64 = 0;
@@ -453,9 +471,10 @@ pub const GpuWorker = struct {
             if (self.stop_requested) {
                 _ = c.pthread_mutex_unlock(&self.mutex);
                 // Cleanup dmabuf targets. Wait for the outstanding async frames
-                // first (see the configure handler) — precise per-buffer fences,
-                // not a device drain.
+                // and any in-flight atlas upload first (see the configure
+                // handler) — precise fences, not a device drain.
                 if (explicit_sync != null) ctx.waitFences(es_fences[0..dmabuf_count], std.time.ns_per_s);
+                if (upload_in_flight) ctx.waitFences(&.{upload_fence}, std.time.ns_per_s);
                 for (0..dmabuf_count) |i| dmabuf_targets[i].destroy(&ctx);
                 return;
             }
@@ -469,9 +488,10 @@ pub const GpuWorker = struct {
 
             switch (request.tag) {
                 .quit => {
-                    // Wait for outstanding async frames before teardown (see
-                    // configure handler below).
+                    // Wait for outstanding async frames + any in-flight upload
+                    // before teardown (see configure handler below).
                     if (explicit_sync != null) ctx.waitFences(es_fences[0..dmabuf_count], std.time.ns_per_s);
+                    if (upload_in_flight) ctx.waitFences(&.{upload_fence}, std.time.ns_per_s);
                     for (0..dmabuf_count) |i| dmabuf_targets[i].destroy(&ctx);
                     return;
                 },
@@ -614,6 +634,17 @@ pub const GpuWorker = struct {
                                     break :blk null;
                                 };
                             }
+                            // One dedicated command buffer + fence for the async
+                            // atlas upload that advances residency off the
+                            // present critical path.
+                            upload_cmd = ctx.allocCommandBuffer() catch blk: {
+                                ok = false;
+                                break :blk null;
+                            };
+                            upload_fence = ctx.createSignaledFence() catch blk: {
+                                ok = false;
+                                break :blk null;
+                            };
                             if (ok) {
                                 self.es_acquire_fd = afd;
                                 self.es_release_fd = rfd;
@@ -659,21 +690,63 @@ pub const GpuWorker = struct {
                     }
 
                     const atlas_ref = self.atlas_ref.?;
-                    var lease = atlas_ref.acquire();
-                    defer lease.release();
-                    // Re-read each frame: auto-fallback (in extend) can swap
-                    // the shared `Faces` when a miss run needs a new font, and
-                    // it takes effect on the next frame's build.
+                    // Re-read faces each frame: auto-fallback (in extend) can
+                    // swap the shared `Faces` when a miss run needs a new font.
                     const faces = atlas_ref.faces orelse {
                         writeResponse(self.response_fds[1], self.io, fail);
                         continue;
                     };
 
-                    // Shape the frame, growing the atlas on glyph misses. No
-                    // emit happens during the miss→extend cycle (that would
-                    // fail per row and spam warnings); we upload + emit once,
-                    // below, against the completed atlas.
-                    const cur_atlas = lease.get();
+                    // Decoupled present: reap a completed async atlas upload and
+                    // advance the resident generation to it. The render below
+                    // draws from whatever is resident, never gated by upload.
+                    var atlas_uploaded = false;
+                    if (explicit_sync != null and upload_in_flight and ctx.fenceReady(upload_fence)) {
+                        if (device_atlas.?.commitUpload(&upload_pending.?)) |new_binding| {
+                            if (atlas_binding) |b| device_atlas.?.releaseBinding(b);
+                            atlas_binding = new_binding;
+                            if (resident_lease) |*l| l.release();
+                            resident_lease = upload_lease;
+                            atlas_uploaded = true;
+                        } else |e| {
+                            log.err(.gpu, "atlas commit failed", .{ .err = e });
+                            if (upload_lease) |*l| l.release();
+                        }
+                        upload_lease = null;
+                        device_atlas.?.freeStaging(&upload_pending.?);
+                        upload_pending = null;
+                        upload_in_flight = false;
+                    }
+
+                    // Pick the atlas to render against: the resident generation
+                    // (async path; bootstrapped synchronously on the first frame)
+                    // or the latest snapshot (sync path, uploaded inline below).
+                    var owns_render_lease = false;
+                    var render_lease: atlas_ref_mod.AtlasRef.Lease = undefined;
+                    if (explicit_sync != null) {
+                        if (resident_lease == null) {
+                            var boot = atlas_ref.acquire();
+                            if (device_atlas.?.upload(boot.get())) |b| {
+                                if (atlas_binding) |old| device_atlas.?.releaseBinding(old);
+                                atlas_binding = b;
+                                resident_lease = boot;
+                                atlas_uploaded = true;
+                            } else |e| {
+                                log.err(.gpu, "atlas bootstrap upload failed", .{ .err = e });
+                                boot.release();
+                            }
+                        }
+                        if (resident_lease == null) {
+                            writeResponse(self.response_fds[1], self.io, fail);
+                            continue;
+                        }
+                        render_lease = resident_lease.?;
+                    } else {
+                        render_lease = atlas_ref.acquire();
+                        owns_render_lease = true;
+                    }
+                    defer if (owns_render_lease) render_lease.release();
+                    const cur_atlas = render_lease.get();
 
                     log.setFrame(.gpu, request.serial);
                     var render_ok = true;
@@ -685,23 +758,22 @@ pub const GpuWorker = struct {
                     };
                     const build_ns = phase_t.elapsedNs();
                     phaseBuildNs += build_ns;
-                    // Hand any newly-seen glyphs to the async prep thread and
-                    // move on — the frame does NOT block on prep. Glyphs not yet
-                    // prepped are skipped per-glyph by emit and appear on a later
-                    // sampled frame once prep publishes an extended atlas. `faces`
-                    // is re-read at the top of the next frame, so an auto-fallback
+                    // Hand newly-seen glyphs to the async prep thread and move on
+                    // — the frame never blocks on prep. Glyphs not yet resident
+                    // are skipped per-glyph by emit and appear on a later frame
+                    // once prep publishes and the async upload makes them
+                    // resident. `faces` is re-read next frame so an auto-fallback
                     // face added during prep takes effect a frame later.
                     phase_t = perf.Timer.now();
                     if (render_ok and had_misses) atlas_ref.requestPrep(pipeline.?.misses.text());
                     phasePrepNs += phase_t.elapsedNs();
 
-                    // Upload the atlas we actually leased (cached by that
-                    // snapshot's generation, not the global counter — the prep
-                    // thread may have published newer snapshots since we leased).
+                    // Sync path only: upload the leased generation inline. The
+                    // async path advanced residency above (reap) and kicks the
+                    // next upload after the render, off the critical path.
                     phase_t = perf.Timer.now();
-                    var atlas_uploaded = false;
-                    if (render_ok) {
-                        const cur_gen = lease.generation();
+                    if (render_ok and explicit_sync == null) {
+                        const cur_gen = render_lease.generation();
                         if (atlas_binding == null or cur_gen != cached_atlas_gen) {
                             if (atlas_binding) |b| device_atlas.?.releaseBinding(b);
                             atlas_binding = device_atlas.?.upload(cur_atlas) catch |e| blk: {
@@ -804,6 +876,42 @@ pub const GpuWorker = struct {
                         .serial = request.serial,
                         .acquire_point = acquire_point,
                     });
+
+                    // Kick the next residency-advancing upload (async path): if a
+                    // newer generation exists and none is in flight, record +
+                    // submit it on its own fence. Submitted AFTER the present so
+                    // present is never gated by it; delta copies target disjoint
+                    // new pages and same-queue order keeps it safe against the
+                    // in-flight render. Reaped at the top of a later frame.
+                    if (explicit_sync != null and !upload_in_flight and resident_lease != null) {
+                        var latest = atlas_ref.acquire();
+                        var adopted = false;
+                        defer if (!adopted) latest.release();
+                        if (latest.generation() > resident_lease.?.generation()) kick: {
+                            ctx.beginOneTime(upload_cmd) catch break :kick;
+                            var p = device_atlas.?.recordUpload(latest.get(), upload_cmd) catch |e| {
+                                log.err(.gpu, "atlas record upload failed", .{ .err = e });
+                                ctx.endCmd(upload_cmd) catch {};
+                                break :kick;
+                            };
+                            ctx.endCmd(upload_cmd) catch {
+                                device_atlas.?.abortUpload(&p);
+                                device_atlas.?.freeStaging(&p);
+                                break :kick;
+                            };
+                            ctx.resetFence(upload_fence);
+                            ctx.submitFenced(upload_cmd, upload_fence) catch |e| {
+                                log.err(.gpu, "atlas upload submit failed", .{ .err = e });
+                                device_atlas.?.abortUpload(&p);
+                                device_atlas.?.freeStaging(&p);
+                                break :kick;
+                            };
+                            upload_pending = p;
+                            upload_lease = latest;
+                            upload_in_flight = true;
+                            adopted = true;
+                        }
+                    }
 
                     // Per-frame phase split (mirrors the CPU worker's "frame
                     // complete"). `render` is CPU wall time around the

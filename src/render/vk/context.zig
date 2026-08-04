@@ -406,6 +406,44 @@ pub const Context = struct {
         _ = vk.vkWaitForFences(self.device, @intCast(fences.len), fences.ptr, vk.VK_TRUE, timeout_ns);
     }
 
+    /// Begin `cmd` for a single one-time submission (implicitly resets it — the
+    /// command pool is created with RESET_COMMAND_BUFFER_BIT).
+    pub fn beginOneTime(self: *const Context, cmd: vk.VkCommandBuffer) !void {
+        _ = self;
+        const info = vk.VkCommandBufferBeginInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        if (vk.vkBeginCommandBuffer(cmd, &info) != vk.VK_SUCCESS) return error.BeginCommandFailed;
+    }
+
+    pub fn endCmd(self: *const Context, cmd: vk.VkCommandBuffer) !void {
+        _ = self;
+        if (vk.vkEndCommandBuffer(cmd) != vk.VK_SUCCESS) return error.EndCommandFailed;
+    }
+
+    /// True if `fence` has been signalled (non-blocking poll). Used to reap a
+    /// completed async atlas upload without stalling the worker.
+    pub fn fenceReady(self: *const Context, fence: vk.VkFence) bool {
+        return vk.vkGetFenceStatus(self.device, fence) == vk.VK_SUCCESS;
+    }
+
+    /// Submit a command buffer signalling only `fence` (no semaphore), WITHOUT
+    /// waiting — for async atlas uploads. No compositor waits on these; the
+    /// fence tells us when the copies landed so we can commit residency.
+    pub fn submitFenced(self: *const Context, cmd: vk.VkCommandBuffer, fence: vk.VkFence) !void {
+        const submit_info = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+        };
+        const sr = vk.vkQueueSubmit(self.queue, 1, &submit_info, fence);
+        if (sr != vk.VK_SUCCESS) {
+            log.err(.gpu, "vkQueueSubmit(upload)", .{ .result = sr });
+            return error.SubmitFailed;
+        }
+    }
+
     /// Submit a command buffer that signals `signal_sem` (compositor-side, via a
     /// DRM syncobj) and `fence` (our-side completion) on completion, WITHOUT
     /// waiting. The explicit-sync present path: the compositor waits on the
