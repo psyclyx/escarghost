@@ -264,18 +264,26 @@ pub const Diagnostics = struct {
                 .prep_full = atlas_ref_mod.prepFullCount,
                 .prep_err = atlas_ref_mod.prepErrCount,
             });
-            // Per-frame worker phase split (avg ms/frame). render = the
-            // submitAndWait draw; upload = atlas transfer (also submitAndWait).
+            // Per-frame worker phase split (avg ms/frame). Atlas upload is
+            // decoupled (async, off the frame), so per-frame `upload_ms` is ~0;
+            // the async uploads are summarized on the next line.
             if (gpu_worker.phaseFrameCount > 0) {
                 const fc: f64 = @floatFromInt(gpu_worker.phaseFrameCount);
                 log.info(.diag, "gpu frame phases", .{
                     .frames = gpu_worker.phaseFrameCount,
                     .build_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseBuildNs)) / ms_f / fc}),
                     .prep_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phasePrepNs)) / ms_f / fc}),
-                    .upload_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseUploadNs)) / ms_f / fc}),
                     .emit_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseEmitNs)) / ms_f / fc}),
                     .render_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseRenderNs)) / ms_f / fc}),
                     .gpu_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_worker.phaseGpuNs)) / ms_f / fc}),
+                });
+                // Decoupled present: async atlas uploads that advanced residency,
+                // and frames held by the freshest-complete policy (R3).
+                const uc = gpu_worker.asyncUploadCount;
+                log.info(.diag, "gpu decoupled present", .{
+                    .async_uploads = uc,
+                    .avg_resident_ms = log.fmt("{d:.1}", .{if (uc > 0) @as(f64, @floatFromInt(gpu_worker.asyncUploadResidentNs)) / ms_f / @as(f64, @floatFromInt(uc)) else 0}),
+                    .held_frames = gpu_worker.heldFrameCount,
                 });
             }
             // Where row building (the "build" phase, both workers) spends its

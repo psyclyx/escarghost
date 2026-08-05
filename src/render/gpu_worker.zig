@@ -57,7 +57,12 @@ pub var captureCellsAccumNs: u64 = 0;
 // can see what the async-pipelining rework must actually attack.
 pub var phaseBuildNs: u64 = 0;
 pub var phasePrepNs: u64 = 0;
-pub var phaseUploadNs: u64 = 0;
+/// Decoupled async atlas uploads: how many advanced residency, and their total
+/// queued→resident wall time (see the "atlas resident" log). Reported at exit.
+pub var asyncUploadCount: u64 = 0;
+pub var asyncUploadResidentNs: u64 = 0;
+/// Frames HELD by the freshest-complete policy (R3) instead of presented.
+pub var heldFrameCount: u64 = 0;
 pub var phaseEmitNs: u64 = 0;
 pub var phaseRenderNs: u64 = 0;
 /// GPU-side execution time (timestamp queries) — the on-GPU portion of
@@ -477,6 +482,7 @@ pub const GpuWorker = struct {
         var upload_lease: ?atlas_ref_mod.AtlasRef.Lease = null;
         defer if (upload_lease) |*l| l.release();
         var upload_in_flight = false;
+        var upload_kick_ns: u64 = 0; // when the in-flight upload was queued
 
         var worker_wait_accum_ns: u64 = 0;
         var worker_wait_count: u64 = 0;
@@ -744,6 +750,13 @@ pub const GpuWorker = struct {
                             if (resident_lease) |*l| l.release();
                             resident_lease = upload_lease;
                             atlas_uploaded = true;
+                            const resident_ns = monotonicNs() -% upload_kick_ns;
+                            asyncUploadCount += 1;
+                            asyncUploadResidentNs += resident_ns;
+                            log.info(.gpu, "atlas resident", .{
+                                .gen = resident_lease.?.generation(),
+                                .resident_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(resident_ns)) / std.time.ns_per_ms}),
+                            });
                         } else |e| {
                             log.err(.gpu, "atlas commit failed", .{ .err = e });
                             if (upload_lease) |*l| l.release();
@@ -828,7 +841,12 @@ pub const GpuWorker = struct {
                             upload_pending = p;
                             upload_lease = latest;
                             upload_in_flight = true;
+                            upload_kick_ns = monotonicNs();
                             adopted = true;
+                            log.debug(.gpu, "atlas upload queued", .{
+                                .from_gen = resident_lease.?.generation(),
+                                .to_gen = latest.generation(),
+                            });
                         }
                     }
 
@@ -848,6 +866,11 @@ pub const GpuWorker = struct {
                         const now = monotonicNs();
                         if (incomplete_since_ns == 0) incomplete_since_ns = now;
                         if ((now -% incomplete_since_ns) < hold_deadline_ns) {
+                            heldFrameCount += 1;
+                            log.debug(.gpu, "frame held", .{
+                                .stale_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(now -% incomplete_since_ns)) / std.time.ns_per_ms}),
+                                .residency_behind = residency_behind,
+                            });
                             writeResponse(self.response_fds[1], self.io, .{
                                 .tag = .frame,
                                 .buffer_index = buffer_index,
@@ -862,10 +885,8 @@ pub const GpuWorker = struct {
                         // Deadline exceeded — present with gaps (fall through).
                     }
 
-                    // Upload is off the render critical path now (async, above),
-                    // so the render frame's own upload time is zero.
-                    const upload_ns: u64 = 0;
-                    phaseUploadNs += upload_ns;
+                    // Atlas upload is decoupled (async, above), so it's no longer
+                    // a phase of the frame.
                     phase_t = perf.Timer.now();
                     if (render_ok) {
                         pipeline.?.emitBuilt(cur_atlas, atlas_binding.?, &self.snapshots[snapshot_slot]) catch |e| {
@@ -942,19 +963,19 @@ pub const GpuWorker = struct {
                     });
 
                     // Per-frame phase split (mirrors the CPU worker's "frame
-                    // complete"). `render` is CPU wall time around the
-                    // synchronous Vulkan submit; `gpu` is the actual on-GPU
-                    // execution from timestamp queries (0 = unsupported);
-                    // `upload` is ~0 unless the atlas generation changed.
+                    // complete"). `render` is CPU wall time around the Vulkan
+                    // submit; `gpu` is the actual on-GPU execution from timestamp
+                    // queries (0 = unsupported). Atlas upload is decoupled, so
+                    // it's not a frame phase; `atlas_uploaded` marks a frame that
+                    // reaped an async upload (residency advanced) this cycle.
                     const ms = std.time.ns_per_ms;
                     log.debug(.gpu, "frame complete", .{
                         .buffer = buffer_index,
                         .build_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(build_ns)) / ms}),
-                        .upload_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(upload_ns)) / ms}),
                         .emit_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(emit_ns)) / ms}),
                         .render_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(render_ns)) / ms}),
                         .gpu_ms = log.fmt("{d:.2}", .{@as(f64, @floatFromInt(gpu_ns)) / ms}),
-                        .total_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(build_ns + upload_ns + emit_ns + render_ns)) / ms}),
+                        .total_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(build_ns + emit_ns + render_ns)) / ms}),
                         .atlas_uploaded = atlas_uploaded,
                         .misses = had_misses,
                     });
