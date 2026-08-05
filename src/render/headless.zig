@@ -13,6 +13,7 @@ const snail = @import("snail");
 const vk = @import("vk/root.zig");
 const vkb = @import("vk/vulkan.zig").vk;
 const gpu_pipeline = @import("gpu_pipeline.zig");
+const cpu_pipeline = @import("cpu_pipeline.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const atlas_worker = @import("atlas_worker.zig");
 const terminal_mod = @import("../terminal.zig");
@@ -119,6 +120,91 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
 
     try readbackPpm(allocator, io, &ctx, &target, opts.out_path);
     log.info(.main, "headless screenshot written", .{ .path = opts.out_path });
+}
+
+/// Headless CPU (software-raster) screenshot — the CPU analog of `screenshot`,
+/// with no Vulkan. Used to verify the CPU path (and diff the glyph coverage
+/// cache against the analytic raster: same text, `SCRGO_CPU_GLYPH_CACHE=0/1`,
+/// compare the PPMs).
+pub fn screenshotCpu(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_mod.Config, opts: Options) !void {
+    var atlas_thread: atlas_worker.AtlasWorker = .{};
+    try atlas_thread.startWithBootstrap(io, .{
+        .allocator = allocator,
+        .font_path_cfg = cfg.font_path,
+        .fallback_fonts = cfg.fallback_fonts,
+        .font_size = cfg.font_size,
+    });
+    for (0..2) |_| {
+        const resp = (try atlas_thread.readResponse()) orelse return error.BootstrapFailed;
+        if (resp.tag == .failed) return atlas_thread.bootstrap_err orelse error.BootstrapFailed;
+    }
+    const atlas_ref = atlas_thread.atlas_ref;
+    atlas_ref.custom_glyphs = cfg.custom_glyphs;
+    defer atlas_ref.stopPrep();
+    const faces = atlas_thread.faces.?;
+
+    const m = try gpu_pipeline.computeCellMetrics(faces, cfg.font_size);
+    const grid = gpu_pipeline.computeGridSize(m.cell_width, m.cell_height, opts.width, opts.height);
+    var term: terminal_mod.Terminal = undefined;
+    try term.init(io, grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
+    defer term.deinit();
+    term.feedData(opts.text);
+
+    const pl = try allocator.create(cpu_pipeline.CpuPipeline);
+    defer allocator.destroy(pl);
+    try pl.init(allocator, atlas_ref);
+    defer pl.deinit();
+    pl.configure(opts.width, opts.height, m.em, m.cell_width, m.cell_height, m.baseline_offset, m.descent);
+    const snap = try allocator.create(render_snapshot.SharedSnapshot);
+    defer allocator.destroy(snap);
+
+    const stride = opts.width * 4;
+    const pixels = try allocator.alloc(u8, stride * opts.height);
+    defer allocator.free(pixels);
+
+    var frame: u32 = 0;
+    var complete = false;
+    while (frame < opts.max_frames) : (frame += 1) {
+        var lease = atlas_ref.acquire();
+        const atlas = lease.get();
+        try render_snapshot.capture(snap, &term, atlas, null, null, null);
+        pl.renderToMemory(pixels.ptr, opts.width, opts.height, stride, snap, atlas) catch |e| {
+            lease.release();
+            return e;
+        };
+        const had_misses = !pl.misses.isEmpty();
+        lease.release();
+        if (!had_misses) {
+            complete = true;
+            break;
+        }
+        var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 30_000_000 };
+        _ = c.nanosleep(&ts, null);
+    }
+    log.info(.main, "headless cpu rendered", .{ .frames = frame + 1, .complete = complete });
+
+    // Write PPM (P6). The SHM buffer is R,G,B,A in memory order → take RGB.
+    var file = try std.Io.Dir.cwd().createFile(io, opts.out_path, .{});
+    defer file.close(io);
+    var hdr: [64]u8 = undefined;
+    const head = std.fmt.bufPrint(&hdr, "P6\n{d} {d}\n255\n", .{ opts.width, opts.height }) catch unreachable;
+    try file.writeStreamingAll(io, head);
+    const rgb = try allocator.alloc(u8, @as(usize, opts.width) * opts.height * 3);
+    defer allocator.free(rgb);
+    var i: usize = 0;
+    var y: u32 = 0;
+    while (y < opts.height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < opts.width) : (x += 1) {
+            const o = @as(usize, y) * stride + @as(usize, x) * 4;
+            rgb[i] = pixels[o];
+            rgb[i + 1] = pixels[o + 1];
+            rgb[i + 2] = pixels[o + 2];
+            i += 3;
+        }
+    }
+    try file.writeStreamingAll(io, rgb);
+    log.info(.main, "headless cpu screenshot written", .{ .path = opts.out_path });
 }
 
 /// Copy the (complete, GENERAL-layout) dmabuf image back to host memory and

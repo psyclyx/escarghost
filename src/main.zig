@@ -152,7 +152,14 @@ pub fn main(init: std.process.Init) !void {
                 "日本語 中文 한국어  ﾊﾛｰ  αβγ Привет  😀🎉🌙\n";
         const w: u32 = if (getenv("SCRGO_SCREENSHOT_W")) |s| std.fmt.parseInt(u32, s, 10) catch 1000 else 1000;
         const h: u32 = if (getenv("SCRGO_SCREENSHOT_H")) |s| std.fmt.parseInt(u32, s, 10) catch 600 else 600;
-        headless.screenshot(allocator, io, &cfg, .{ .text = text, .out_path = shot_path, .width = w, .height = h }) catch |err| {
+        // SCRGO_RENDERER=cpu takes the software-raster path (also lets us diff
+        // the glyph coverage cache against the analytic raster).
+        const shot_opts: headless.Options = .{ .text = text, .out_path = shot_path, .width = w, .height = h };
+        const cpu_shot = if (getenv("SCRGO_RENDERER")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "cpu") else false;
+        (if (cpu_shot)
+            headless.screenshotCpu(allocator, io, &cfg, shot_opts)
+        else
+            headless.screenshot(allocator, io, &cfg, shot_opts)) catch |err| {
             log.err(.main, "headless screenshot failed", .{ .err = err });
             return err;
         };

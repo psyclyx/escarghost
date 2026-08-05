@@ -6,6 +6,7 @@ const std = @import("std");
 const snail = @import("snail");
 const raster = @import("snail-raster");
 const atlas_ref_mod = @import("atlas_ref.zig");
+const glyph_cache = @import("glyph_cache.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const render_snapshot = @import("render_snapshot.zig");
 const render_env = @import("render_env.zig");
@@ -171,6 +172,26 @@ pub const CpuPipeline = struct {
     /// `snapshot_id` the `cache_binding` was built from; 0 = none uploaded.
     cache_snapshot_id: u64 = 0,
 
+    // ── Glyph coverage cache (glyph_cache.zig) ──
+    // Memoizes each glyph's rasterized coverage so steady frames blit tiles
+    // instead of re-evaluating cubic-lowered quads per pixel.
+    coverage: glyph_cache.Cache,
+    cache_enabled: bool = true,
+    /// Scratch surface for rasterizing one glyph into a coverage tile, sized in
+    /// `configure` to ~3× the cell (room for bearings / ascenders / descenders).
+    tile_buf: []u8 = &.{},
+    tile_cov: []u8 = &.{},
+    tile_renderer: ?raster.Renderer = null,
+    tile_w: u32 = 0,
+    tile_h: u32 = 0,
+    tile_pen_x: f32 = 0,
+    tile_pen_y: f32 = 0,
+    tile_instances: [64]Instance = undefined,
+    tile_batches: [16]DrawBatch = undefined,
+    /// Colour / oversized glyphs deferred to one analytic-raster pass per frame
+    /// (the coverage cache handles only monochrome glyphs).
+    fallback_shapes: [render_snapshot.MaxCols * 4]snail.Shape = undefined,
+
     /// Initialize in place. `self` must point at allocated (uninitialized)
     /// storage — CpuPipeline embeds several-MB scratch arrays, so returning
     /// it by value would blow the caller's stack.
@@ -181,8 +202,16 @@ pub const CpuPipeline = struct {
             .atlas_ref = atlas_ref,
             .eph = row_build.EphemeralBlobs.init(allocator),
             .device_atlas = device_atlas,
+            // 64 MiB cap: a screenful of distinct glyphs is far less; the cap is
+            // a backstop against pathological churn, resetting the whole cache.
+            .coverage = glyph_cache.Cache.init(allocator, 64 << 20),
         };
         self.misses.lifo = std.c.getenv("SCRGO_MISS_LIFO") != null;
+        // On by default; SCRGO_CPU_GLYPH_CACHE=0 forces the analytic path.
+        self.cache_enabled = if (std.c.getenv("SCRGO_CPU_GLYPH_CACHE")) |v|
+            !std.mem.eql(u8, std.mem.sliceTo(v, 0), "0")
+        else
+            true;
         // Fan the full-screen software raster across a couple of cores. The
         // software path is only the pre-GPU fallback, and it competes with the
         // prep workers during a flood, so a small pool wins; override with
@@ -210,6 +239,9 @@ pub const CpuPipeline = struct {
         self.eph.deinit();
         self.instances.deinit(self.allocator);
         self.batches.deinit(self.allocator);
+        self.coverage.deinit();
+        if (self.tile_buf.len > 0) self.allocator.free(self.tile_buf);
+        if (self.tile_cov.len > 0) self.allocator.free(self.tile_cov);
     }
 
     pub fn configure(
@@ -229,6 +261,29 @@ pub const CpuPipeline = struct {
         self.cell_height = cell_height;
         self.baseline_offset = baseline_offset;
         self.descent = descent;
+
+        // (Re)size the coverage-tile scratch to this cell. Generous margins hold
+        // bearings, ascenders and descenders; a glyph whose ink still exceeds it
+        // falls back to the analytic raster. On alloc failure the scratch stays
+        // empty and the whole path falls back — never fatal.
+        // Wide enough for a double-width (2-cell) CJK glyph plus bearings, but
+        // only ~2× tall (glyphs span one cell vertically, plus ascender /
+        // descender margin). A glyph whose ink still exceeds it (border touch)
+        // falls back to the analytic raster.
+        const tw: u32 = @intFromFloat(@ceil(cell_width * 3));
+        const th: u32 = @intFromFloat(@ceil(cell_height * 2));
+        if (tw != self.tile_w or th != self.tile_h or self.tile_buf.len == 0) {
+            if (self.tile_buf.len > 0) self.allocator.free(self.tile_buf);
+            if (self.tile_cov.len > 0) self.allocator.free(self.tile_cov);
+            self.tile_renderer = null;
+            self.coverage.reset();
+            self.tile_buf = self.allocator.alloc(u8, tw * th * 4) catch &.{};
+            self.tile_cov = self.allocator.alloc(u8, tw * th) catch &.{};
+            self.tile_w = tw;
+            self.tile_h = th;
+        }
+        self.tile_pen_x = @round(cell_width);
+        self.tile_pen_y = @round(cell_height * 1.4);
     }
 
     /// Render the snapshot to the SHM buffer pixels (ABGR8888 memory order).
@@ -336,7 +391,7 @@ pub const CpuPipeline = struct {
         }
 
         // ── 5. Text ──
-        try self.drawText(surface, cur_atlas, built.rows);
+        try self.drawText(surface, buf, width, height, stride, cur_atlas, built.rows);
 
         // ── 6. Cursor ──
         if (built.cursor) |cursor| self.drawCursor(r, surface, cursor);
@@ -375,26 +430,11 @@ pub const CpuPipeline = struct {
         self.cache_snapshot_id = snap_id;
     }
 
-    /// Emit every row's placed glyph shapes and rasterize them over the buffer.
-    fn drawText(
-        self: *CpuPipeline,
-        surface: raster.TargetSurface,
-        atlas: *const snail.Atlas,
-        rows: []const row_build.RowDraw,
-    ) !void {
-        var total_shapes: usize = 0;
-        for (rows) |row| total_shapes += row.shapes.len;
-        if (total_shapes == 0) return;
-
-        // Refresh the software atlas cache. A binding's prepared pages are
-        // cache-owned copies, so it stays valid across frames:
-        //  - snapshot unchanged  → reuse the binding, upload nothing.
-        //  - snapshot advanced   → `uploadDelta` uploads only the new pages
-        //    (a flood extends the atlas with append-only children, which reuse
-        //    the resident pages) instead of re-flattening the whole, possibly
-        //    100+MB, atlas — the dominant CPU-path cost under a flood.
-        //  - first use / incompatible snapshot (post eviction/compaction) →
-        //    full `upload`.
+    /// Keep the software device-atlas binding current for `atlas`: reuse it when
+    /// the snapshot is unchanged, `uploadDelta` only the new pages when it
+    /// advanced (a flood appends children), or flatten the whole atlas on first
+    /// use / an incompatible snapshot.
+    fn ensureBinding(self: *CpuPipeline, atlas: *const snail.Atlas) !Binding {
         const snap_id = atlas.snapshotIdentity().snapshot_id;
         if (self.cache_binding) |prev| {
             if (self.cache_snapshot_id != snap_id) {
@@ -410,38 +450,31 @@ pub const CpuPipeline = struct {
         } else {
             try self.fullAtlasUpload(atlas, snap_id);
         }
-        const binding = self.cache_binding.?;
+        return self.cache_binding.?;
+    }
 
-        // Generous upper bound: emit may expand a shape into several
-        // per-layer instances (COLR / hinted).
-        const cap = total_shapes * 8 + 64;
+    const Emitted = struct { instances: usize = 0, batches: usize = 0 };
+
+    /// Emit `rows`' glyph shapes (each translated by its `row_y`) into the
+    /// instance/batch buffers. emit is all-or-nothing per call, so a row with a
+    /// not-yet-prepped glyph is re-emitted filtered to the prepped subset (the
+    /// rest fill in on a later frame). Returns the staged lengths.
+    fn emitRows(self: *CpuPipeline, atlas: *const snail.Atlas, binding: Binding, rows: []const row_build.RowDraw) !Emitted {
+        var total: usize = 0;
+        for (rows) |row| total += row.shapes.len;
+        const cap = total * 8 + 64; // COLR / hinted shapes expand to several instances
         try self.instances.resize(self.allocator, cap);
         try self.batches.resize(self.allocator, cap);
 
-        // emit is all-or-nothing per call: one glyph not yet prepped in the
-        // atlas fails the whole row. Rather than drop the row (and log per
-        // row — which flooded the log under a flood), re-emit only the prepped
-        // shapes so the row still renders; the rest fill in on a later sampled
-        // frame. Summarize the partials once per frame. Mirrors GpuPipeline.
-        var instance_len: usize = 0;
-        var batch_len: usize = 0;
+        var e: Emitted = .{};
         var partial_rows: u32 = 0;
         for (rows) |row| {
             if (row.shapes.len == 0) continue;
             const xform = snail.Transform2D.translate(0, row.row_y);
-            _ = snail.emit.emit(
-                self.instances.items,
-                self.batches.items,
-                &instance_len,
-                &batch_len,
-                binding,
-                atlas,
-                row.shapes,
-                xform,
-                white_tint,
-            ) catch {
-                // Failed call stages into the buffer tails but only commits on
-                // full success, so il/bl are untouched — re-emit the subset.
+            _ = snail.emit.emit(self.instances.items, self.batches.items, &e.instances, &e.batches, binding, atlas, row.shapes, xform, white_tint) catch {
+                // The failed call staged into the buffer tails but committed
+                // nothing, so the cursors are untouched — re-emit the prepped
+                // subset. The rest render as gaps until prep publishes.
                 partial_rows += 1;
                 var n: usize = 0;
                 for (row.shapes) |s| {
@@ -450,45 +483,182 @@ pub const CpuPipeline = struct {
                         n += 1;
                     }
                 }
-                if (n > 0) {
-                    _ = snail.emit.emit(
-                        self.instances.items,
-                        self.batches.items,
-                        &instance_len,
-                        &batch_len,
-                        binding,
-                        atlas,
-                        self.filtered_shapes[0..n],
-                        xform,
-                        white_tint,
-                    ) catch {};
-                }
+                if (n > 0) _ = snail.emit.emit(self.instances.items, self.batches.items, &e.instances, &e.batches, binding, atlas, self.filtered_shapes[0..n], xform, white_tint) catch {};
             };
         }
-        if (partial_rows > 0) {
-            log.warn(.cpu, "rows partially drawn (glyphs not yet prepped)", .{
-                .rows = partial_rows,
-                .total_rows = rows.len,
-            });
-        }
-        if (instance_len == 0) return;
+        if (partial_rows > 0) log.warn(.cpu, "rows partially drawn (glyphs not yet prepped)", .{ .rows = partial_rows, .total_rows = rows.len });
+        return e;
+    }
 
+    /// Rasterize the currently-staged instances over the main surface.
+    fn rasterInstances(self: *CpuPipeline, surface: raster.TargetSurface, e: Emitted) void {
+        if (e.instances == 0) return;
         const wf: f32 = @floatFromInt(surface.pixel_width);
         const hf: f32 = @floatFromInt(surface.pixel_height);
-        const draw_state: raster.DrawState = .{
-            .surface = surface,
-            .raster = .{},
-            .mvp = snail.Mat4.ortho(0, wf, hf, 0, -1, 1),
-        };
-
+        const draw_state: raster.DrawState = .{ .surface = surface, .raster = .{}, .mvp = snail.Mat4.ortho(0, wf, hf, 0, -1, 1) };
         raster.draw(
             &self.renderer.?,
             draw_state,
-            .{ .instances = self.instances.items[0..instance_len], .batches = self.batches.items[0..batch_len] },
+            .{ .instances = self.instances.items[0..e.instances], .batches = self.batches.items[0..e.batches] },
             &[_]*const raster.DeviceAtlas{&self.device_atlas},
             if (self.pool_ready) &self.thread_pool else null,
-        ) catch |err| {
-            log.warn(.cpu, "raster draw failed", .{ .err = err });
+        ) catch |err| log.warn(.cpu, "raster draw failed", .{ .err = err });
+    }
+
+    /// Draw all text. With the coverage cache on, blit each monochrome glyph
+    /// from its cached tile and defer colour / oversized glyphs to a single
+    /// analytic pass; with it off, everything goes through the analytic path.
+    fn drawText(
+        self: *CpuPipeline,
+        surface: raster.TargetSurface,
+        buf: []u8,
+        width: u32,
+        height: u32,
+        stride: u32,
+        atlas: *const snail.Atlas,
+        rows: []const row_build.RowDraw,
+    ) !void {
+        var total: usize = 0;
+        for (rows) |row| total += row.shapes.len;
+        if (total == 0) return;
+        const binding = try self.ensureBinding(atlas);
+
+        if (!self.cache_enabled or self.tile_buf.len == 0) {
+            self.rasterInstances(surface, try self.emitRows(atlas, binding, rows));
+            return;
+        }
+
+        // Un-prepped glyphs are skipped (they render as gaps until prep
+        // publishes, exactly like the analytic path's filtered re-emit).
+        var fb_len: usize = 0;
+        var n_blit: u32 = 0;
+        var n_miss: u32 = 0;
+        for (rows) |row| {
+            for (row.shapes) |shape| {
+                if (!atlas.contains(shape.key)) continue;
+                const qx = glyph_cache.quantize(shape.local_transform.tx);
+                const qy = glyph_cache.quantize(shape.local_transform.ty + row.row_y);
+                const key: glyph_cache.Key = .{
+                    .record = .{ shape.key.namespace, shape.key.a, shape.key.b, shape.key.c },
+                    .sub_x = qx.sub,
+                    .sub_y = qy.sub,
+                };
+                const tile = self.coverage.get(key) orelse blk: {
+                    n_miss += 1;
+                    const t = self.rasterCoverageTile(atlas, binding, shape, key);
+                    self.coverage.put(key, t);
+                    break :blk t;
+                };
+                if (tile.fallback) {
+                    if (fb_len < self.fallback_shapes.len) {
+                        var s = shape;
+                        s.local_transform.ty += row.row_y; // bake row_y → one identity-xform emit
+                        self.fallback_shapes[fb_len] = s;
+                        fb_len += 1;
+                    }
+                    continue;
+                }
+                glyph_cache.blit(buf, width, height, stride, tile, qx.int, qy.int, shape.local_color);
+                n_blit += 1;
+            }
+        }
+        if (fb_len > 0) {
+            const one_row = [_]row_build.RowDraw{.{ .shapes = self.fallback_shapes[0..fb_len], .rects = &.{}, .box_rects = &.{}, .row_y = 0 }};
+            self.rasterInstances(surface, try self.emitRows(atlas, binding, &one_row));
+        }
+        log.debug(.cpu, "glyph cache", .{ .blit = n_blit, .miss = n_miss, .fallback = fb_len });
+    }
+
+    /// Rasterize one glyph white into the tile scratch (linear encoding), then
+    /// extract its coverage. Returns `fallback` for colour glyphs (COLR ignores
+    /// the white tint → non-grayscale output) or ink larger than the scratch.
+    /// The glyph is drawn at the key's sub-pixel bucket so the tile matches the
+    /// on-screen sub-pixel position (cell origins are integer-snapped, so this
+    /// is bucket 0 for the common case and bit-exact with the analytic raster).
+    fn rasterCoverageTile(self: *CpuPipeline, atlas: *const snail.Atlas, binding: Binding, shape: snail.Shape, key: glyph_cache.Key) glyph_cache.Tile {
+        const tw = self.tile_w;
+        const th = self.tile_h;
+        const sub = @as(f32, @floatFromInt(glyph_cache.SUBPIXEL));
+        const px = self.tile_pen_x + @as(f32, @floatFromInt(key.sub_x)) / sub;
+        const py = self.tile_pen_y + @as(f32, @floatFromInt(key.sub_y)) / sub;
+        const st = tw * 4;
+        @memset(self.tile_buf, 0);
+        if (self.tile_renderer) |*tr| {
+            tr.reinitBuffer(self.tile_buf, tw, th, st, .rgba8_unorm) catch return .{ .fallback = true };
+        } else {
+            self.tile_renderer = raster.Renderer.init(self.tile_buf, tw, th, st, .rgba8_unorm) catch return .{ .fallback = true };
+        }
+
+        var one = shape;
+        one.local_color = white_tint; // coverage, not colour
+        const xform = snail.Transform2D.translate(px - shape.local_transform.tx, py - shape.local_transform.ty);
+        var il: usize = 0;
+        var bl: usize = 0;
+        _ = snail.emit.emit(self.tile_instances[0..], self.tile_batches[0..], &il, &bl, binding, atlas, &[_]snail.Shape{one}, xform, white_tint) catch return .{ .fallback = true };
+        if (il == 0) return .{}; // no ink (e.g. a space): a cached no-op
+
+        const twf: f32 = @floatFromInt(tw);
+        const thf: f32 = @floatFromInt(th);
+        const ds: raster.DrawState = .{
+            .surface = .{ .pixel_width = tw, .pixel_height = th, .encoding = .linear, .format = .rgba8_unorm },
+            .raster = .{},
+            .mvp = snail.Mat4.ortho(0, twf, thf, 0, -1, 1),
+        };
+        raster.draw(&self.tile_renderer.?, ds, .{ .instances = self.tile_instances[0..il], .batches = self.tile_batches[0..bl] }, &[_]*const raster.DeviceAtlas{&self.device_atlas}, null) catch return .{ .fallback = true };
+
+        return self.extractCoverage(px, py);
+    }
+
+    /// Scan the tile scratch (linear white-on-transparent) for the glyph's ink
+    /// bbox, verify it's monochrome, and copy the coverage (R channel = linear
+    /// coverage) into `tile_cov`, positioned relative to the integer pen.
+    fn extractCoverage(self: *CpuPipeline, px: f32, py: f32) glyph_cache.Tile {
+        const tw = self.tile_w;
+        const th = self.tile_h;
+        const st = tw * 4;
+        var minx: u32 = tw;
+        var miny: u32 = th;
+        var maxx: u32 = 0;
+        var maxy: u32 = 0;
+        var is_color = false;
+        var y: u32 = 0;
+        while (y < th) : (y += 1) {
+            var x: u32 = 0;
+            while (x < tw) : (x += 1) {
+                const o = y * st + x * 4;
+                const rr = self.tile_buf[o];
+                const gg = self.tile_buf[o + 1];
+                const bb = self.tile_buf[o + 2];
+                if (rr == 0 and gg == 0 and bb == 0 and self.tile_buf[o + 3] == 0) continue;
+                if (rr != gg or gg != bb) is_color = true;
+                if (x < minx) minx = x;
+                if (x > maxx) maxx = x;
+                if (y < miny) miny = y;
+                if (y > maxy) maxy = y;
+            }
+        }
+        if (maxx < minx) return .{}; // no ink
+        if (is_color) return .{ .fallback = true };
+        // Ink touching a border means the scratch clipped the glyph.
+        if (minx == 0 or miny == 0 or maxx == tw - 1 or maxy == th - 1) return .{ .fallback = true };
+
+        const w: u16 = @intCast(maxx - minx + 1);
+        const h: u16 = @intCast(maxy - miny + 1);
+        var i: usize = 0;
+        var ry: u32 = miny;
+        while (ry <= maxy) : (ry += 1) {
+            var rx: u32 = minx;
+            while (rx <= maxx) : (rx += 1) {
+                self.tile_cov[i] = self.tile_buf[ry * st + rx * 4]; // R = linear coverage
+                i += 1;
+            }
+        }
+        return .{
+            .w = w,
+            .h = h,
+            .left = @intCast(@as(i32, @intCast(minx)) - @as(i32, @intFromFloat(@floor(px)))),
+            .top = @intCast(@as(i32, @intCast(miny)) - @as(i32, @intFromFloat(@floor(py)))),
+            .cov = self.tile_cov[0 .. @as(usize, w) * h],
         };
     }
 
