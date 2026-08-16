@@ -4,6 +4,7 @@ const terminal_mod = @import("../terminal.zig");
 const render_common = @import("render_common.zig");
 const color = @import("color");
 const selection_mod = @import("../selection.zig");
+const palette_mod = @import("../palette.zig");
 const Rgb = color.Rgb;
 
 // Upper bounds on the rendered grid. The terminal grid is clamped to these
@@ -98,6 +99,10 @@ pub const SharedSnapshot = struct {
     scrollbar: ?ScrollbarOverlay = null,
     /// Visual-bell overlay state. Null = no active bell.
     bell: ?BellOverlay = null,
+    /// Command-palette overlay state. Null = palette closed. Holds copied
+    /// query bytes + static command-name slices, so a worker thread may read
+    /// it without touching live `AppState`.
+    palette: ?palette_mod.Overlay = null,
 };
 
 pub var updateRenderStateAccumNs: u64 = 0;
@@ -130,6 +135,7 @@ pub fn prepare(
     selection: ?selection_mod.Snapshot,
     scrollbar: ?ScrollbarOverlay,
     bell: ?BellOverlay,
+    palette: ?palette_mod.Overlay,
 ) !void {
     const t0 = monotonicNs();
     try term.updateRenderState();
@@ -138,6 +144,7 @@ pub fn prepare(
     snapshot.selection = selection;
     snapshot.scrollbar = scrollbar;
     snapshot.bell = bell;
+    snapshot.palette = palette;
 }
 
 /// Walk the terminal's render_state (already populated by `prepare`) into
@@ -243,9 +250,10 @@ pub fn capture(
     selection: ?selection_mod.Snapshot,
     scrollbar: ?ScrollbarOverlay,
     bell: ?BellOverlay,
+    palette: ?palette_mod.Overlay,
 ) !void {
     term.lock();
     defer term.unlock();
-    try prepare(snapshot, term, selection, scrollbar, bell);
+    try prepare(snapshot, term, selection, scrollbar, bell, palette);
     try captureCells(snapshot, term, atlas);
 }

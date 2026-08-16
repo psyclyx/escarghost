@@ -223,6 +223,8 @@ pub const GpuPipeline = struct {
             .cell_height = self.cell_height,
             .font_size = self.font_size,
             .baseline_offset = self.baseline_offset,
+            .viewport_w = self.viewport_w,
+            .viewport_h = self.viewport_h,
         };
 
         // Serialize shaping: the CPU and GPU workers share one HarfBuzz
@@ -391,6 +393,14 @@ pub const GpuPipeline = struct {
             if (bell.alpha > 0) {
                 const fg = default_fg.toLinearFloat4(1.0);
                 self.emitRect(&il, &bl, binding, atlas, 0, 0, @floatFromInt(self.viewport_w), @floatFromInt(self.viewport_h), .{ fg[0], fg[1], fg[2], 0.15 * bell.alpha });
+            }
+        }
+
+        // ── Layer 7: command palette (backdrop + panel + text) ──
+        if (built.palette) |pal| {
+            for (pal.rects) |r| self.emitRect(&il, &bl, binding, atlas, r.x, r.y, r.w, r.h, r.color);
+            if (pal.shapes.len > 0) {
+                _ = snail.emit.emit(self.instances.items, self.batches.items, &il, &bl, binding, atlas, pal.shapes, .identity, white_tint) catch {};
             }
         }
 

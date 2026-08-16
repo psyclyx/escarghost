@@ -205,6 +205,7 @@ pub const Frontend = struct {
         selection: ?@import("../selection.zig").Snapshot,
         scrollbar: ?render_snapshot.ScrollbarOverlay,
         bell: ?render_snapshot.BellOverlay,
+        palette: ?@import("../palette.zig").Overlay,
     ) !void {
         if (!self.active) return error.Inactive;
         if (self.render_in_flight or self.request_pending) return error.Busy;
@@ -213,7 +214,7 @@ pub const Frontend = struct {
 
         var atlas_lease = self.atlas_ref.acquire();
         defer atlas_lease.release();
-        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get(), selection, scrollbar, bell);
+        try render_snapshot.capture(&self.snapshots[snapshot_slot], term, atlas_lease.get(), selection, scrollbar, bell, palette);
         self.snapshot_busy[snapshot_slot] = true;
 
         _ = c.pthread_mutex_lock(&self.mutex);

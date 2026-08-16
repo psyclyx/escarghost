@@ -334,6 +334,8 @@ pub const CpuPipeline = struct {
             .cell_height = self.cell_height,
             .font_size = self.font_size,
             .baseline_offset = self.baseline_offset,
+            .viewport_w = self.viewport_w,
+            .viewport_h = self.viewport_h,
         };
         const faces = self.atlas_ref.faces orelse return error.NoFaces;
         const cur_atlas = atlas;
@@ -417,6 +419,17 @@ pub const CpuPipeline = struct {
             if (bell.alpha > 0) {
                 const fg = default_fg.toLinearFloat4(1.0);
                 fillRect(r, surface, 0, 0, @floatFromInt(width), @floatFromInt(height), .{ fg[0], fg[1], fg[2], 0.15 * bell.alpha });
+            }
+        }
+
+        // ── 9. Command palette (backdrop + panel + text) ──
+        if (built.palette) |pal| {
+            for (pal.rects) |rect| fillRect(r, surface, rect.x, rect.y, rect.w, rect.h, rect.color);
+            if (pal.shapes.len > 0) {
+                // Reuse the text path: wrap the absolutely-positioned shapes as
+                // one synthetic row (row_y = 0).
+                const prows = [_]row_build.RowDraw{.{ .shapes = pal.shapes, .rects = &.{}, .box_rects = &.{}, .row_y = 0 }};
+                try self.drawText(surface, buf, width, height, stride, cur_atlas, &prows);
             }
         }
     }

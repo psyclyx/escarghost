@@ -3,6 +3,7 @@ const app_state = @import("app_state.zig");
 const diagnostics = @import("diagnostics.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
+const palette_mod = @import("palette.zig");
 const log = @import("log.zig");
 
 const SCROLLBAR_HIDE_DELAY_NS: u64 = 1_000 * std.time.ns_per_ms;
@@ -130,6 +131,13 @@ pub fn currentBellOverlay(s: *app_state.AppState) ?render_snapshot.BellOverlay {
     return .{ .alpha = alpha };
 }
 
+/// Sample the command-palette overlay for this snapshot. Null when the palette
+/// is closed (renderers skip the pass).
+pub fn currentPaletteOverlay(s: *app_state.AppState) ?palette_mod.Overlay {
+    if (!s.palette.open) return null;
+    return palette_mod.buildOverlay(&s.palette);
+}
+
 /// Called once per loop iteration. While the bell is fading, dirty
 /// the frame so each step of the fade actually paints. When the bell
 /// deadline elapses, dirty once more so the final non-tinted frame
@@ -163,7 +171,7 @@ pub fn maybeQueueGpuFrame(s: *app_state.AppState) void {
     // the state changed (new content) or we owe a miss-fill, sampling the
     // latest state each time; the compositor latches the most recent commit at
     // vsync (no tearing). `NoFreeBuffer` below is the real backpressure.
-    gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), currentBellOverlay(s)) catch |err| switch (err) {
+    gpu.queueRender(s.refs.term, s.render.render_serial, s.input.selection.toSnapshot(), currentScrollbarOverlay(s), currentBellOverlay(s), currentPaletteOverlay(s)) catch |err| switch (err) {
         error.NoFreeBuffer => {
             // Track how long we're stuck without a released buffer so
             // we can see at exit whether compositor release latency is
@@ -230,6 +238,7 @@ pub fn renderActivePath(s: *app_state.AppState) void {
             s.input.selection.toSnapshot(),
             currentScrollbarOverlay(s),
             currentBellOverlay(s),
+            currentPaletteOverlay(s),
         ) catch |err| switch (err) {
             error.Busy, error.NoFreeBuffer, error.NoFreeSnapshot, error.Inactive => return,
             else => return,

@@ -31,6 +31,9 @@ pub const Options = struct {
     out_path: []const u8,
     /// Upper bound on warm frames before giving up on full glyph coverage.
     max_frames: u32 = 120,
+    /// When set, render the command palette overlay over the frame (for
+    /// screenshot verification — there's no interactive input here).
+    palette: ?@import("../palette.zig").Overlay = null,
 };
 
 pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_mod.Config, opts: Options) !void {
@@ -94,7 +97,7 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
     while (frame < opts.max_frames) : (frame += 1) {
         var lease = atlas_ref.acquire();
         const atlas = lease.get();
-        try render_snapshot.capture(snap, &term, atlas, null, null, null);
+        try render_snapshot.capture(snap, &term, atlas, null, null, null, opts.palette);
         // Re-read faces each frame, mirroring the real GPU worker: auto-fallback
         // (in extend) swaps the shared `Faces` when a miss run needs a new font.
         // Reusing the bootstrap `faces` would keep shaping stale coverage, so a
@@ -173,7 +176,7 @@ pub fn screenshotCpu(allocator: std.mem.Allocator, io: std.Io, cfg: *const confi
     while (frame < opts.max_frames) : (frame += 1) {
         var lease = atlas_ref.acquire();
         const atlas = lease.get();
-        try render_snapshot.capture(snap, &term, atlas, null, null, null);
+        try render_snapshot.capture(snap, &term, atlas, null, null, null, opts.palette);
         pl.renderToMemory(pixels.ptr, opts.width, opts.height, stride, snap, atlas) catch |e| {
             lease.release();
             return e;

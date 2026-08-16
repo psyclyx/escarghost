@@ -15,6 +15,7 @@ const diagnostics = @import("diagnostics.zig");
 const app_state = @import("app_state.zig");
 const render_loop = @import("render_loop.zig");
 const input = @import("input.zig");
+const palette_mod = @import("palette.zig");
 const log = @import("log.zig");
 const cli = @import("cli.zig");
 const bell_mod = @import("bell.zig");
@@ -154,7 +155,16 @@ pub fn main(init: std.process.Init) !void {
         const h: u32 = if (getenv("SCRGO_SCREENSHOT_H")) |s| std.fmt.parseInt(u32, s, 10) catch 600 else 600;
         // SCRGO_RENDERER=cpu takes the software-raster path (also lets us diff
         // the glyph coverage cache against the analytic raster).
-        const shot_opts: headless.Options = .{ .text = text, .out_path = shot_path, .width = w, .height = h };
+        // SCRGO_PALETTE (optional) forces the command palette open with its
+        // value as the query, so its overlay can be screenshot-verified.
+        var pal_state: palette_mod.PaletteState = .{};
+        const palette_ov: ?palette_mod.Overlay = if (getenv("SCRGO_PALETTE")) |q| blk: {
+            pal_state.openReset();
+            const qs = std.mem.sliceTo(q, 0);
+            for (qs) |b| pal_state.appendChar(b);
+            break :blk palette_mod.buildOverlay(&pal_state);
+        } else null;
+        const shot_opts: headless.Options = .{ .text = text, .out_path = shot_path, .width = w, .height = h, .palette = palette_ov };
         const cpu_shot = if (getenv("SCRGO_RENDERER")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "cpu") else false;
         (if (cpu_shot)
             headless.screenshotCpu(allocator, io, &cfg, shot_opts)

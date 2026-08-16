@@ -26,6 +26,7 @@ const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 const Rgb = color.Rgb;
 const bitmap_glyphs = @import("bitmap_glyphs.zig");
+const palette = @import("../palette.zig");
 
 /// Compose a per-cell `placement` (unit/em → screen) with a baked record's
 /// design→source transform, mirroring snail's `PreparedPath.placedBy`
@@ -139,6 +140,11 @@ pub const Metrics = struct {
     cell_height: f32,
     font_size: f32,
     baseline_offset: f32,
+    /// Device viewport size, for overlays (e.g. the command palette) that lay
+    /// out against the whole surface rather than the cell grid. Zero when the
+    /// caller doesn't need overlay layout.
+    viewport_w: u32 = 0,
+    viewport_h: u32 = 0,
 
     pub fn baseline(self: Metrics) f32 {
         return self.baseline_offset;
@@ -555,12 +561,21 @@ pub const SelectionSpan = struct {
 
 pub const MAX_SELECTION_SPANS: usize = render_snapshot.MaxRows;
 
+/// Fully laid-out command palette for a frame: device-space rects (backdrop,
+/// panel, selection highlight) and absolutely-positioned text glyphs. Both
+/// pipelines render it as the topmost layer. Null when the palette is closed.
+pub const BuiltPalette = struct {
+    rects: []const ColoredRect,
+    shapes: []const snail.Shape,
+};
+
 pub const BuiltSnapshot = struct {
     rows: []const RowDraw,
     cursor: ?CursorOverlay,
     selection_spans: []const SelectionSpan,
     scrollbar: ?render_snapshot.ScrollbarOverlay,
     bell: ?render_snapshot.BellOverlay,
+    palette: ?BuiltPalette,
 };
 
 /// Max shapes per row — generous upper bound for a full row of glyphs.
@@ -681,13 +696,154 @@ pub fn buildSnapshot(
 
     const spans = resolveSelectionSpans(snapshot, selection_spans_out, rows, cols);
 
+    const built_palette = if (snapshot.palette) |ov|
+        buildPalette(ov, metrics, atlas, atlas_ref, faces, allocator, rect_stash, misses) catch null
+    else
+        null;
+
     return .{
         .rows = rows_out[0..row_count],
         .cursor = cursor,
         .selection_spans = spans,
         .scrollbar = snapshot.scrollbar,
         .bell = snapshot.bell,
+        .palette = built_palette,
     };
+}
+
+// ── Command palette layout + shaping ──
+
+/// Palette colors (sRGB 0–255; converted to linear straight-alpha at build).
+const palette_colors = struct {
+    const backdrop = Rgb{ .r = 0, .g = 0, .b = 0 }; // dim the terminal
+    const panel = Rgb{ .r = 24, .g = 26, .b = 33 };
+    const selected = Rgb{ .r = 46, .g = 82, .b = 148 };
+    const query_fg = Rgb{ .r = 236, .g = 238, .b = 244 };
+    const name_fg = Rgb{ .r = 208, .g = 212, .b = 220 };
+    const name_sel_fg = Rgb{ .r = 255, .g = 255, .b = 255 };
+    const category_fg = Rgb{ .r = 128, .g = 134, .b = 148 };
+};
+
+/// Lay out the palette panel + text into device-space rects and shapes. Text is
+/// shaped through the same atlas as the terminal; glyphs not yet resident are
+/// dropped and their run is fed to `misses` so the prep thread bakes them (they
+/// fill in on a later frame, like terminal pop-in). Allocations are stashed in
+/// `rect_stash` so they outlive the build and reach emit.
+fn buildPalette(
+    ov: palette.Overlay,
+    metrics: Metrics,
+    atlas: *const snail.Atlas,
+    atlas_ref: *const atlas_ref_mod.AtlasRef,
+    faces: *snail.Faces,
+    allocator: std.mem.Allocator,
+    rect_stash: *EphemeralBlobs,
+    misses: *glyph_misses.Set,
+) !?BuiltPalette {
+    _ = atlas_ref;
+    const vw: f32 = @floatFromInt(metrics.viewport_w);
+    const vh: f32 = @floatFromInt(metrics.viewport_h);
+    if (vw <= 0 or vh <= 0 or metrics.cell_height <= 0) return null;
+
+    const em = metrics.font_size;
+    const line_h = metrics.cell_height;
+    const pad = @round(line_h * 0.5);
+    const total_lines: f32 = @floatFromInt(1 + ov.row_count); // query + rows
+
+    const box_w = @min(@round(vw * 0.7), 960.0);
+    const box_h = total_lines * line_h + pad * 2.0;
+    const box_x = @round((vw - box_w) / 2.0);
+    const box_y = @round(vh * 0.12);
+    const text_x = box_x + pad;
+    const text_right = box_x + box_w - pad;
+
+    var rects: std.ArrayListUnmanaged(ColoredRect) = .empty;
+    var shapes: std.ArrayListUnmanaged(snail.Shape) = .empty;
+
+    // Backdrop over the whole viewport, then the panel.
+    try rects.append(allocator, .{ .x = 0, .y = 0, .w = vw, .h = vh, .color = palette_colors.backdrop.toLinearFloat4(0.55) });
+    try rects.append(allocator, .{ .x = box_x, .y = box_y, .w = box_w, .h = box_h, .color = palette_colors.panel.toLinearFloat4(0.98) });
+
+    // baseline for a text line whose cell-top is `top`.
+    const baselineFor = struct {
+        fn f(top: f32, m: Metrics) f32 {
+            return top + m.baseline_offset;
+        }
+    }.f;
+
+    // Query line.
+    const q_top = box_y + pad;
+    var qbuf: [palette.MAX_QUERY + 2]u8 = undefined;
+    qbuf[0] = '>';
+    qbuf[1] = ' ';
+    const qtext = ov.queryText();
+    @memcpy(qbuf[2 .. 2 + qtext.len], qtext);
+    try appendTextRun(&shapes, allocator, atlas, faces, misses, text_x, baselineFor(q_top, metrics), em, qbuf[0 .. 2 + qtext.len], palette_colors.query_fg.toLinearFloat4(1.0), null);
+
+    // Command rows.
+    for (ov.rows[0..ov.row_count], 0..) |row, i| {
+        const row_top = box_y + pad + line_h * @as(f32, @floatFromInt(i + 1));
+        const base = baselineFor(row_top, metrics);
+        if (row.selected) {
+            try rects.append(allocator, .{
+                .x = box_x + @round(pad * 0.5),
+                .y = row_top,
+                .w = box_w - pad,
+                .h = line_h,
+                .color = palette_colors.selected.toLinearFloat4(0.95),
+            });
+        }
+        const name_col = if (row.selected) palette_colors.name_sel_fg else palette_colors.name_fg;
+        try appendTextRun(&shapes, allocator, atlas, faces, misses, text_x, base, em, row.name, name_col.toLinearFloat4(1.0), null);
+        // Category, right-aligned (dim).
+        try appendTextRun(&shapes, allocator, atlas, faces, misses, text_right, base, em, row.category, palette_colors.category_fg.toLinearFloat4(1.0), text_right);
+    }
+
+    const rects_owned = try rects.toOwnedSlice(allocator);
+    try rect_stash.stashRects(rects_owned);
+    const shapes_owned = try shapes.toOwnedSlice(allocator);
+    try rect_stash.stashShapes(shapes_owned);
+    return .{ .rects = rects_owned, .shapes = shapes_owned };
+}
+
+/// Shape `text` and append its resident glyph shapes at baseline (x, y). When
+/// `right_align_x` is non-null, the run's right edge is placed there instead
+/// (x is ignored). Missing glyphs are dropped and the run fed to `misses`.
+fn appendTextRun(
+    shapes: *std.ArrayListUnmanaged(snail.Shape),
+    allocator: std.mem.Allocator,
+    atlas: *const snail.Atlas,
+    faces: *snail.Faces,
+    misses: *glyph_misses.Set,
+    x: f32,
+    y: f32,
+    em: f32,
+    text: []const u8,
+    col: [4]f32,
+    right_align_x: ?f32,
+) !void {
+    if (text.len == 0) return;
+    var shaped = snail.shape(allocator, faces, text, .{}) catch return;
+    defer shaped.deinit();
+    if (shaped.glyphs.len == 0) return;
+
+    const start_x = if (right_align_x) |rx| rx - em * shaped.advanceX() else x;
+    const placed = snail.placeRunAlloc(allocator, &shaped, faces, .{
+        .baseline = .{ .x = start_x, .y = y },
+        .em = em,
+        .color = col,
+        .snap = .none,
+    }) catch return;
+    defer allocator.free(placed);
+
+    var had_miss = false;
+    for (placed) |shp| {
+        if (atlas.contains(shp.key)) {
+            try shapes.append(allocator, shp);
+        } else {
+            had_miss = true;
+        }
+    }
+    if (had_miss) misses.addRun(text);
 }
 
 fn resolveSelectionSpans(
