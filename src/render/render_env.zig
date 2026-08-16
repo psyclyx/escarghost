@@ -80,35 +80,12 @@ pub fn parseRuntimeFlags(value: ?[]const u8) RuntimeFlags {
     return result;
 }
 
-/// Hint mode that drives both the cell-metrics snap step and the
-/// row_build per-sub-range append path. Mutable at runtime via the
-/// Ctrl+Shift+F4 debug keybinding so we can A/B/C compare without
-/// rebuilding.
-pub const HintMode = enum(u8) {
-    /// No pixel-grid snap, no TT hinter. Glyphs raster at the raw
-    /// requested em; baseline is the synthetic `cell_height * 0.8`.
-    none = 0,
-    /// Pixel-snapped em/cell_width/baseline via `atlas.cellGrid` but
-    /// no TT hinter — the cheap "terminal grid" path.
-    grid = 1,
-    /// Grid snap + snail's `TrueTypeHintContext` best-effort hinter
-    /// applied to every sub-range; this is the default.
-    tt = 2,
-};
+// Glyph hinting: terminal cells always snap to the device pixel grid (that's
+// monospace layout, not a "mode"); glyph outlines currently render unhinted.
+// snail's FreeType-style light autohinter is a planned follow-up — it needs a
+// prep-pipeline rework (per-source AutohintContexts + model→glyph dependency
+// ordering) that the parallel OutlineContext workers don't yet support.
 
-/// Mode atomic shared between the main thread (writer, on keybinding)
-/// and the worker threads (readers, per-frame). Initialised to .grid
-/// at startup — pixel-snapped metrics are the cheap, robust default.
-/// The `.tt` mode is known to produce visible rasterisation artefacts
-/// on at least DejaVu Sans Mono at 11pt; opt in via Ctrl+Shift+F4 at
-/// runtime or `SCRGO_HINT_MODE=tt` at startup.
-/// `loadHintMode` does the relaxed read on the hot path.
-pub var hint_mode_atomic: std.atomic.Value(u8) = .{ .raw = @intFromEnum(HintMode.grid) };
-
-/// Set from SCRGO_HINT_DIAG=1 at startup. When true, row_build queries
-/// the hint context per fallback glyph to bucket fallbacks by reject
-/// reason — adds ~50ns per fallback glyph per frame, so off by default.
-pub var hint_diag_enabled: bool = false;
 pub var direct_resolve_enabled: bool = false;
 
 pub fn directResolveEnabled() bool {
@@ -126,51 +103,6 @@ pub fn loadDirectResolveFromEnv() void {
     if (c.getenv("SCRGO_DIRECT_RESOLVE")) |value| {
         const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), " \t\r\n");
         direct_resolve_enabled = truthy(trimmed);
-    }
-}
-
-pub fn loadHintDiagFromEnv() void {
-    if (c.getenv("SCRGO_HINT_DIAG")) |value| {
-        const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), " \t\r\n");
-        hint_diag_enabled = !std.mem.eql(u8, trimmed, "") and
-            !std.mem.eql(u8, trimmed, "0") and
-            !std.mem.eql(u8, trimmed, "false") and
-            !std.mem.eql(u8, trimmed, "off");
-    }
-}
-
-pub fn loadHintMode() HintMode {
-    return @enumFromInt(hint_mode_atomic.load(.monotonic));
-}
-
-pub fn storeHintMode(mode: HintMode) void {
-    hint_mode_atomic.store(@intFromEnum(mode), .monotonic);
-}
-
-pub fn cycleHintMode() HintMode {
-    const current = loadHintMode();
-    const next: HintMode = switch (current) {
-        .none => .grid,
-        .grid => .tt,
-        .tt => .none,
-    };
-    storeHintMode(next);
-    return next;
-}
-
-/// `SCRGO_HINT_MODE=none|grid|tt` — override the default hint mode at
-/// startup. Unrecognised values fall back to the default. Useful for
-/// pinning the bench (or reproducing rendering bugs) without depending
-/// on the Ctrl+Shift+F4 keybinding.
-pub fn loadHintModeFromEnv() void {
-    const value = c.getenv("SCRGO_HINT_MODE") orelse return;
-    const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "none")) {
-        storeHintMode(.none);
-    } else if (std.ascii.eqlIgnoreCase(trimmed, "grid")) {
-        storeHintMode(.grid);
-    } else if (std.ascii.eqlIgnoreCase(trimmed, "tt")) {
-        storeHintMode(.tt);
     }
 }
 
@@ -231,9 +163,7 @@ pub fn loadRenderConfigFromEnv() RenderConfig {
     if (c.getenv("SCRGO_COVERAGE_EXPONENT")) |value| {
         config.coverage_exponent = parseCoverageExponent(std.mem.sliceTo(value, 0));
     }
-    loadHintDiagFromEnv();
     loadDirectResolveFromEnv();
-    loadHintModeFromEnv();
     return config;
 }
 

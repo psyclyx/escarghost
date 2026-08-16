@@ -7,7 +7,6 @@ const clipboard_mod = @import("clipboard.zig");
 const wayland_mod = @import("wayland.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
-const render_env_mod = @import("render/render_env.zig");
 const palette_mod = @import("palette.zig");
 const log = @import("log.zig");
 
@@ -127,7 +126,7 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
                 pasteFromClipboard(.clipboard);
                 return;
             },
-            // Debug: Ctrl+Shift+F1/F2/F3/F4
+            // Debug: Ctrl+Shift+F1/F2/F3
             xkb_syms.XKB_KEY_F1 => {
                 debugKillActiveRenderer();
                 return;
@@ -138,10 +137,6 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
             },
             xkb_syms.XKB_KEY_F3 => {
                 debugClearAtlas();
-                return;
-            },
-            xkb_syms.XKB_KEY_F4 => {
-                debugCycleHintMode();
                 return;
             },
             else => {},
@@ -576,7 +571,6 @@ fn executePaletteCommand(idx: usize) void {
             state.refs.atlas_ref.custom_glyphs = !state.refs.atlas_ref.custom_glyphs;
             render_loop.markRenderDirty(state);
         },
-        .cycle_hint_mode => debugCycleHintMode(),
         .swap_renderer => debugSwapRenderer(),
         .kill_renderer => debugKillActiveRenderer(),
         .force_redraw => debugClearAtlas(),
@@ -830,23 +824,6 @@ fn debugClearAtlas() void {
     // current atlas's font config bytes.
     render_loop.markRenderDirty(state);
     log.warn(.input, "debug atlas clear", .{ .status = "noop" });
-}
-
-fn debugCycleHintMode() void {
-    const next = render_env_mod.cycleHintMode();
-    // Cell metrics depend on mode (.none keeps unsnapped em; .grid/.tt
-    // snap via cellGrid). Recompute and push through the existing
-    // reconfigure path so the worker picks up new metrics + redraws.
-    var atlas_lease = state.refs.atlas_ref.acquire();
-    defer atlas_lease.release();
-    const cm = gpu_pipeline.computeCellMetrics(state.refs.atlas_ref.faces.?, state.metrics.font_size) catch return;
-    state.metrics.font_size = cm.em;
-    state.metrics.cell_width = cm.cell_width;
-    state.metrics.cell_height = cm.cell_height;
-    state.metrics.baseline_offset = cm.baseline_offset;
-    state.render.gpu_reconfigure_requested = true;
-    render_loop.markRenderDirty(state);
-    log.warn(.input, "debug hint mode", .{ .mode = @tagName(next) });
 }
 
 fn keysymToGhosttyKey(keysym: u32) c_uint {
