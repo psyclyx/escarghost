@@ -135,6 +135,8 @@ fn createMainModule(b: *std.Build, deps: Deps, opts: MainOptions) *std.Build.Mod
     mod.linkSystemLibrary("libdrm", .{ .use_pkg_config = .force });
     mod.linkSystemLibrary("fontconfig", .{});
     mod.linkSystemLibrary("libpulse-simple", .{});
+    // libspng: decodes embedded emoji PNG strikes for snail's color-bitmap path.
+    mod.linkSystemLibrary("spng", .{ .use_pkg_config = .force });
 
     mod.addCSourceFile(.{ .file = b.path("protocol/xdg-shell-protocol.c") });
     mod.addCSourceFile(.{ .file = b.path("protocol/xdg-decoration-protocol.c") });

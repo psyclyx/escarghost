@@ -15,6 +15,7 @@
   libxkbcommon,
   fontconfig,
   harfbuzz,
+  libspng,
   libpulseaudio,
   libghostty-vt,
   snail-src,
@@ -55,6 +56,7 @@ stdenv.mkDerivation {
     libxkbcommon
     fontconfig
     harfbuzz
+    libspng
     libpulseaudio
     libghostty-vt.dev
   ];

@@ -17,6 +17,7 @@
   libxkbcommon,
   harfbuzz,
   fontconfig,
+  libspng,
   libpulseaudio,
   vulkan-headers,
   vulkan-loader,
@@ -51,6 +52,7 @@ mkShell {
     libxkbcommon
     harfbuzz
     fontconfig
+    libspng
     libpulseaudio
     vulkan-headers
     vulkan-loader
@@ -78,6 +80,7 @@ mkShell {
     wayland
     libxkbcommon
     harfbuzz
+    libspng
     libghostty-vt
     libpulseaudio
     vulkan-loader
