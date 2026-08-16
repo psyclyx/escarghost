@@ -379,6 +379,18 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run.step);
         b.step("test-cli", "Run CLI parser tests").dependOn(&run.step);
     }
+    // palette.zig is a pure leaf (std only) — tests always run.
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/palette.zig"),
+            .target = deps.target,
+            .optimize = deps.optimize,
+        });
+        const tests = b.addTest(.{ .root_module = mod });
+        const run = b.addRunArtifact(tests);
+        test_step.dependOn(&run.step);
+        b.step("test-palette", "Run command palette tests").dependOn(&run.step);
+    }
     // bell.zig pulls in libpulse for audio, so its test module needs
     // the same linker arg.
     {

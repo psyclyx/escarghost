@@ -188,3 +188,71 @@ pub fn buildOverlay(pal: *const PaletteState) Overlay {
     ov.row_count = r;
     return ov;
 }
+
+const testing = std.testing;
+
+test "fuzzyMatch is a case-insensitive subsequence" {
+    try testing.expect(fuzzyMatch("", "anything"));
+    try testing.expect(fuzzyMatch("fs", "Font size"));
+    try testing.expect(fuzzyMatch("RENDER", "Toggle renderer"));
+    try testing.expect(!fuzzyMatch("zzz", "Font size"));
+    try testing.expect(!fuzzyMatch("sf", "Font size")); // order matters
+}
+
+test "filter narrows to matching commands and empty query matches all" {
+    var buf: [commands.len]usize = undefined;
+    try testing.expectEqual(commands.len, filter("", &buf));
+
+    const n = filter("font", &buf);
+    try testing.expect(n >= 3);
+    for (buf[0..n]) |idx| try testing.expectEqual(Command, @TypeOf(commands[idx]));
+    // Every "font" match's name contains the subsequence.
+    for (buf[0..n]) |idx| try testing.expect(fuzzyMatch("font", commands[idx].name));
+}
+
+test "selectedCommand clamps to the filtered range" {
+    var pal = PaletteState{};
+    pal.openReset();
+    for ("font") |b| pal.appendChar(b);
+    pal.selected = 999; // out of range on purpose
+    const sel = selectedCommand(&pal).?;
+    try testing.expect(fuzzyMatch("font", commands[sel].name));
+
+    // A query that matches nothing yields null (Enter is a no-op).
+    pal.query_len = 0;
+    for ("zzzz") |b| pal.appendChar(b);
+    try testing.expectEqual(@as(?usize, null), selectedCommand(&pal));
+}
+
+test "appendChar/backspace edit the query and reset selection" {
+    var pal = PaletteState{};
+    pal.openReset();
+    pal.selected = 4;
+    pal.appendChar('a');
+    try testing.expectEqualStrings("a", pal.queryText());
+    try testing.expectEqual(@as(usize, 0), pal.selected);
+    pal.backspace();
+    try testing.expectEqual(@as(usize, 0), pal.query_len);
+    pal.backspace(); // underflow-safe
+    try testing.expectEqual(@as(usize, 0), pal.query_len);
+}
+
+test "buildOverlay windows the list to keep the selection visible" {
+    var pal = PaletteState{};
+    pal.openReset(); // empty query → all commands
+
+    // First row selected, window starts at the top.
+    var ov = buildOverlay(&pal);
+    try testing.expectEqual(commands.len, ov.total);
+    try testing.expectEqual(@min(commands.len, MAX_VISIBLE), ov.row_count);
+    try testing.expect(ov.rows[0].selected);
+
+    // Select past the visible window: it scrolls so the selection is the last
+    // visible row.
+    if (commands.len > MAX_VISIBLE) {
+        pal.selected = commands.len - 1;
+        ov = buildOverlay(&pal);
+        try testing.expectEqual(MAX_VISIBLE, ov.row_count);
+        try testing.expect(ov.rows[ov.row_count - 1].selected);
+    }
+}
