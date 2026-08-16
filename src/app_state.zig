@@ -10,6 +10,7 @@ const cpu_worker = @import("render/cpu_worker.zig");
 const gpu_worker = @import("render/gpu_worker.zig");
 const diagnostics = @import("diagnostics.zig");
 const bell_mod = @import("bell.zig");
+const palette_mod = @import("palette.zig");
 
 pub const RenderPath = enum {
     cpu,
@@ -224,6 +225,9 @@ pub const AppState = struct {
     lifecycle: Lifecycle = .{},
     diag: diagnostics.Diagnostics = .{},
     debug: DebugFlags = .{},
+    /// Command-palette interaction state (open/query/selection). Overlay is
+    /// sampled from this into the frame snapshot. See `palette.zig`.
+    palette: palette_mod.PaletteState = .{},
     /// Process-wide `Io` instance, set once in `main()`. Thread-safe
     /// (Threaded implementation); used by input dispatch and other
     /// subsystems that need to do IO through `state`.

@@ -8,6 +8,7 @@ const wayland_mod = @import("wayland.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const render_env_mod = @import("render/render_env.zig");
+const palette_mod = @import("palette.zig");
 const log = @import("log.zig");
 
 const c = @cImport({
@@ -56,9 +57,22 @@ const TOUCH_FLING_MAX_LPS: f64 = 80.0;
 pub fn onKey(ev: wayland_mod.KeyEvent) void {
     if (ev.state == .released) return;
 
+    // Command palette is modal: while open it swallows every key (nothing
+    // reaches the PTY or the other bindings) until dismissed.
+    if (state.palette.open) {
+        handlePaletteKey(ev);
+        return;
+    }
+
     // Scrgo bindings (intercepted before sending to PTY)
     if (ev.mods.ctrl and ev.mods.shift) {
         switch (ev.keysym) {
+            // Command palette: Ctrl+Shift+P
+            xkb_syms.XKB_KEY_P, xkb_syms.XKB_KEY_p => {
+                state.palette.openReset();
+                render_loop.markRenderDirty(state);
+                return;
+            },
             // Zoom: Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0
             xkb_syms.XKB_KEY_plus, xkb_syms.XKB_KEY_equal => {
                 zoomIn();
@@ -513,6 +527,70 @@ fn pixelToCell(x: f64, y: f64) ?selection_mod.Cell {
     const sb = state.refs.term.scrollbar();
     const screen_y: u32 = @intCast(@min(sb.offset + view_row, std.math.maxInt(u32)));
     return .{ .row = screen_y, .col = col };
+}
+
+// ── Command palette ──────────────────────────────────────────────────────
+
+/// Route a key to the open palette: Esc closes, Enter runs the selection,
+/// Up/Down (and Tab) navigate, Backspace edits, printable text filters.
+fn handlePaletteKey(ev: wayland_mod.KeyEvent) void {
+    switch (ev.keysym) {
+        xkb_syms.XKB_KEY_Escape => {
+            state.palette.open = false;
+        },
+        xkb_syms.XKB_KEY_Return, xkb_syms.XKB_KEY_KP_Enter => {
+            const sel = palette_mod.selectedCommand(&state.palette);
+            state.palette.open = false;
+            if (sel) |idx| executePaletteCommand(idx);
+        },
+        xkb_syms.XKB_KEY_Up, xkb_syms.XKB_KEY_ISO_Left_Tab => {
+            if (state.palette.selected > 0) state.palette.selected -= 1;
+        },
+        xkb_syms.XKB_KEY_Down, xkb_syms.XKB_KEY_Tab => {
+            const cnt = palette_mod.matchCount(state.palette.queryText());
+            if (cnt > 0 and state.palette.selected + 1 < cnt) state.palette.selected += 1;
+        },
+        xkb_syms.XKB_KEY_BackSpace => state.palette.backspace(),
+        else => {
+            // Printable text filters. Special keys arrive here as control
+            // codes in `utf8` (\r, \x08, \x1b); the keysym arms above already
+            // consumed them, so only append genuine printable bytes.
+            const n = @min(ev.utf8_len, ev.utf8.len);
+            for (ev.utf8[0..n]) |b| {
+                if (b >= 0x20 and b != 0x7f) state.palette.appendChar(b);
+            }
+        },
+    }
+    render_loop.markRenderDirty(state);
+}
+
+/// Run the command at registry index `idx`. The dispatch lives here (not in
+/// `palette.zig`) so it can reuse the existing action functions + global state.
+fn executePaletteCommand(idx: usize) void {
+    if (idx >= palette_mod.commands.len) return;
+    switch (palette_mod.commands[idx].id) {
+        .font_increase => zoomIn(),
+        .font_decrease => zoomOut(),
+        .font_reset => zoomReset(),
+        .toggle_custom_glyphs => {
+            state.refs.atlas_ref.custom_glyphs = !state.refs.atlas_ref.custom_glyphs;
+            render_loop.markRenderDirty(state);
+        },
+        .cycle_hint_mode => debugCycleHintMode(),
+        .swap_renderer => debugSwapRenderer(),
+        .kill_renderer => debugKillActiveRenderer(),
+        .force_redraw => debugClearAtlas(),
+        .scroll_top => {
+            state.refs.term.scrollToTop();
+            render_loop.markRenderDirty(state);
+        },
+        .scroll_bottom => {
+            state.refs.term.scrollToBottom();
+            render_loop.markRenderDirty(state);
+        },
+        .copy_selection => copySelectionToClipboard(),
+        .paste => pasteFromClipboard(.clipboard),
+    }
 }
 
 fn zoomIn() void {
