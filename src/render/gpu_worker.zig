@@ -562,6 +562,15 @@ pub const GpuWorker = struct {
                     }
                     self.buffer_count = @intCast(dmabuf_count);
 
+                    // The buffers are freshly allocated, so nothing is in flight
+                    // in them: clear their release points. Otherwise each keeps
+                    // its pre-reconfigure release point, whose compositor-side
+                    // signal never arrives (that buffer was destroyed), and the
+                    // first frame into each recreated buffer blocks in
+                    // `waitRelease` for the full timeout — a multi-second stall
+                    // after any reconfigure (font-size zoom, hint-mode change).
+                    @memset(&release_points, 0);
+
                     if (dmabuf_count == 0) {
                         writeResponse(self.response_fds[1], self.io, .{ .tag = .failed });
                         continue;
