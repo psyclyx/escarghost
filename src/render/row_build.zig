@@ -25,6 +25,56 @@ const box_glyphs = @import("box_glyphs.zig");
 const perf = @import("../perf.zig");
 const log = @import("../log.zig");
 const Rgb = color.Rgb;
+const bitmap_glyphs = @import("bitmap_glyphs.zig");
+
+/// Compose a per-cell `placement` (unit/em → screen) with a baked record's
+/// design→source transform, mirroring snail's `PreparedPath.placedBy`
+/// (`multiply(outer, design_to_source)`). One helper for every baked primitive
+/// we instance ourselves — the unit rect, Powerline separators, and color-
+/// bitmap glyphs — so the placement math lives in exactly one place and matches
+/// snail's contract instead of being re-derived per call site.
+pub fn placeBaked(placement: snail.Transform2D, design_to_source: snail.Transform2D) snail.Transform2D {
+    return snail.Transform2D.multiply(placement, design_to_source);
+}
+
+/// If `shp`'s glyph ink is larger than the cell, shrink it (uniformly, never
+/// upscale) so it fits — otherwise oversized fallback/tofu glyphs spill into
+/// neighboring cells and read as noise. The shape's `local_transform` is the
+/// glyph's em→screen placement (`{ xx = em, yy = -em, … }`); the glyph ink box
+/// comes from the font in font units, scaled to em by `unitsPerEm`. We scale
+/// about the ink's own center, so a glyph centered in its cell stays centered
+/// and simply fits — no positional drift, and glyphs that already fit are
+/// untouched (early return). Applied only to fallback/tofu glyphs by the caller.
+fn fitGlyphToCell(
+    shp: *snail.Shape,
+    atlas_ref: *const atlas_ref_mod.AtlasRef,
+    metrics: Metrics,
+    font_id: u32,
+    glyph_id: u16,
+) void {
+    const font = atlas_ref.fontForId(font_id) orelse return;
+    const upem: f32 = @floatFromInt(font.unitsPerEm());
+    if (upem <= 0) return;
+    const bb = font.bbox(glyph_id) catch return;
+
+    const t = shp.local_transform;
+    const em = t.xx; // uniform em scale from placeCellRun
+    const ink_w = em * (bb.max.x - bb.min.x) / upem;
+    const ink_h = em * (bb.max.y - bb.min.y) / upem;
+    if (ink_w <= 0 or ink_h <= 0) return;
+
+    // A 1px slack keeps glyphs that only graze the cell edge from being scaled.
+    const tol: f32 = 1.0;
+    if (ink_w <= metrics.cell_width + tol and ink_h <= metrics.cell_height + tol) return;
+
+    const s = @min(@min(metrics.cell_width / ink_w, metrics.cell_height / ink_h), 1.0);
+    // Ink center in screen space (apply the placement transform to the em-unit
+    // bbox midpoint; `t.yy` is negative, flipping y-up font space into the scene).
+    const cx = t.tx + t.xx * ((bb.min.x + bb.max.x) * 0.5 / upem);
+    const cy = t.ty + t.yy * ((bb.min.y + bb.max.y) * 0.5 / upem);
+    const fit = snail.Transform2D{ .xx = s, .xy = 0, .yx = 0, .yy = s, .tx = cx * (1 - s), .ty = cy * (1 - s) };
+    shp.local_transform = snail.Transform2D.multiply(fit, t);
+}
 
 // ── Phase counters (diagnostic) ──
 
@@ -254,7 +304,7 @@ fn buildRow(
                     };
                     shapes_out[pl_n] = .{
                         .key = prim.key,
-                        .local_transform = outer.multiply(prim.xform),
+                        .local_transform = placeBaked(outer, prim.xform),
                         .local_color = fg.toLinearFloat4(1.0),
                     };
                     pl_n += 1;
@@ -320,6 +370,8 @@ fn buildRow(
         };
         defer shaped.deinit();
 
+        const ppem: u16 = @intFromFloat(@round(metrics.font_size));
+
         if (shaped.glyphs.len > 0) {
             // Detect glyphs not yet present in the (immutable) atlas
             // snapshot. The render path must never mutate the shared atlas
@@ -328,6 +380,23 @@ fn buildRow(
             // is collected below so the caller can request an extension.
             for (shaped.glyphs) |glyph| {
                 const font_id = faces.fontIdForFace(glyph.face_index) orelse continue;
+                // Emoji: a known color-bitmap strike is served by its own record
+                // (image-painted), not the outline. Residency is checked against
+                // *this frame's* atlas snapshot — the same one `emit` draws from —
+                // so a strike present in the global table but not yet in the
+                // leased snapshot counts as a miss and the freshest-complete loop
+                // waits for the snapshot to catch up (matching outline glyphs).
+                // First sighting (strike not yet discovered) falls through to the
+                // outline check, which triggers the prep pass that discovers and
+                // bakes the strike.
+                if (atlas_ref.bitmaps.hasStrike(font_id, glyph.glyph_id)) {
+                    const bkey = snail.record_key.colorBitmapGlyph(font_id, @intCast(glyph.glyph_id), ppem);
+                    if (!atlas.contains(bkey)) {
+                        had_misses = true;
+                        break;
+                    }
+                    continue;
+                }
                 const key = snail.record_key.unhintedGlyph(font_id, @intCast(glyph.glyph_id));
                 if (!atlas.contains(key)) {
                     had_misses = true;
@@ -364,6 +433,43 @@ fn buildRow(
                     return .{ .rect_count = rect_count, .shape_count = shape_count, .box_rect_count = box_n, .had_misses = had_misses };
                 };
                 shape_count = pl_n + placed.len;
+
+                // Post-process each placed outline shape. `placeCellRun` may
+                // expand COLR glyphs, so a placed shape isn't 1:1 with a source
+                // glyph — match by its record key, which carries
+                // (font_id, glyph_id) for outline shapes.
+                for (placed) |*shp| {
+                    if (shp.key.namespace != snail.record_key.ns.unhinted_glyph) continue;
+                    const font_id = shp.key.a;
+                    const glyph_id: u16 = @intCast(shp.key.b);
+
+                    // 1) Color-bitmap strike: swap onto the image record when it
+                    // is resident in *this frame's* snapshot (miss detection above
+                    // holds the frame until it is). The bitmap carries its own
+                    // color (untinted); its em-bbox rect is placed by folding the
+                    // record's design→source into the glyph's em→screen transform,
+                    // exactly like an outline glyph occupies the cell. Strike
+                    // glyphs never fall through to the outline-fit below. See
+                    // [[custom_glyphs]].
+                    if (atlas_ref.bitmaps.hasStrike(font_id, glyph_id)) {
+                        if (atlas_ref.bitmaps.get(.{ .font_id = font_id, .glyph_id = glyph_id, .ppem = ppem })) |entry| {
+                            if (atlas.contains(entry.key)) {
+                                shp.key = entry.key;
+                                shp.local_color = .{ 1, 1, 1, 1 };
+                                shp.local_transform = placeBaked(shp.local_transform, entry.xform);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // 2) Fallback / tofu glyphs whose ink overflows the cell
+                    // look awful spilling into neighbors. Shrink an oversized one
+                    // to fit. Primary-font text (font_id 0, non-`.notdef`) is
+                    // left untouched — it's designed for the cell.
+                    if (font_id != 0 or glyph_id == 0) {
+                        fitGlyphToCell(shp, atlas_ref, metrics, font_id, glyph_id);
+                    }
+                }
             }
 
             if (had_misses) misses.addRun(row.text[0..row.text_len]);

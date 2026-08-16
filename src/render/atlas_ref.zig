@@ -1,6 +1,8 @@
 const std = @import("std");
 const snail = @import("snail");
 const powerline = @import("powerline_glyphs.zig");
+const bitmap_glyphs = @import("bitmap_glyphs.zig");
+const png_decode = @import("png_decode.zig");
 const glyph_misses = @import("glyph_misses.zig");
 const log = @import("../log.zig");
 
@@ -172,6 +174,16 @@ pub const AtlasRef = struct {
     /// `ensurePowerlineGlyphs` at bootstrap; read-only afterwards.
     powerline: powerline.Table = .{},
 
+    /// Baked color-bitmap (emoji) glyph records, keyed by (font, glyph, ppem).
+    /// Unlike `powerline`, populated lazily by the prep/apply threads as strikes
+    /// are decoded; every access is serialized by `shape_lock`. See
+    /// [[custom_glyphs]] / `bitmap_glyphs.zig`.
+    bitmaps: bitmap_glyphs.Table = .{},
+    /// Current device ppem for bitmap-strike selection, = round(font_size).
+    /// Published each frame by `buildSnapshot` (font size changes with zoom),
+    /// read by the prep thread's `bakeBitmaps`. Zero until the first frame.
+    bitmap_ppem: std.atomic.Value(u16) = .init(0),
+
     /// When true, the render path draws Powerline separators and
     /// box-drawing/block glyphs itself instead of shaping them from the font.
     /// Set once from config before the first frame. See [[custom_glyphs]].
@@ -213,21 +225,55 @@ pub const AtlasRef = struct {
         }
     };
 
+    /// A decoded emoji strike awaiting commit. The extract thread decodes the
+    /// PNG and prepares the em-bbox rect geometry (heavy work, off the apply
+    /// thread); the apply thread extends the atlas with it and records the
+    /// table entry. Owns the decoded image + prepared geometry until committed.
+    const BitmapBake = struct {
+        id: bitmap_glyphs.Id,
+        /// Heap-allocated decoded texels, stable so the paint and the atlas can
+        /// borrow its address. Ownership passes to `bitmaps` on a successful
+        /// commit (set null then); otherwise `deinit` frees it.
+        image: ?*snail.Image,
+        /// Em-space rect over the strike's placement box; source of the
+        /// design→source placement and the fill curves. Freed after commit.
+        prep: snail.PreparedPath,
+        curves: snail.GlyphCurves,
+        /// Strike placement box in em space (drives the image UV transform).
+        bbox: snail.BBox,
+
+        fn deinit(self: *BitmapBake, allocator: std.mem.Allocator) void {
+            self.curves.deinit();
+            self.prep.deinit();
+            if (self.image) |image| {
+                image.deinit();
+                allocator.destroy(image);
+            }
+        }
+    };
+
     /// One miss batch's baked glyph records, produced by the extract stage and
     /// consumed by the apply stage. `results` are views into `owned`; `plan`
-    /// carries the insert recipe and the required-record weld. Freed by
-    /// `deinit` once the apply stage has committed (or dropped) it.
+    /// carries the insert recipe and the required-record weld (null for a
+    /// bitmaps-only batch — e.g. a font-size change whose outlines are already
+    /// resident). Freed by `deinit` once the apply stage has committed (or
+    /// dropped) it.
     const ExtractedBatch = struct {
-        plan: snail.PreparePlan,
+        plan: ?snail.PreparePlan,
         owned: []?snail.prepared.OwnedRecord,
         results: []?snail.prepared.RecordView,
         allocator: std.mem.Allocator,
+        /// Decoded emoji strikes to commit alongside the outlines. `applyBatch`
+        /// consumes this and empties it; on the drop path `deinit` frees it.
+        bitmaps: []BitmapBake = &.{},
 
         fn deinit(self: *ExtractedBatch) void {
             for (self.owned) |*rec| if (rec.*) |*view| view.deinit();
-            self.allocator.free(self.owned);
-            self.allocator.free(self.results);
-            self.plan.deinit();
+            if (self.owned.len > 0) self.allocator.free(self.owned);
+            if (self.results.len > 0) self.allocator.free(self.results);
+            if (self.plan) |*plan| plan.deinit();
+            for (self.bitmaps) |*bake| bake.deinit(self.allocator);
+            if (self.bitmaps.len > 0) self.allocator.free(self.bitmaps);
         }
     };
 
@@ -276,6 +322,23 @@ pub const AtlasRef = struct {
         if (self.update_fd < 0) return;
         const one: u64 = 1;
         _ = c.write(self.update_fd, &one, @sizeOf(u64));
+    }
+
+    /// Publish the current device ppem (= round(font_size)) for the prep
+    /// thread's bitmap-strike selection. Called by the render pipelines each
+    /// frame, since the font size changes with zoom. Lock-free.
+    pub fn setBitmapPpem(self: *AtlasRef, ppem: u16) void {
+        self.bitmap_ppem.store(ppem, .monotonic);
+    }
+
+    /// The font backing `font_id`, or null. `face_specs` is small and mutated
+    /// only by the extract thread under `shape_lock`; call this holding
+    /// `shape_lock` (the render path does, across `buildSnapshot`).
+    pub fn fontForId(self: *const AtlasRef, font_id: u32) ?*const snail.Font {
+        for (self.face_specs.items) |spec| {
+            if (spec.font_id == font_id) return spec.font;
+        }
+        return null;
     }
 
     /// Acquire the current snapshot and keep it alive until the lease is
@@ -477,10 +540,108 @@ pub const AtlasRef = struct {
         // Extraction (the ~90% cost) fans across the prep worker stripes.
         var lease = self.acquire();
         defer lease.release();
-        return self.planAndExtract(lease.get(), &shaped) catch {
+        var outline: ?ExtractedBatch = self.planAndExtract(lease.get(), &shaped) catch blk: {
             prepErrCount += 1;
-            return null;
+            break :blk null;
         };
+
+        // Phase C — decode any color-bitmap (emoji) strikes in this run. Runs
+        // independently of outline residency: a font-size change needs a fresh
+        // record at the new ppem even when the outline is already resident.
+        const bitmaps = self.bakeBitmaps(faces, &shaped);
+
+        if (outline == null and bitmaps.len == 0) return null;
+        if (outline) |*b| {
+            b.bitmaps = bitmaps;
+            return b.*;
+        }
+        // Bitmaps-only: a plan-less batch the apply thread commits by extending
+        // the freshest snapshot directly.
+        return ExtractedBatch{
+            .plan = null,
+            .owned = &.{},
+            .results = &.{},
+            .allocator = self.allocator,
+            .bitmaps = bitmaps,
+        };
+    }
+
+    /// Decode every color-bitmap strike referenced by `shaped` that isn't
+    /// already baked at the current ppem, returning them for the apply thread
+    /// to commit. `Font.colorBitmap` reads shared HarfBuzz font state, so strike
+    /// discovery runs under `shape_lock`; the heavier PNG decode + geometry prep
+    /// run unlocked. Returns an empty slice when there is nothing to bake (the
+    /// common warm path) or on any allocation failure.
+    fn bakeBitmaps(self: *AtlasRef, faces: *snail.Faces, shaped: *const snail.ShapedText) []BitmapBake {
+        const ppem = self.bitmap_ppem.load(.monotonic);
+        if (ppem == 0) return &.{};
+
+        // Under shape_lock: fetch encoded strikes for glyphs not yet resident at
+        // this ppem, deduped. Also mark strike-bearing glyphs so miss detection
+        // can re-request a bake after a ppem change without re-querying here.
+        const Candidate = struct { id: bitmap_glyphs.Id, strike: snail.font.color_bitmap.ColorBitmap };
+        var cands: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer cands.deinit(self.allocator);
+
+        _ = c.pthread_mutex_lock(&self.shape_lock);
+        for (shaped.glyphs) |g| {
+            const id = bitmap_glyphs.Id{ .font_id = g.font_id, .glyph_id = g.glyph_id, .ppem = ppem };
+            if (self.bitmaps.isResident(id)) continue;
+            var dup = false;
+            for (cands.items) |ca| if (std.meta.eql(ca.id, id)) {
+                dup = true;
+                break;
+            };
+            if (dup) continue;
+            const font = faces.fontForFace(g.face_index) orelse continue;
+            const strike = (font.colorBitmap(self.allocator, g.glyph_id, ppem) catch continue) orelse continue;
+            self.bitmaps.markStrike(self.allocator, g.font_id, g.glyph_id);
+            cands.append(self.allocator, .{ .id = id, .strike = strike }) catch {
+                var s = strike;
+                s.deinit();
+                break;
+            };
+        }
+        _ = c.pthread_mutex_unlock(&self.shape_lock);
+        if (cands.items.len == 0) return &.{};
+
+        // Unlocked: decode each PNG + prepare its em-bbox rect geometry.
+        var bakes: std.ArrayListUnmanaged(BitmapBake) = .empty;
+        for (cands.items) |*ca| {
+            var strike = ca.strike;
+            defer strike.deinit();
+            const bake = self.prepareBitmap(ca.id, &strike) orelse continue;
+            bakes.append(self.allocator, bake) catch {
+                var b = bake;
+                b.deinit(self.allocator);
+                break;
+            };
+        }
+        return bakes.toOwnedSlice(self.allocator) catch &.{};
+    }
+
+    /// Decode one strike and build its em-bbox rect geometry. Returns null (and
+    /// leaves nothing allocated) on any decode/prepare failure; the caller still
+    /// owns `strike`.
+    fn prepareBitmap(self: *AtlasRef, id: bitmap_glyphs.Id, strike: *snail.font.color_bitmap.ColorBitmap) ?BitmapBake {
+        const alloc = self.allocator;
+        const bb = strike.bbox;
+
+        var path = snail.Path.init(alloc);
+        defer path.deinit();
+        path.addRect(.{ .x = bb.min.x, .y = bb.min.y, .w = bb.max.x - bb.min.x, .h = bb.max.y - bb.min.y }) catch return null;
+
+        var prep = path.prepare(alloc) catch return null;
+        errdefer prep.deinit();
+        var curves = prep.fillCurves(alloc, alloc) catch return null;
+        errdefer curves.deinit();
+
+        // Decode last, onto a stable heap address the paint + atlas will borrow.
+        const image = alloc.create(snail.Image) catch return null;
+        errdefer alloc.destroy(image);
+        image.* = png_decode.decoder.decodeImage(strike.format, strike.data, alloc) catch return null;
+
+        return BitmapBake{ .id = id, .image = image, .prep = prep, .curves = curves, .bbox = bb };
     }
 
     /// Hand a baked batch to the apply thread. Single-slot and back-pressured:
@@ -543,17 +704,29 @@ pub const AtlasRef = struct {
         var lease = self.acquire();
         defer lease.release();
 
-        var next = b.plan.apply(self.allocator, lease.get(), b.results) catch |err| {
-            if (err == error.OutOfLayers) {
-                // Pool exhausted: new glyphs can't be prepped and render as
-                // gaps. Warn once — sustained hits on a *real* workload (not
-                // the synthetic flood) are the signal that LRU eviction is
-                // worth building. See [[render_perf]].
-                if (prepFullCount == 0) log.warn(.atlas, "atlas full — new glyphs dropped (raise max_layers or add eviction)", .{});
-                prepFullCount += 1;
-            } else prepErrCount += 1;
-            return;
-        };
+        // Outline commit: apply the plan, or (bitmaps-only batch) take a fresh
+        // snapshot of the freshest atlas to extend the strikes onto.
+        var next = if (b.plan) |*plan|
+            plan.apply(self.allocator, lease.get(), b.results) catch |err| {
+                if (err == error.OutOfLayers) {
+                    // Pool exhausted: new glyphs can't be prepped and render as
+                    // gaps. Warn once — sustained hits on a *real* workload (not
+                    // the synthetic flood) are the signal that LRU eviction is
+                    // worth building. See [[render_perf]].
+                    if (prepFullCount == 0) log.warn(.atlas, "atlas full — new glyphs dropped (raise max_layers or add eviction)", .{});
+                    prepFullCount += 1;
+                } else prepErrCount += 1;
+                return;
+            }
+        else
+            lease.get().extend(self.allocator, .{}) catch {
+                prepErrCount += 1;
+                return;
+            };
+
+        // Emoji strikes ride onto the same snapshot as image-painted records.
+        self.commitBitmaps(&next, &b);
+
         prepOkCount += 1;
         atlasRecords = next.recordCount();
 
@@ -566,6 +739,75 @@ pub const AtlasRef = struct {
             heap.deinit();
             self.allocator.destroy(heap);
         };
+    }
+
+    /// Extend `next` with the batch's decoded emoji strikes and record them in
+    /// the render-side `bitmaps` table. Each strike becomes an image-painted
+    /// em-bbox rect keyed by `colorBitmapGlyph(font, glyph, ppem)`; its decoded
+    /// texels move to a heap `snail.Image` the atlas borrows for the process
+    /// lifetime. Consumes `b.bitmaps` (emptied on return so the caller's
+    /// `deinit` won't double-free). Best-effort: a failed extend drops the whole
+    /// group; a failed table insert drops just that glyph.
+    fn commitBitmaps(self: *AtlasRef, next: *snail.Atlas, b: *ExtractedBatch) void {
+        if (b.bitmaps.len == 0) return;
+        const alloc = self.allocator;
+        defer {
+            // Geometry is copied into the atlas at extend time; images are
+            // transferred (image == null) or freed by `deinit`. Drop the slice.
+            for (b.bitmaps) |*bake| bake.deinit(alloc);
+            alloc.free(b.bitmaps);
+            b.bitmaps = &.{};
+        }
+
+        // Build the image-painted entries; `committed[i]` maps an entry back to
+        // its bake so we can transfer the image once the extend succeeds.
+        var entries: std.ArrayListUnmanaged(snail.AtlasEntry) = .empty;
+        defer entries.deinit(alloc);
+        var committed: std.ArrayListUnmanaged(usize) = .empty;
+        defer committed.deinit(alloc);
+        entries.ensureTotalCapacity(alloc, b.bitmaps.len) catch return;
+        committed.ensureTotalCapacity(alloc, b.bitmaps.len) catch return;
+
+        for (b.bitmaps, 0..) |*bake, i| {
+            const source_paint = snail.Paint{ .image = .{
+                .image = bake.image.?,
+                .uv_transform = snail.font.color_bitmap.imageUvTransform(bake.bbox),
+                .filter = .nearest,
+            } };
+            const paint = bake.prep.paintForDesign(source_paint) catch continue;
+            const key = snail.record_key.colorBitmapGlyph(bake.id.font_id, bake.id.glyph_id, bake.id.ppem);
+            entries.append(alloc, .{ .geometry = .{
+                .key = key,
+                .curves = bake.curves.view(),
+                .paint = paint,
+            } }) catch continue;
+            committed.append(alloc, i) catch {
+                _ = entries.pop();
+                continue;
+            };
+        }
+        if (entries.items.len == 0) return;
+
+        // On failure `next` is logically unchanged (the images were never
+        // borrowed), so leave them owned by the bakes for `deinit` to free.
+        next.extendInPlace(alloc, .{ .entries = entries.items }) catch return;
+
+        // Committed: the atlas now borrows each image, so ownership passes out of
+        // the bake (set null) into `bitmaps` — regardless of a put failure, the
+        // image must stay alive while the snapshot references it. Published under
+        // shape_lock, where the render path reads the table.
+        _ = c.pthread_mutex_lock(&self.shape_lock);
+        for (committed.items) |i| {
+            const bake = &b.bitmaps[i];
+            const image = bake.image.?;
+            bake.image = null;
+            _ = self.bitmaps.put(alloc, bake.id, .{
+                .key = snail.record_key.colorBitmapGlyph(bake.id.font_id, bake.id.glyph_id, bake.id.ppem),
+                .xform = bake.prep.design_to_source,
+                .image = image,
+            });
+        }
+        _ = c.pthread_mutex_unlock(&self.shape_lock);
     }
 
     /// One extraction worker. Claims contiguous chunks of request indices
@@ -952,6 +1194,7 @@ pub const AtlasRef = struct {
         self.retired_faces.deinit(self.allocator);
         self.face_specs.deinit(self.allocator);
         self.fallback_tried.deinit(self.allocator);
+        self.bitmaps.deinit(self.allocator);
         _ = c.pthread_mutex_destroy(&self.shape_lock);
         _ = c.pthread_cond_destroy(&self.prep_cond);
         _ = c.pthread_mutex_destroy(&self.prep_mutex);

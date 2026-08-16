@@ -341,6 +341,7 @@ pub const CpuPipeline = struct {
         // Serialize shaping: the CPU and GPU workers share one HarfBuzz
         // buffer via `Faces`, so concurrent shapes corrupt it. Scoped to
         // just the shape.
+        self.atlas_ref.setBitmapPpem(@intFromFloat(@round(metrics.font_size)));
         const built = blk: {
             self.atlas_ref.lockShaping();
             defer self.atlas_ref.unlockShaping();

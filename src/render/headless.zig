@@ -95,7 +95,13 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
         var lease = atlas_ref.acquire();
         const atlas = lease.get();
         try render_snapshot.capture(snap, &term, atlas, null, null, null);
-        const had_misses = pl.buildShapes(atlas, faces, snap) catch |e| {
+        // Re-read faces each frame, mirroring the real GPU worker: auto-fallback
+        // (in extend) swaps the shared `Faces` when a miss run needs a new font.
+        // Reusing the bootstrap `faces` would keep shaping stale coverage, so a
+        // codepoint that only the auto-loaded font covers (e.g. an emoji whose
+        // strike lives in a fallback face) would miss forever.
+        const cur_faces = atlas_ref.faces orelse faces;
+        const had_misses = pl.buildShapes(atlas, cur_faces, snap) catch |e| {
             lease.release();
             return e;
         };

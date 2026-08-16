@@ -228,6 +228,7 @@ pub const GpuPipeline = struct {
         // Serialize shaping: the CPU and GPU workers share one HarfBuzz
         // buffer via `Faces`, so concurrent shapes corrupt it. Scoped to
         // just the shape — the caller's extend()/emit run outside it.
+        self.atlas_ref.setBitmapPpem(@intFromFloat(@round(self.font_size)));
         self.built = blk: {
             self.atlas_ref.lockShaping();
             defer self.atlas_ref.unlockShaping();
@@ -418,7 +419,7 @@ pub const GpuPipeline = struct {
         const outer = snail.Transform2D{ .xx = w, .yy = h, .tx = x, .ty = y };
         const shape = snail.Shape{
             .key = self.atlas_ref.rect_key,
-            .local_transform = outer.multiply(self.atlas_ref.rect_xform),
+            .local_transform = row_build.placeBaked(outer, self.atlas_ref.rect_xform),
             .local_color = tint,
         };
         _ = snail.emit.emit(
