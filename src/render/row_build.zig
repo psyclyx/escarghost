@@ -90,16 +90,6 @@ pub var phase_shape_call_ns: u64 = 0;
 pub var phase_shape_call_count: u64 = 0;
 pub var phase_cell_walk_ns: u64 = 0;
 
-// Hint diagnostic stubs (referenced by diagnostics.zig). The snail 0.13
-// pipeline doesn't populate these yet.
-pub var phase_hint_prepare_ns: u64 = 0;
-pub var phase_hint_append_ns: u64 = 0;
-pub var phase_hint_runs: u64 = 0;
-pub var phase_hint_glyphs_hinted: u64 = 0;
-pub var phase_hint_glyphs_fallback: u64 = 0;
-pub const reject_reason_count: usize = 10;
-pub var phase_hint_reject_counts: [reject_reason_count]u64 = .{0} ** reject_reason_count;
-
 pub const MAX_RECTS_PER_ROW: usize = @as(usize, render_snapshot.MaxCols) * 3;
 
 pub const ColoredRect = struct {

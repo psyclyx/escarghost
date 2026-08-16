@@ -339,33 +339,6 @@ pub const Diagnostics = struct {
                     .draw_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(cpu_pipeline.phase_draw_ns)) / ms_f}),
                 });
             }
-            if (row_build_mod.phase_hint_runs > 0) {
-                log.info(.diag, "tt hinter", .{
-                    .runs = row_build_mod.phase_hint_runs,
-                    .hinted = row_build_mod.phase_hint_glyphs_hinted,
-                    .fallback = row_build_mod.phase_hint_glyphs_fallback,
-                    .prepare_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_prepare_ns)) / ms_f}),
-                    .append_ms = log.fmt("{d:.1}", .{@as(f64, @floatFromInt(row_build_mod.phase_hint_append_ns)) / ms_f}),
-                });
-                const r = row_build_mod.phase_hint_reject_counts;
-                var any: u64 = 0;
-                for (r) |v| any +%= v;
-                if (any > 0) {
-                    // TODO: snail 0.13 TrueTypeHintRejectReason mapping
-                    log.info(.diag, "tt hinter rejects", .{
-                        .invalid_face = r[0],
-                        .no_tt_program = r[1],
-                        .synthetic_embolden = r[2],
-                        .color_glyph = r[3],
-                        .grid_fit_disabled = r[4],
-                        .missing_base_glyph = r[5],
-                        .topology_changed = r[6],
-                        .bands_not_reusable = r[7],
-                        .empty_hinted_outline = r[8],
-                        .exec_failed = r[9],
-                    });
-                }
-            }
         }
 
         if (self.trace_commits and self.commit_trace_len > 0) {
