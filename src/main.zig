@@ -157,15 +157,27 @@ pub fn main(init: std.process.Init) !void {
         // the glyph coverage cache against the analytic raster).
         // SCRGO_PALETTE (optional) forces the command palette open with its
         // value as the query, so its overlay can be screenshot-verified.
+        const cpu_shot = if (getenv("SCRGO_RENDERER")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "cpu") else false;
         var pal_state: palette_mod.PaletteState = .{};
         const palette_ov: ?palette_mod.Overlay = if (getenv("SCRGO_PALETTE")) |q| blk: {
             pal_state.openReset();
             const qs = std.mem.sliceTo(q, 0);
             for (qs) |b| pal_state.appendChar(b);
-            break :blk palette_mod.buildOverlay(&pal_state);
+            var ov = palette_mod.buildOverlay(&pal_state);
+            // Sample current values (the live app fills these from AppState in
+            // render_loop.currentPaletteOverlay; here we synthesize from cfg).
+            for (ov.rows[0..ov.row_count]) |*row| switch (row.id) {
+                .swap_renderer => row.setValue(if (cpu_shot) "cpu" else "gpu"),
+                .toggle_custom_glyphs => row.setValue(if (cfg.custom_glyphs) "on" else "off"),
+                .font_increase, .font_decrease, .font_reset => {
+                    var fb: [16]u8 = undefined;
+                    row.setValue(std.fmt.bufPrint(&fb, "{d:.0}px", .{cfg.font_size}) catch continue);
+                },
+                else => {},
+            };
+            break :blk ov;
         } else null;
         const shot_opts: headless.Options = .{ .text = text, .out_path = shot_path, .width = w, .height = h, .palette = palette_ov };
-        const cpu_shot = if (getenv("SCRGO_RENDERER")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "cpu") else false;
         (if (cpu_shot)
             headless.screenshotCpu(allocator, io, &cfg, shot_opts)
         else

@@ -132,10 +132,26 @@ pub fn currentBellOverlay(s: *app_state.AppState) ?render_snapshot.BellOverlay {
 }
 
 /// Sample the command-palette overlay for this snapshot. Null when the palette
-/// is closed (renderers skip the pass).
+/// is closed (renderers skip the pass). Fills each visible row's current value
+/// from live state (renderer, custom-glyphs, font size) — the palette module is
+/// a pure leaf and can't read `AppState`, so the projection lives here.
 pub fn currentPaletteOverlay(s: *app_state.AppState) ?palette_mod.Overlay {
     if (!s.palette.open) return null;
-    return palette_mod.buildOverlay(&s.palette);
+    var ov = palette_mod.buildOverlay(&s.palette);
+    for (ov.rows[0..ov.row_count]) |*row| fillPaletteValue(s, row);
+    return ov;
+}
+
+fn fillPaletteValue(s: *app_state.AppState, row: *palette_mod.Row) void {
+    switch (row.id) {
+        .swap_renderer => row.setValue(@tagName(s.render.active_render_path)),
+        .toggle_custom_glyphs => row.setValue(if (s.refs.atlas_ref.custom_glyphs) "on" else "off"),
+        .font_increase, .font_decrease, .font_reset => {
+            var buf: [16]u8 = undefined;
+            row.setValue(std.fmt.bufPrint(&buf, "{d:.0}px", .{s.metrics.font_size}) catch return);
+        },
+        else => {},
+    }
 }
 
 /// Called once per loop iteration. While the bell is fading, dirty

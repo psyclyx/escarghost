@@ -712,6 +712,7 @@ const palette_colors = struct {
     const name_fg = Rgb{ .r = 208, .g = 212, .b = 220 };
     const name_sel_fg = Rgb{ .r = 255, .g = 255, .b = 255 };
     const category_fg = Rgb{ .r = 128, .g = 134, .b = 148 };
+    const value_fg = Rgb{ .r = 150, .g = 200, .b = 230 }; // current setting value
 };
 
 /// Lay out the palette panel + text into device-space rects and shapes. Text is
@@ -784,8 +785,13 @@ fn buildPalette(
         }
         const name_col = if (row.selected) palette_colors.name_sel_fg else palette_colors.name_fg;
         try appendTextRun(&shapes, allocator, atlas, faces, misses, text_x, base, em, row.name, name_col.toLinearFloat4(1.0), null);
-        // Category, right-aligned (dim).
-        try appendTextRun(&shapes, allocator, atlas, faces, misses, text_right, base, em, row.category, palette_colors.category_fg.toLinearFloat4(1.0), text_right);
+        // Right-aligned: the command's current value (accent) when it has one,
+        // otherwise its category (dim).
+        if (row.value_len > 0) {
+            try appendTextRun(&shapes, allocator, atlas, faces, misses, text_right, base, em, row.valueText(), palette_colors.value_fg.toLinearFloat4(1.0), text_right);
+        } else {
+            try appendTextRun(&shapes, allocator, atlas, faces, misses, text_right, base, em, row.category, palette_colors.category_fg.toLinearFloat4(1.0), text_right);
+        }
     }
 
     const rects_owned = try rects.toOwnedSlice(allocator);

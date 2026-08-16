@@ -135,11 +135,29 @@ pub fn selectedCommand(pal: *const PaletteState) ?usize {
     return buf[@min(pal.selected, n - 1)];
 }
 
-/// One rendered row: static name/category slices plus whether it's selected.
+/// One rendered row: static name/category slices, whether it's selected, and
+/// the command's current value (e.g. "gpu", "on", "14") when it has one. The
+/// value is filled after `buildOverlay` by the app layer (which can read
+/// `AppState`); `buildOverlay` leaves it empty. Rendered in place of the
+/// category when present.
 pub const Row = struct {
+    id: CommandId,
     name: []const u8,
     category: []const u8,
     selected: bool,
+    value: [24]u8 = undefined,
+    value_len: usize = 0,
+
+    pub fn valueText(self: *const Row) []const u8 {
+        return self.value[0..self.value_len];
+    }
+
+    /// Copy `text` (truncated to the buffer) into this row's value.
+    pub fn setValue(self: *Row, text: []const u8) void {
+        const n = @min(text.len, self.value.len);
+        @memcpy(self.value[0..n], text[0..n]);
+        self.value_len = n;
+    }
 };
 
 /// Render-ready snapshot of the palette, sampled into the frame snapshot. Self
@@ -180,7 +198,7 @@ pub fn buildOverlay(pal: *const PaletteState) Overlay {
     var i = start;
     while (i < end) : (i += 1) {
         const cmd = commands[idx_buf[i]];
-        ov.rows[r] = .{ .name = cmd.name, .category = cmd.category, .selected = (i == sel) };
+        ov.rows[r] = .{ .id = cmd.id, .name = cmd.name, .category = cmd.category, .selected = (i == sel) };
         r += 1;
     }
     ov.row_count = r;
