@@ -1,11 +1,13 @@
 //! Command palette: a modal overlay for twiddling runtime settings and running
 //! debug commands without a dedicated keybinding for each one. No persistence.
 //!
-//! This module is a pure leaf (imports only `std`): the command *metadata*
-//! (id/name/category), the palette's interaction state, the fuzzy filter, and
-//! the render-ready overlay snapshot. It deliberately does NOT know how to
-//! *execute* a command — that dispatch lives in `input.zig`, which owns the
-//! action functions and the global `AppState`, and switches on `Command.id`.
+//! This module is a pure leaf (imports only `std` and the std-only `actions.zig`
+//! vocabulary): the command *metadata* (id/name/category), the palette's
+//! interaction state, the fuzzy filter, and the render-ready overlay snapshot. It
+//! deliberately does NOT know how to *execute* a command — that dispatch lives in
+//! `input.zig` (`runAction`), which owns the action functions and the global
+//! `AppState`. A command's `id` is an `actions.Action`, the shared vocabulary
+//! keybindings also resolve to.
 //! Keeping execution out of here avoids an input↔palette↔render_loop import
 //! cycle: `app_state`, `input`, `render_loop`, `render_snapshot`, and the
 //! pipelines all import this module one-directionally.

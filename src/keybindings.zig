@@ -80,10 +80,8 @@ pub fn parseChord(str: []const u8) ?Chord {
         } else {
             if (keysym != null) return null; // more than one key name
             var buf: [64]u8 = undefined;
-            if (tok.len >= buf.len) return null;
-            @memcpy(buf[0..tok.len], tok);
-            buf[tok.len] = 0;
-            const ks = xkb.xkb_keysym_from_name(&buf, xkb.XKB_KEYSYM_CASE_INSENSITIVE);
+            const name = std.fmt.bufPrintZ(&buf, "{s}", .{tok}) catch return null; // too long
+            const ks = xkb.xkb_keysym_from_name(name.ptr, xkb.XKB_KEYSYM_CASE_INSENSITIVE);
             if (ks == xkb.XKB_KEY_NoSymbol) return null;
             keysym = xkb.xkb_keysym_to_lower(ks);
         }
