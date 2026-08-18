@@ -458,7 +458,14 @@ pub const GpuPipeline = struct {
         const cw = self.cell_width;
         const ch = self.cell_height;
         switch (cursor.style) {
-            .block => self.emitRect(il, bl, binding, atlas, x, y, cw, ch, cursor.color.toLinearFloat4(0.7)),
+            .block => {
+                // Opaque block, then the inverted glyph on top (empty for an
+                // empty cell → just a solid block).
+                self.emitRect(il, bl, binding, atlas, x, y, cw, ch, cursor.color.toLinearFloat4(1.0));
+                if (cursor.glyph.len > 0) {
+                    _ = snail.emit.emit(self.instances.items, self.batches.items, il, bl, binding, atlas, cursor.glyph, .identity, white_tint) catch {};
+                }
+            },
             .bar => {
                 const ext = render_common.barCursorExtent(y, ch, self.baseline_offset, self.descent);
                 self.emitRect(il, bl, binding, atlas, x, ext.y, 2, ext.h, cursor.color.toLinearFloat4(1.0));

@@ -397,7 +397,15 @@ pub const CpuPipeline = struct {
         try self.drawText(surface, buf, width, height, stride, cur_atlas, built.rows);
 
         // ── 6. Cursor ──
-        if (built.cursor) |cursor| self.drawCursor(r, surface, cursor);
+        if (built.cursor) |cursor| {
+            self.drawCursor(r, surface, cursor);
+            // Inverted glyph over the (opaque) block — reuse the text path with a
+            // synthetic row (shapes are absolutely positioned, row_y = 0).
+            if (cursor.glyph.len > 0) {
+                const grows = [_]row_build.RowDraw{.{ .shapes = cursor.glyph, .rects = &.{}, .box_rects = &.{}, .row_y = 0 }};
+                try self.drawText(surface, buf, width, height, stride, cur_atlas, &grows);
+            }
+        }
 
         // ── 7. Scrollbar ──
         if (built.scrollbar) |sb| {
@@ -687,7 +695,9 @@ pub const CpuPipeline = struct {
         const cw = self.cell_width;
         const ch = self.cell_height;
         switch (cursor.style) {
-            .block => fillRect(r, surface, x, y, cw, ch, cursor.color.toLinearFloat4(0.7)),
+            // Opaque block; the inverted glyph is drawn over it by the caller
+            // (it has the text-draw context). Empty cell → just a solid block.
+            .block => fillRect(r, surface, x, y, cw, ch, cursor.color.toLinearFloat4(1.0)),
             .bar => {
                 const ext = render_common.barCursorExtent(y, ch, self.baseline_offset, self.descent);
                 fillRect(r, surface, x, ext.y, 2, ext.h, cursor.color.toLinearFloat4(1.0));

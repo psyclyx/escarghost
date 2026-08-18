@@ -541,6 +541,10 @@ pub const CursorOverlay = struct {
     cell_y: u16,
     style: render_snapshot.CursorStyle,
     color: Rgb,
+    /// For a block cursor over a glyph: the covered glyph re-placed in the
+    /// cell's background color, drawn on top of the (opaque) block so it reads
+    /// inverted instead of vanishing. Empty for non-block cursors / empty cells.
+    glyph: []const snail.Shape = &.{},
 };
 
 pub const SelectionSpan = struct {
@@ -607,6 +611,12 @@ pub fn buildSnapshot(
 
     var cell_index: usize = 0;
     var cursor_cell: ?render_common.CursorCell = null;
+    // The cursor cell's own placed glyph(s), recolored to the cell background,
+    // captured from the row as it's built. Drawn over the opaque block cursor so
+    // the covered glyph reads inverted. Empty for non-block cursors / empty
+    // cells. Reuses the exact shapes the row drew — same placement, key, and
+    // hinting — rather than re-shaping.
+    var cursor_glyph_shapes: []const snail.Shape = &.{};
     var row_count: usize = 0;
 
     var row_idx: u16 = 0;
@@ -658,6 +668,36 @@ pub fn buildSnapshot(
         // Copy shapes + rects to heap for stable references
         const shapes = try allocator.dupe(snail.Shape, row_scratch.shapes[0..built.shape_count]);
         try rect_stash.stashShapes(shapes);
+
+        // Block cursor on this row: clone the covered cell's already-placed
+        // glyph(s) in the cell background color for the cursor layer to draw
+        // over the opaque block (inverted). Row shapes are absolute in x (`tx`)
+        // but row-relative in y, so fold this row's `row_y` into `ty` — the
+        // cursor layer emits them without the per-row translation.
+        if (header.cursor_style == .block and row_idx == header.cursor_y) {
+            if (cursor_cell) |cc| if (cc.has_text) {
+                const cl = @as(f32, @floatFromInt(header.cursor_x)) * metrics.cell_width;
+                const half = metrics.cell_width * 0.5;
+                const bg4 = cc.bg.toLinearFloat4(1.0);
+                var list: std.ArrayListUnmanaged(snail.Shape) = .empty;
+                for (shapes) |shp| {
+                    if (shp.local_transform.tx >= cl - half and shp.local_transform.tx < cl + half) {
+                        var c = shp;
+                        c.local_color = bg4;
+                        c.local_transform.ty += row_y;
+                        list.append(allocator, c) catch continue;
+                    }
+                }
+                if (list.items.len > 0) {
+                    if (list.toOwnedSlice(allocator)) |owned| {
+                        if (rect_stash.stashShapes(owned)) |_| {
+                            cursor_glyph_shapes = owned;
+                        } else |_| allocator.free(owned);
+                    } else |_| list.deinit(allocator);
+                } else list.deinit(allocator);
+            };
+        }
+
         const rects = try allocator.dupe(ColoredRect, scratch_rects[0..built.rect_count]);
         try rect_stash.stashRects(rects);
         const box_rects = try allocator.dupe(ColoredRect, box_rects_scratch[0..built.box_rect_count]);
@@ -681,6 +721,7 @@ pub fn buildSnapshot(
             .cell_y = header.cursor_y,
             .style = header.cursor_style,
             .color = cursor_color,
+            .glyph = cursor_glyph_shapes,
         };
     }
 
