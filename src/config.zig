@@ -73,6 +73,12 @@ pub const Config = struct {
     // the font's glyphs.
     custom_glyphs: bool = true,
 
+    // Apply TrueType bytecode hinting to the primary monospace face. Fallback
+    // faces (emoji/CJK/COLR) always render unhinted. No-op if the primary face
+    // isn't a static TrueType font. Toggleable at runtime from the command
+    // palette; this is only the initial state.
+    tt_hint: bool = false,
+
     // Bell behavior. mode=visual matches what users get without
     // touching config.
     bell: bell_mod.Config = .{},
@@ -360,6 +366,9 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
     if (obj.get("custom_glyphs")) |v| {
         if (v == .bool) cfg.custom_glyphs = v.bool;
     }
+    if (obj.get("tt_hint")) |v| {
+        if (v == .bool) cfg.tt_hint = v.bool;
+    }
     if (obj.get("touch_momentum")) |v| {
         if (v == .bool) cfg.touch_momentum = v.bool;
     }
@@ -443,6 +452,13 @@ test "parseJson basic" {
     try std.testing.expectEqual(@as(u16, 120), cfg.cols);
     try std.testing.expectEqual(@as(u16, 40), cfg.rows);
     try std.testing.expectEqual(false, cfg.generate_256);
+}
+
+test "parseJson tt_hint" {
+    var cfg = defaults;
+    try std.testing.expectEqual(false, cfg.tt_hint);
+    try parseJson(std.testing.allocator, "{\"tt_hint\": true}", &cfg);
+    try std.testing.expectEqual(true, cfg.tt_hint);
 }
 
 test "parseJson colors" {

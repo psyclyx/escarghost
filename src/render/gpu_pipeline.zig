@@ -92,6 +92,29 @@ pub fn computeCellMetricsFromFont(font: *const snail.Font, font_size: f32) !Cell
     };
 }
 
+/// Device-pixel cell width from the primary font's *hinted* advance at
+/// `font_size`, or null if the font can't be TT-hinted (so the caller keeps the
+/// unhinted design-advance width from `computeCellMetrics`). For a normal
+/// monospace font this equals the unhinted width; it only diverges for a font
+/// whose hint program deltas the advance per-ppem. Runs a throwaway `TtHintVm` —
+/// cheap, and only called on the rare metrics paths (bootstrap / zoom / toggle).
+pub fn hintedAdvanceWidth(allocator: std.mem.Allocator, font: *const snail.Font, font_size: f32) ?f32 {
+    const glyph_id = font.glyphIndex('M') catch return null;
+    if (glyph_id == 0) return null;
+    const ppem_px: u32 = @intFromFloat(@round(font_size));
+    if (ppem_px == 0) return null;
+    var vm = snail.TtHintVm.init(allocator, font) catch return null;
+    defer vm.deinit();
+    var prep = vm.prepare(snail.TtHintPpem.uniform(ppem_px << 6)) catch return null;
+    defer prep.deinit();
+    const adv_26_6 = vm.hintedAdvance(&prep, glyph_id) catch return null;
+    // Hinted advance is 26.6 device px at ppem; rescale by em/ppem to match the
+    // placement scale row_build applies (identity at integer font sizes).
+    const adv_px = @as(f32, @floatFromInt(adv_26_6)) / 64.0;
+    const rescale = font_size / @as(f32, @floatFromInt(ppem_px));
+    return @round(adv_px * rescale);
+}
+
 pub fn computeGridSize(cell_width: f32, cell_height: f32, pixel_w: u32, pixel_h: u32) struct { cols: u16, rows: u16 } {
     // Clamp to the renderer's snapshot capacity. The terminal is sized to what
     // we can actually render, so columns/rows past the cap are never created

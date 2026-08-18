@@ -169,6 +169,7 @@ pub fn main(init: std.process.Init) !void {
             for (ov.rows[0..ov.row_count]) |*row| switch (row.id) {
                 .swap_renderer => row.setValue(if (cpu_shot) "cpu" else "gpu"),
                 .toggle_custom_glyphs => row.setValue(if (cfg.custom_glyphs) "on" else "off"),
+                .toggle_tt_hint => row.setValue(if (cfg.tt_hint) "on" else "off"),
                 .font_increase, .font_decrease, .font_reset => {
                     var fb: [16]u8 = undefined;
                     row.setValue(std.fmt.bufPrint(&fb, "{d:.0}px", .{cfg.font_size}) catch continue);
@@ -244,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
         .font_path_cfg = cfg.font_path,
         .fallback_fonts = cfg.fallback_fonts,
         .font_size = cfg.font_size,
+        .tt_hint = cfg.tt_hint,
     });
     defer atlas_thread.stop();
 
@@ -359,6 +361,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(atlas_thread.bootstrap_font_path);
     const atlas_ref_ptr = atlas_thread.atlas_ref;
     atlas_ref_ptr.custom_glyphs = cfg.custom_glyphs;
+    atlas_ref_ptr.tt_hint = .init(cfg.tt_hint);
     state.refs.atlas_ref = atlas_ref_ptr;
     log.info(.atlas, "ready", .{});
 

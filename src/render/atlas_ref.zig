@@ -142,6 +142,29 @@ pub const AtlasRef = struct {
     /// instead of being rebuilt each time. Owned; allocated at `startPrep`,
     /// freed at `stopPrep` after the prep thread joins.
     prep_contexts: []snail.OutlineContext = &.{},
+    /// Per-worker TrueType hint state (one per `prep_contexts` slot). Each
+    /// holds a `TtHintContext` bound to the primary face plus a cached per-ppem
+    /// `TtHintSize`. Allocated at `startPrep`; the `TtHintContext`s are only
+    /// initialised when `tt_hint_supported`. Freed at `stopPrep`.
+    tt_workers: []TtWorker = &.{},
+    /// Stable primary `FontSource` (font_id 0) the per-worker `TtHintContext`s
+    /// borrow (its `check()` compares against this). Set at `startPrep`.
+    tt_source: snail.FontSource = undefined,
+    /// Whether the primary face can be TT-hinted (static TrueType, no
+    /// variations). Probed once at `startPrep` via `TtHintVm.init`; immutable
+    /// after. When false, `tt_hint` is inert.
+    tt_hint_supported: bool = false,
+    /// Runtime kill-switch: set if the TT prep plan ever fails to bake (a font
+    /// the probe accepted but whose glyphs snail can't hint). Reverts the render
+    /// path to unhinted (always-resident) keys so hinting can never leave a row
+    /// permanently missing — the font stays usable, just unhinted. Written by
+    /// the prep thread, read by the render path, so atomic.
+    tt_hint_failed: std.atomic.Value(bool) = .init(false),
+    /// Live TrueType-hint toggle for the primary face. Read each pass by the
+    /// render path (`row_build`) and the prep thread; flipped by the palette
+    /// command. Initial state from config (`main` seeds it). Effective only
+    /// when `tt_hint_supported`. Fallback faces always render unhinted.
+    tt_hint: std.atomic.Value(bool) = .init(false),
     /// eventfd the apply thread bumps on `publish` so the main loop can wake
     /// and re-render newly-prepped glyphs without polling. Stays quiet when
     /// the atlas is warm, so an idle terminal burns no CPU/GPU.
@@ -392,6 +415,37 @@ pub const AtlasRef = struct {
         log.info(.atlas, "prep workers", .{ .workers = self.prep_workers, .cores = cpu });
         self.prep_contexts = try self.allocator.alloc(snail.OutlineContext, self.prep_workers);
         for (self.prep_contexts) |*cx| cx.* = snail.OutlineContext.init(self.allocator, self.allocator);
+
+        // Probe the primary face (font_id 0) for TT-hint support and, if it has
+        // it, build a stable FontSource plus one TtHintContext per worker. The
+        // VM rejects non-static-TrueType faces (CFF/variable) with NoHinting, in
+        // which case `tt_hint` stays inert and every glyph renders unhinted.
+        self.tt_workers = try self.allocator.alloc(TtWorker, self.prep_workers);
+        for (self.tt_workers) |*w| w.* = .{};
+        self.tt_hint_supported = false;
+        if (self.primaryFace()) |spec| {
+            self.tt_source = .{
+                .font_id = spec.font_id,
+                .font = spec.font,
+                .cache_key = fontCacheKey(spec),
+            };
+            if (snail.TtHintVm.init(self.allocator, spec.font)) |vm_probe| {
+                var probe = vm_probe;
+                probe.deinit();
+                self.tt_hint_supported = true;
+                for (self.tt_workers) |*w| {
+                    w.ctx = snail.TtHintContext.init(self.allocator, self.allocator, &self.tt_source) catch null;
+                    if (w.ctx == null) {
+                        // Init should not fail after a successful probe, but if
+                        // it does, disable hinting rather than half-arm it.
+                        self.tt_hint_supported = false;
+                        break;
+                    }
+                }
+            } else |_| {}
+        }
+        log.info(.atlas, "tt hinting", .{ .supported = self.tt_hint_supported });
+
         self.prep_active = true;
         // Apply thread first so it's ready to consume the extract thread's
         // first handoff.
@@ -435,6 +489,18 @@ pub const AtlasRef = struct {
         for (self.prep_contexts) |*cx| cx.deinit();
         self.allocator.free(self.prep_contexts);
         self.prep_contexts = &.{};
+        for (self.tt_workers) |*w| w.deinit();
+        self.allocator.free(self.tt_workers);
+        self.tt_workers = &.{};
+        self.tt_hint_supported = false;
+    }
+
+    /// The primary face (font_id 0, the configured monospace font) if present.
+    fn primaryFace(self: *const AtlasRef) ?snail.Face {
+        for (self.face_specs.items) |spec| {
+            if (spec.font_id == 0) return spec;
+        }
+        return null;
     }
 
     /// Hand `miss_text` to the prep thread and return immediately. Single-slot
@@ -540,10 +606,41 @@ pub const AtlasRef = struct {
         // Extraction (the ~90% cost) fans across the prep worker stripes.
         var lease = self.acquire();
         defer lease.release();
-        var outline: ?ExtractedBatch = self.planAndExtract(lease.get(), &shaped) catch blk: {
+
+        // Unhinted plan over every font — always runs, so any cell we leave
+        // unhinted (all fallback glyphs, and primary glyphs when hinting is off)
+        // always has a resident record.
+        var all_sources: std.ArrayList(snail.FontSource) = .empty;
+        defer all_sources.deinit(self.allocator);
+        self.buildAllSources(&all_sources) catch {};
+        var outline: ?ExtractedBatch = self.planAndExtract(lease.get(), &shaped, all_sources.items, .{ .unhinted = .{} }, false) catch blk: {
             prepErrCount += 1;
             break :blk null;
         };
+
+        // TrueType plan for the primary face only, when hinting is effective.
+        // Submitted as its own batch here (freshest-complete holds any row until
+        // both its unhinted and hinted records land). ppem = round(font_size),
+        // matching the render path's `ttHintedGlyph` key + placement scale.
+        if (self.ttEffective()) {
+            const ppem_px = self.bitmap_ppem.load(.monotonic);
+            if (ppem_px != 0) {
+                const ppem = snail.TtHintPpem.uniform(@as(u32, ppem_px) << 6);
+                const tt_sources = [_]snail.FontSource{self.tt_source};
+                const tt_batch: ?ExtractedBatch = self.planAndExtract(lease.get(), &shaped, &tt_sources, .{ .tt_hint = ppem }, true) catch blk: {
+                    // A font the probe accepted but that snail can't actually
+                    // hint. Disable hinting for the session so the render path
+                    // reverts to the always-resident unhinted keys — the font
+                    // stays fully usable, just unhinted. Warn once.
+                    prepErrCount += 1;
+                    if (!self.tt_hint_failed.swap(true, .monotonic)) {
+                        log.warn(.atlas, "tt hinting disabled: primary face failed to bake, rendering unhinted", .{});
+                    }
+                    break :blk null;
+                };
+                if (tt_batch) |b| self.submitApply(b);
+            }
+        }
 
         // Phase C — decode any color-bitmap (emoji) strikes in this run. Runs
         // independently of outline residency: a font-size change needs a fresh
@@ -810,6 +907,50 @@ pub const AtlasRef = struct {
         _ = c.pthread_mutex_unlock(&self.shape_lock);
     }
 
+    /// Per-worker TrueType hint state: a `TtHintContext` for the primary face
+    /// plus its cached per-ppem `TtHintSize`. Thread-confined — one per prep
+    /// worker. `ctx` is null until `startPrep` initialises it (only when
+    /// `tt_hint_supported`). A prep batch is single-ppem, so the size is built
+    /// once per batch and reused across every `.tt_glyph`/`.tt_advance` request.
+    const TtWorker = struct {
+        ctx: ?snail.TtHintContext = null,
+        size: ?snail.TtHintSize = null,
+        size_ppem_26_6: u32 = 0,
+
+        /// Prepare one TT request, (re)building the per-ppem size on demand.
+        /// The ppem rides on the request itself, so no external plumbing.
+        fn prepare(self: *TtWorker, request: snail.PrepareRequest) !snail.prepared.OwnedRecord {
+            const ppem = switch (request.operation) {
+                .tt_glyph => |o| o.ppem,
+                .tt_advance => |o| o.ppem,
+                else => return error.WrongContext,
+            };
+            if (self.ctx == null) return error.NoHinting;
+            if (self.size == null or self.size_ppem_26_6 != ppem.x_26_6) {
+                if (self.size) |*s| s.deinit();
+                self.size = null;
+                self.size = try self.ctx.?.prepareSize(ppem);
+                self.size_ppem_26_6 = ppem.x_26_6;
+            }
+            return self.ctx.?.prepare(&self.size.?, request);
+        }
+
+        fn deinit(self: *TtWorker) void {
+            if (self.size) |*s| s.deinit();
+            if (self.ctx) |*cx| cx.deinit();
+            self.* = .{};
+        }
+    };
+
+    /// Effective TT-hint state this pass: the live toggle AND primary-face
+    /// support AND no runtime bake failure. Read by the render path and the
+    /// prep thread.
+    pub fn ttEffective(self: *const AtlasRef) bool {
+        return self.tt_hint_supported and
+            !self.tt_hint_failed.load(.monotonic) and
+            self.tt_hint.load(.monotonic);
+    }
+
     /// One extraction worker. Claims contiguous chunks of request indices
     /// from a shared atomic cursor — contiguous for cache locality and to
     /// avoid false sharing on the large `results[]` slots, dynamic so workers
@@ -823,6 +964,9 @@ pub const AtlasRef = struct {
         owned: []?snail.prepared.OwnedRecord,
         results: []?snail.prepared.RecordView,
         ctx: *snail.OutlineContext,
+        /// Per-worker TT context, non-null only for a `.tt_hint` plan.
+        /// `.tt_glyph`/`.tt_advance` requests route here; `.outline` uses `ctx`.
+        tt: ?*TtWorker = null,
         cursor: *std.atomic.Value(usize),
         err: ?anyerror = null,
 
@@ -840,10 +984,15 @@ pub const AtlasRef = struct {
                 if (start >= count) break;
                 const end = @min(start + chunk, count);
                 for (start..end) |i| {
-                    // Unhinted runs are all `.outline` operations with no
-                    // inter-request dependencies, so any worker can prepare any
-                    // index in any order.
-                    const record = self.ctx.prepare(self.requests[i]) catch |e| {
+                    // Both hinted and unhinted runs are dependency-free, so any
+                    // worker prepares any index in any order. `.outline` goes to
+                    // the shared OutlineContext; `.tt_glyph`/`.tt_advance` to the
+                    // per-worker TtHintContext (populated for `.tt_hint` plans).
+                    const request = self.requests[i];
+                    const record = (switch (request.operation) {
+                        .outline => self.ctx.prepare(request),
+                        else => self.tt.?.prepare(request),
+                    }) catch |e| {
                         self.err = e;
                         return;
                     };
@@ -867,39 +1016,44 @@ pub const AtlasRef = struct {
         return key;
     }
 
-    /// Plan → parallel-prepare. Enumerates the miss glyphs not already resident
-    /// in `base` and bakes their outlines across up to `prep_workers` workers
-    /// (this thread runs one, spawns the rest); planning stays serial. Does NOT
-    /// mutate the atlas — the baked records are returned as an `ExtractedBatch`
-    /// for the apply thread to commit. Returns null when nothing new needs
-    /// baking. Any prepare error frees the partial work and propagates.
-    fn planAndExtract(
-        self: *AtlasRef,
-        base: *const snail.Atlas,
-        shaped: *const snail.ShapedText,
-    ) !?ExtractedBatch {
-        // FontSource selection set: every distinct font the runs may reference.
-        // `planRuns` skips glyphs whose font_id isn't listed and rejects
-        // duplicate ids, so dedup by font_id here.
-        var sources: std.ArrayList(snail.FontSource) = .empty;
-        defer sources.deinit(self.allocator);
+    /// FontSource selection set: every distinct font the runs may reference.
+    /// `planRuns` skips glyphs whose font_id isn't listed and rejects duplicate
+    /// ids, so dedup by font_id here. Used for the unhinted-all plan.
+    fn buildAllSources(self: *AtlasRef, out: *std.ArrayList(snail.FontSource)) !void {
         for (self.face_specs.items) |spec| {
             var dup = false;
-            for (sources.items) |s| {
+            for (out.items) |s| {
                 if (s.font_id == spec.font_id) {
                     dup = true;
                     break;
                 }
             }
             if (dup) continue;
-            try sources.append(self.allocator, .{
+            try out.append(self.allocator, .{
                 .font_id = spec.font_id,
                 .font = spec.font,
                 .cache_key = fontCacheKey(spec),
             });
         }
+    }
 
-        var plan = try snail.planRuns(base, self.allocator, sources.items, &.{shaped}, .{ .unhinted = .{} });
+    /// Plan → parallel-prepare. Enumerates the miss glyphs not already resident
+    /// in `base` and bakes them across up to `prep_workers` workers (this thread
+    /// runs one, spawns the rest); planning stays serial. `mode` selects the
+    /// hinting path and `sources` the participating fonts; when `hinted`, TT
+    /// requests route to the per-worker `TtHintContext`s. Does NOT mutate the
+    /// atlas — the baked records are returned as an `ExtractedBatch` for the
+    /// apply thread to commit. Returns null when nothing new needs baking. Any
+    /// prepare error frees the partial work and propagates.
+    fn planAndExtract(
+        self: *AtlasRef,
+        base: *const snail.Atlas,
+        shaped: *const snail.ShapedText,
+        sources: []const snail.FontSource,
+        mode: snail.PrepareMode,
+        hinted: bool,
+    ) !?ExtractedBatch {
+        var plan = try snail.planRuns(base, self.allocator, sources, &.{shaped}, mode);
         errdefer plan.deinit();
 
         const requests = plan.requests();
@@ -933,6 +1087,7 @@ pub const AtlasRef = struct {
             .owned = owned,
             .results = results,
             .ctx = &self.prep_contexts[ti],
+            .tt = if (hinted) &self.tt_workers[ti] else null,
             .cursor = &cursor,
         };
 

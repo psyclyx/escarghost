@@ -146,6 +146,9 @@ fn fillPaletteValue(s: *app_state.AppState, row: *palette_mod.Row) void {
     switch (row.id) {
         .swap_renderer => row.setValue(@tagName(s.render.active_render_path)),
         .toggle_custom_glyphs => row.setValue(if (s.refs.atlas_ref.custom_glyphs) "on" else "off"),
+        .toggle_tt_hint => row.setValue(if (!s.refs.atlas_ref.tt_hint_supported)
+            "n/a"
+        else if (s.refs.atlas_ref.tt_hint.load(.monotonic)) "on" else "off"),
         .font_increase, .font_decrease, .font_reset => {
             var buf: [16]u8 = undefined;
             row.setValue(std.fmt.bufPrint(&buf, "{d:.0}px", .{s.metrics.font_size}) catch return);

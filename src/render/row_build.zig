@@ -368,6 +368,24 @@ fn buildRow(
 
         const ppem: u16 = @intFromFloat(@round(metrics.font_size));
 
+        // TrueType hinting for the primary face (font_id 0). A column is hinted
+        // only when *every* glyph landing on it is primary, so the residency key
+        // and the `placeCellRun` key always agree and every emitted key is baked
+        // (the prep thread bakes primary TT + all-fonts unhinted). Fallback/emoji
+        // columns stay unhinted. The key ppem = round(em), matching the prep ppem
+        // and the placement `em/ppem` scale.
+        const tt_on = atlas_ref.ttEffective();
+        const ppem_26_6: u32 = @as(u32, ppem) << 6;
+        var fallback_cols = std.StaticBitSet(render_snapshot.MaxCols).initEmpty();
+        if (tt_on) {
+            for (shaped.glyphs) |glyph| {
+                if (glyph.font_id == 0) continue;
+                if (glyph.source_start >= row.byte_to_col.len) continue;
+                const col = row.byte_to_col[glyph.source_start];
+                if (col < render_snapshot.MaxCols) fallback_cols.set(col);
+            }
+        }
+
         if (shaped.glyphs.len > 0) {
             // Detect glyphs not yet present in the (immutable) atlas
             // snapshot. The render path must never mutate the shared atlas
@@ -393,11 +411,33 @@ fn buildRow(
                     }
                     continue;
                 }
-                const key = snail.record_key.unhintedGlyph(font_id, @intCast(glyph.glyph_id));
+                // Match the key `placeCellRun` will emit: primary glyphs on a
+                // hinted column resolve the TT record, everything else unhinted.
+                const col = if (glyph.source_start < row.byte_to_col.len)
+                    row.byte_to_col[glyph.source_start]
+                else
+                    render_snapshot.MaxCols;
+                const use_tt = tt_on and font_id == 0 and
+                    col < render_snapshot.MaxCols and !fallback_cols.isSet(col);
+                const key = if (use_tt)
+                    snail.record_key.ttHintedGlyph(0, @intCast(glyph.glyph_id), ppem_26_6)
+                else
+                    snail.record_key.unhintedGlyph(font_id, @intCast(glyph.glyph_id));
                 if (!atlas.contains(key)) {
                     had_misses = true;
                     break;
                 }
+            }
+
+            // Per-cell hint mode. `row` is reused scratch and `appendCell` never
+            // writes `.mode`, so set it explicitly for every cell each row (both
+            // on and off) — otherwise a mode from a previous row could linger.
+            for (row.cells[0..row.cell_count]) |*cell| {
+                cell.mode = if (tt_on and cell.column < render_snapshot.MaxCols and
+                    !fallback_cols.isSet(cell.column))
+                    .{ .tt_hint = .{ .ppem_26_6 = ppem_26_6 } }
+                else
+                    .unhinted;
             }
 
             // Place cells into shapes
@@ -406,7 +446,9 @@ fn buildRow(
                 .baseline = .{ .x = 0, .y = baseline_y },
                 .cell_width = metrics.cell_width,
                 .em = metrics.font_size,
-                .snap = .grid,
+                // Hinted glyphs want their origins on integer pixels; unhinted
+                // terminal cells keep the cheaper baseline/advance snap.
+                .snap = if (tt_on) .glyph_origins else .grid,
                 .world_to_pixel = .identity,
                 .colr = true,
             };

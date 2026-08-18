@@ -52,11 +52,17 @@ pub fn screenshot(allocator: std.mem.Allocator, io: std.Io, cfg: *const config_m
     }
     const atlas_ref = atlas_thread.atlas_ref;
     atlas_ref.custom_glyphs = cfg.custom_glyphs;
+    atlas_ref.tt_hint = .init(cfg.tt_hint);
     defer atlas_ref.stopPrep();
     const faces = atlas_thread.faces.?;
 
     // ── Metrics + grid + terminal ──
-    const m = try gpu_pipeline.computeCellMetrics(faces, cfg.font_size);
+    var m = try gpu_pipeline.computeCellMetrics(faces, cfg.font_size);
+    if (cfg.tt_hint) {
+        if (faces.fontForFace(0)) |pf| {
+            if (gpu_pipeline.hintedAdvanceWidth(allocator, pf, cfg.font_size)) |w| m.cell_width = w;
+        }
+    }
     const grid = gpu_pipeline.computeGridSize(m.cell_width, m.cell_height, opts.width, opts.height);
     var term: terminal_mod.Terminal = undefined;
     try term.init(io, grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);
@@ -149,10 +155,16 @@ pub fn screenshotCpu(allocator: std.mem.Allocator, io: std.Io, cfg: *const confi
     }
     const atlas_ref = atlas_thread.atlas_ref;
     atlas_ref.custom_glyphs = cfg.custom_glyphs;
+    atlas_ref.tt_hint = .init(cfg.tt_hint);
     defer atlas_ref.stopPrep();
     const faces = atlas_thread.faces.?;
 
-    const m = try gpu_pipeline.computeCellMetrics(faces, cfg.font_size);
+    var m = try gpu_pipeline.computeCellMetrics(faces, cfg.font_size);
+    if (cfg.tt_hint) {
+        if (faces.fontForFace(0)) |pf| {
+            if (gpu_pipeline.hintedAdvanceWidth(allocator, pf, cfg.font_size)) |w| m.cell_width = w;
+        }
+    }
     const grid = gpu_pipeline.computeGridSize(m.cell_width, m.cell_height, opts.width, opts.height);
     var term: terminal_mod.Terminal = undefined;
     try term.init(io, grid.cols, grid.rows, cfg.max_scrollback, cfg.palette, cfg.foreground, cfg.background);

@@ -126,19 +126,6 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
                 pasteFromClipboard(.clipboard);
                 return;
             },
-            // Debug: Ctrl+Shift+F1/F2/F3
-            xkb_syms.XKB_KEY_F1 => {
-                debugKillActiveRenderer();
-                return;
-            },
-            xkb_syms.XKB_KEY_F2 => {
-                debugSwapRenderer();
-                return;
-            },
-            xkb_syms.XKB_KEY_F3 => {
-                debugClearAtlas();
-                return;
-            },
             else => {},
         }
     }
@@ -571,6 +558,7 @@ fn executePaletteCommand(idx: usize) void {
             state.refs.atlas_ref.custom_glyphs = !state.refs.atlas_ref.custom_glyphs;
             render_loop.markRenderDirty(state);
         },
+        .toggle_tt_hint => toggleTtHint(),
         .swap_renderer => debugSwapRenderer(),
         .kill_renderer => debugKillActiveRenderer(),
         .force_redraw => debugClearAtlas(),
@@ -585,6 +573,32 @@ fn executePaletteCommand(idx: usize) void {
         .copy_selection => copySelectionToClipboard(),
         .paste => pasteFromClipboard(.clipboard),
     }
+}
+
+/// Flip the primary-face TrueType hinting toggle. A re-render detects the new
+/// (hinted vs unhinted) keys as misses and drives the normal prep path. Cell
+/// metrics are usually unchanged (a monospace advance rounds the same hinted or
+/// not), so we reflow the grid only if the hinted advance actually differs —
+/// otherwise this is just an in-place record swap, no reconfigure.
+fn toggleTtHint() void {
+    const ar = state.refs.atlas_ref;
+    const next = !ar.tt_hint.load(.monotonic);
+    ar.tt_hint.store(next, .monotonic);
+    if (next and !ar.tt_hint_supported) {
+        log.warn(.input, "tt hinting unsupported for primary face", .{});
+    } else {
+        log.info(.input, "tt hinting", .{ .enabled = next });
+    }
+
+    var atlas_lease = ar.acquire();
+    defer atlas_lease.release();
+    if (computeMetricsNow()) |cm| {
+        if (cm.cell_width != state.metrics.cell_width or cm.cell_height != state.metrics.cell_height) {
+            applyMetrics(cm);
+            return;
+        }
+    }
+    render_loop.markRenderDirty(state);
 }
 
 fn zoomIn() void {
@@ -602,10 +616,25 @@ fn zoomReset() void {
     applyZoom();
 }
 
-fn applyZoom() void {
-    var atlas_lease = state.refs.atlas_ref.acquire();
-    defer atlas_lease.release();
-    const cm = gpu_pipeline.computeCellMetrics(state.refs.atlas_ref.faces.?, state.metrics.font_size) catch return;
+/// Hinted cell width for the current font size when hinting is live, else null
+/// (keep the unhinted design-advance width). Only diverges from the unhinted
+/// width for a monospace face whose hint program deltas its advance per-ppem.
+fn hintedWidthNow() ?f32 {
+    const ar = state.refs.atlas_ref;
+    if (!ar.ttEffective()) return null;
+    return gpu_pipeline.hintedAdvanceWidth(ar.allocator, ar.tt_source.font, state.metrics.font_size);
+}
+
+/// Cell metrics for the current font size, with the hinted advance folded in.
+fn computeMetricsNow() ?gpu_pipeline.CellMetrics {
+    var cm = gpu_pipeline.computeCellMetrics(state.refs.atlas_ref.faces.?, state.metrics.font_size) catch return null;
+    if (hintedWidthNow()) |w| cm.cell_width = w;
+    return cm;
+}
+
+/// Push new cell metrics into AppState, resize the terminal + PTY grid, and
+/// request a GPU reconfigure. Shared by zoom and the hint toggle.
+fn applyMetrics(cm: gpu_pipeline.CellMetrics) void {
     state.metrics.font_size = cm.em;
     state.metrics.cell_width = cm.cell_width;
     state.metrics.cell_height = cm.cell_height;
@@ -619,6 +648,13 @@ fn applyZoom() void {
 
     render_loop.markRenderDirty(state);
     state.render.gpu_reconfigure_requested = true;
+}
+
+fn applyZoom() void {
+    var atlas_lease = state.refs.atlas_ref.acquire();
+    defer atlas_lease.release();
+    const cm = computeMetricsNow() orelse return;
+    applyMetrics(cm);
 }
 
 /// Copy the current selection to the regular clipboard (Ctrl+Shift+C).

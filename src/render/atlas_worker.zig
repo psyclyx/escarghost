@@ -38,6 +38,9 @@ pub const BootstrapConfig = struct {
     /// reads them and drops the references after resolving.
     fallback_fonts: []const []const u8 = &.{},
     font_size: f32,
+    /// Initial TrueType-hint state. When set (and the primary face is
+    /// TT-hintable), bootstrap sizes the cell from the hinted advance.
+    tt_hint: bool = false,
 };
 
 /// Runs font + atlas bootstrap on a worker thread, then exits. Once
@@ -164,6 +167,14 @@ pub const AtlasWorker = struct {
         // (fallbacks, Faces/HarfBuzz build, page pool, Powerline, prep thread)
         // runs on below, overlapping the fork + terminal init.
         self.cell_metrics = try gpu_pipeline.computeCellMetricsFromFont(primary_font, config.font_size);
+        // TT hinting can grid-fit the advance (only diverges for a font whose
+        // hint program deltas it); size the cell from the hinted advance so the
+        // grid matches the hinted glyphs. No-op for a normal monospace face.
+        if (config.tt_hint) {
+            if (gpu_pipeline.hintedAdvanceWidth(alloc, primary_font, config.font_size)) |w| {
+                self.cell_metrics.?.cell_width = w;
+            }
+        }
         self.bootstrap_font_path = font_path;
         log.info(.atlas, "metrics ready", .{});
         writeResponse(self.response_fds[1], self.io, .{ .tag = .metrics_ready });
