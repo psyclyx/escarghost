@@ -16,6 +16,7 @@ const app_state = @import("app_state.zig");
 const render_loop = @import("render_loop.zig");
 const input = @import("input.zig");
 const palette_mod = @import("palette.zig");
+const keybindings = @import("keybindings.zig");
 const log = @import("log.zig");
 const cli = @import("cli.zig");
 const bell_mod = @import("bell.zig");
@@ -452,6 +453,11 @@ pub fn main(init: std.process.Init) !void {
     // before the first wayland.dispatchPending, otherwise a callback can
     // fire against a half-built state.
     input.bind(&state);
+    // Build the chord→action keymap (defaults merged with config) and install it
+    // before the first key can arrive. Lives for the program.
+    var keymap = try keybindings.Keymap.build(allocator, &keybindings.default_bindings, cfg.keybindings);
+    defer keymap.deinit();
+    input.setKeymap(&keymap);
     wl.on_key = input.onKey;
     wl.on_mouse = input.onMouse;
     wl.on_touch = input.onTouch;

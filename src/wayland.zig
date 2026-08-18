@@ -116,12 +116,7 @@ pub const KeyEvent = struct {
     mods: Mods,
 };
 
-pub const Mods = struct {
-    shift: bool = false,
-    ctrl: bool = false,
-    alt: bool = false,
-    super_: bool = false,
-};
+pub const Mods = @import("modifiers.zig").Mods;
 
 pub const PendingMods = struct {
     depressed: u32 = 0,

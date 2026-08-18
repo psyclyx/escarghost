@@ -391,6 +391,21 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run.step);
         b.step("test-palette", "Run command palette tests").dependOn(&run.step);
     }
+    // keybindings.zig depends only on xkbcommon (+ leaf modules); its test
+    // module needs that one system lib.
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/keybindings.zig"),
+            .target = deps.target,
+            .optimize = deps.optimize,
+            .link_libc = true,
+        });
+        mod.linkSystemLibrary("xkbcommon", .{});
+        const tests = b.addTest(.{ .root_module = mod });
+        const run = b.addRunArtifact(tests);
+        test_step.dependOn(&run.step);
+        b.step("test-keybindings", "Run keybindings tests").dependOn(&run.step);
+    }
     // bell.zig pulls in libpulse for audio, so its test module needs
     // the same linker arg.
     {

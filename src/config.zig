@@ -20,6 +20,15 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 /// Future HiDPI work should replace this with wl_output scale × 96/72.
 pub const pt_to_px: f32 = 96.0 / 72.0;
 
+/// One raw keybinding from the config: a chord string (e.g. "ctrl+shift+c")
+/// and an action name (e.g. "copy_selection", or "none" to unbind). Kept as
+/// raw strings here — resolution to keysyms/actions happens in `keybindings.zig`
+/// so config stays a leaf. Owned when `owns_keybindings` is set.
+pub const KeyBinding = struct {
+    chord: []const u8,
+    action: []const u8,
+};
+
 pub const Config = struct {
     font_path: []const u8,
     /// Fontconfig query strings tried (in order) when the primary font
@@ -79,6 +88,10 @@ pub const Config = struct {
     // palette; this is only the initial state.
     tt_hint: bool = false,
 
+    // Chord → action overrides, merged over the built-in defaults at startup
+    // (see keybindings.zig). Owned when `owns_keybindings` is set.
+    keybindings: []const KeyBinding = &.{},
+
     // Bell behavior. mode=visual matches what users get without
     // touching config.
     bell: bell_mod.Config = .{},
@@ -92,6 +105,7 @@ pub const Config = struct {
     owns_font_path: bool = false,
     owns_shell: bool = false,
     owns_fallback_fonts: bool = false,
+    owns_keybindings: bool = false,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.owns_font_path) allocator.free(self.font_path);
@@ -99,6 +113,13 @@ pub const Config = struct {
         if (self.owns_fallback_fonts) {
             for (self.fallback_fonts) |f| allocator.free(f);
             allocator.free(self.fallback_fonts);
+        }
+        if (self.owns_keybindings) {
+            for (self.keybindings) |kb| {
+                allocator.free(kb.chord);
+                allocator.free(kb.action);
+            }
+            allocator.free(self.keybindings);
         }
     }
 };
@@ -369,6 +390,28 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8, cfg: *Config) !void
     if (obj.get("tt_hint")) |v| {
         if (v == .bool) cfg.tt_hint = v.bool;
     }
+    if (obj.get("keybindings")) |v| {
+        if (v == .object) {
+            var list: std.ArrayListUnmanaged(KeyBinding) = .empty;
+            errdefer {
+                for (list.items) |kb| {
+                    allocator.free(kb.chord);
+                    allocator.free(kb.action);
+                }
+                list.deinit(allocator);
+            }
+            var it = v.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue;
+                const chord = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(chord);
+                const action = try allocator.dupe(u8, entry.value_ptr.*.string);
+                try list.append(allocator, .{ .chord = chord, .action = action });
+            }
+            cfg.keybindings = try list.toOwnedSlice(allocator);
+            cfg.owns_keybindings = true;
+        }
+    }
     if (obj.get("touch_momentum")) |v| {
         if (v == .bool) cfg.touch_momentum = v.bool;
     }
@@ -459,6 +502,18 @@ test "parseJson tt_hint" {
     try std.testing.expectEqual(false, cfg.tt_hint);
     try parseJson(std.testing.allocator, "{\"tt_hint\": true}", &cfg);
     try std.testing.expectEqual(true, cfg.tt_hint);
+}
+
+test "parseJson keybindings" {
+    var cfg = defaults;
+    try parseJson(
+        std.testing.allocator,
+        "{\"keybindings\": {\"ctrl+shift+y\": \"paste\", \"ctrl+shift+v\": \"none\"}}",
+        &cfg,
+    );
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), cfg.keybindings.len);
+    try std.testing.expect(cfg.owns_keybindings);
 }
 
 test "parseJson colors" {

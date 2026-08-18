@@ -142,6 +142,8 @@ is not an error unless `-c` names it explicitly. All keys are optional.
 
 ## Keybindings
 
+Defaults:
+
 | Key | Action |
 | --- | --- |
 | `Ctrl+Shift+P` | Open the command palette (twiddle runtime settings) |
@@ -155,6 +157,26 @@ is not an error unless `-c` names it explicitly. All keys are optional.
 Selection copies to the primary selection automatically; typing scrolls to the
 bottom. Renderer debug actions (kill / swap CPU-GPU / clear atlas) live in the
 command palette.
+
+Rebind any of these with a `keybindings` block in the config: a map from a chord
+to an action name. Entries **merge over** the defaults — set an action to
+`"none"` to unbind a default. A chord is `+`-separated modifiers (`ctrl`,
+`shift`, `alt`, `super`) plus one key name that xkbcommon understands (`c`,
+`plus`, `Up`, `Page_Up`, `F5`, …).
+
+```jsonc
+"keybindings": {
+  "ctrl+shift+y": "paste",        // add an alias
+  "ctrl+shift+v": "none",         // unbind a default
+  "ctrl+shift+t": "toggle_tt_hint" // bind an action with no default chord
+}
+```
+
+Actions: `open_palette`, `copy_selection`, `paste`, `font_increase`,
+`font_decrease`, `font_reset`, `scroll_line_up`, `scroll_line_down`,
+`scroll_page_up`, `scroll_page_down`, `scroll_top`, `scroll_bottom`,
+`toggle_custom_glyphs`, `toggle_tt_hint`, `swap_renderer`, `kill_renderer`,
+`force_redraw`. Unrecognized chords or actions are logged and skipped.
 
 ## Renderer backends
 

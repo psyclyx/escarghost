@@ -8,6 +8,7 @@ const wayland_mod = @import("wayland.zig");
 const render_snapshot = @import("render/render_snapshot.zig");
 const gpu_pipeline = @import("render/gpu_pipeline.zig");
 const palette_mod = @import("palette.zig");
+const keybindings = @import("keybindings.zig");
 const log = @import("log.zig");
 
 const c = @cImport({
@@ -25,8 +26,17 @@ const xkb_syms = @cImport(@cInclude("xkbcommon/xkbcommon-keysyms.h"));
 // fires before bind() runs, this deref panics with `state` undefined.
 var state: *app_state.AppState = undefined;
 
+/// Resolved chord→action map (defaults merged with config), owned by `main` and
+/// installed via `setKeymap` alongside `bind`. Null before install: onKey then
+/// runs no scrgo chords (keys pass straight to the PTY).
+var keymap: ?*const keybindings.Keymap = null;
+
 pub fn bind(s: *app_state.AppState) void {
     state = s;
+}
+
+pub fn setKeymap(k: *const keybindings.Keymap) void {
+    keymap = k;
 }
 
 /// Wayland evdev codes for the buttons we care about. Imported here
@@ -63,86 +73,11 @@ pub fn onKey(ev: wayland_mod.KeyEvent) void {
         return;
     }
 
-    // Scrgo bindings (intercepted before sending to PTY)
-    if (ev.mods.ctrl and ev.mods.shift) {
-        switch (ev.keysym) {
-            // Command palette: Ctrl+Shift+P
-            xkb_syms.XKB_KEY_P, xkb_syms.XKB_KEY_p => {
-                state.palette.openReset();
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            // Zoom: Ctrl+Shift+Plus / Ctrl+Shift+Minus / Ctrl+Shift+0
-            xkb_syms.XKB_KEY_plus, xkb_syms.XKB_KEY_equal => {
-                zoomIn();
-                return;
-            },
-            xkb_syms.XKB_KEY_minus, xkb_syms.XKB_KEY_underscore => {
-                zoomOut();
-                return;
-            },
-            xkb_syms.XKB_KEY_0, xkb_syms.XKB_KEY_parenright => {
-                zoomReset();
-                return;
-            },
-            // Scroll: Ctrl+Shift+Up/Down/PageUp/PageDown/Home/End
-            xkb_syms.XKB_KEY_Up => {
-                state.refs.term.scrollViewport(-1);
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            xkb_syms.XKB_KEY_Down => {
-                state.refs.term.scrollViewport(1);
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            xkb_syms.XKB_KEY_Page_Up => {
-                state.refs.term.scrollViewport(-@as(isize, state.metrics.scroll_lines * 10));
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            xkb_syms.XKB_KEY_Page_Down => {
-                state.refs.term.scrollViewport(@as(isize, state.metrics.scroll_lines * 10));
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            xkb_syms.XKB_KEY_Home => {
-                state.refs.term.scrollToTop();
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            xkb_syms.XKB_KEY_End => {
-                state.refs.term.scrollToBottom();
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            // Copy: Ctrl+Shift+C
-            xkb_syms.XKB_KEY_C, xkb_syms.XKB_KEY_c => {
-                copySelectionToClipboard();
-                return;
-            },
-            // Paste: Ctrl+Shift+V
-            xkb_syms.XKB_KEY_V, xkb_syms.XKB_KEY_v => {
-                pasteFromClipboard(.clipboard);
-                return;
-            },
-            else => {},
-        }
-    }
-    // Shift+PageUp/Down for scroll (common terminal convention)
-    if (ev.mods.shift and !ev.mods.ctrl) {
-        switch (ev.keysym) {
-            xkb_syms.XKB_KEY_Page_Up => {
-                state.refs.term.scrollViewport(-@as(isize, state.metrics.scroll_lines * 10));
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            xkb_syms.XKB_KEY_Page_Down => {
-                state.refs.term.scrollViewport(@as(isize, state.metrics.scroll_lines * 10));
-                render_loop.markRenderDirty(state);
-                return;
-            },
-            else => {},
+    // Scrgo bindings (config-driven; intercepted before sending to PTY).
+    if (keymap) |km| {
+        if (km.lookup(ev.mods, ev.keysym)) |action| {
+            runAction(action);
+            return;
         }
     }
 
@@ -550,18 +485,36 @@ fn handlePaletteKey(ev: wayland_mod.KeyEvent) void {
 /// `palette.zig`) so it can reuse the existing action functions + global state.
 fn executePaletteCommand(idx: usize) void {
     if (idx >= palette_mod.commands.len) return;
-    switch (palette_mod.commands[idx].id) {
+    runAction(palette_mod.commands[idx].id);
+}
+
+/// The single action dispatcher, shared by the keymap (onKey) and the command
+/// palette. Every keybinding and palette command resolves to one of these.
+fn runAction(action: keybindings.Action) void {
+    switch (action) {
+        .open_palette => {
+            state.palette.openReset();
+            render_loop.markRenderDirty(state);
+        },
         .font_increase => zoomIn(),
         .font_decrease => zoomOut(),
         .font_reset => zoomReset(),
-        .toggle_custom_glyphs => {
-            state.refs.atlas_ref.custom_glyphs = !state.refs.atlas_ref.custom_glyphs;
+        .scroll_line_up => {
+            state.refs.term.scrollViewport(-1);
             render_loop.markRenderDirty(state);
         },
-        .toggle_tt_hint => toggleTtHint(),
-        .swap_renderer => debugSwapRenderer(),
-        .kill_renderer => debugKillActiveRenderer(),
-        .force_redraw => debugClearAtlas(),
+        .scroll_line_down => {
+            state.refs.term.scrollViewport(1);
+            render_loop.markRenderDirty(state);
+        },
+        .scroll_page_up => {
+            state.refs.term.scrollViewport(-@as(isize, state.metrics.scroll_lines * 10));
+            render_loop.markRenderDirty(state);
+        },
+        .scroll_page_down => {
+            state.refs.term.scrollViewport(@as(isize, state.metrics.scroll_lines * 10));
+            render_loop.markRenderDirty(state);
+        },
         .scroll_top => {
             state.refs.term.scrollToTop();
             render_loop.markRenderDirty(state);
@@ -572,6 +525,14 @@ fn executePaletteCommand(idx: usize) void {
         },
         .copy_selection => copySelectionToClipboard(),
         .paste => pasteFromClipboard(.clipboard),
+        .toggle_custom_glyphs => {
+            state.refs.atlas_ref.custom_glyphs = !state.refs.atlas_ref.custom_glyphs;
+            render_loop.markRenderDirty(state);
+        },
+        .toggle_tt_hint => toggleTtHint(),
+        .swap_renderer => debugSwapRenderer(),
+        .kill_renderer => debugKillActiveRenderer(),
+        .force_redraw => debugClearAtlas(),
     }
 }
 

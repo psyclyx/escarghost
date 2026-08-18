@@ -7,6 +7,9 @@ First tagged release. A Wayland-native terminal emulator rendering with snail
 
 ### Added
 
+- Configurable keybindings: a `keybindings` config block maps chords to actions,
+  merged over the built-in defaults (`"none"` unbinds). Chords parse via
+  xkbcommon; the palette and keymap share one action set.
 - TrueType bytecode hinting for the primary monospace face, off by default.
   Set `tt_hint` in config or toggle it at runtime from the command palette.
   Fallback faces always render unhinted; it's a no-op on non-TrueType primaries

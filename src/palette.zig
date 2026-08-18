@@ -12,22 +12,10 @@
 
 const std = @import("std");
 
-/// Stable identity for a command. `input.zig` switches on this to run the
-/// action; the metadata table below pairs each id with its display text.
-pub const CommandId = enum {
-    font_increase,
-    font_decrease,
-    font_reset,
-    toggle_custom_glyphs,
-    toggle_tt_hint,
-    swap_renderer,
-    kill_renderer,
-    force_redraw,
-    scroll_top,
-    scroll_bottom,
-    copy_selection,
-    paste,
-};
+/// A palette command's action is an `actions.Action` — the same action set
+/// keybindings dispatch to (`input.runAction`). The `commands` table below is
+/// the palette-visible subset; the metadata pairs each action with display text.
+pub const CommandId = @import("actions.zig").Action;
 
 pub const Command = struct {
     id: CommandId,
