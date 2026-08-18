@@ -1,6 +1,6 @@
 .{
     .name = .scrgo,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0xf1070878b3a5429f,
     .paths = .{""},
     .dependencies = .{

@@ -16,7 +16,7 @@
 # is much smaller than `scrgo` itself.
 stdenv.mkDerivation {
   pname = "scrgo-bench-suite";
-  version = "0.0.1";
+  version = "0.1.0";
 
   src = lib.fileset.toSource {
     root = ../../.;

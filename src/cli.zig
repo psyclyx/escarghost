@@ -13,7 +13,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 
-pub const version_string = "scrgo 0.0.1";
+pub const version_string = "scrgo 0.1.0";
 
 /// Mirror of `render_env.RequestedRenderPath`. Defined here to keep
 /// `cli.zig` free of the snail/render dependency chain, so the CLI's

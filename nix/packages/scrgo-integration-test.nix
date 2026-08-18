@@ -15,7 +15,7 @@
 # via wlroots protocols; doesn't link libghostty-vt or snail.
 stdenv.mkDerivation {
   pname = "scrgo-integration-test";
-  version = "0.0.1";
+  version = "0.1.0";
 
   src = lib.fileset.toSource {
     root = ../../.;

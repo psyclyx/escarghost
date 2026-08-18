@@ -8,7 +8,7 @@ glyph rasterizer with a GPU and CPU backend) and drives terminal state with
 model extracted from Ghostty). It talks to the compositor directly over the
 Wayland protocol — there is no GTK/Qt/SDL layer.
 
-Status: early (`0.0.1`). Usable as a daily driver on a single window, but
+Status: early (`0.1.0`). Usable as a daily driver on a single window, but
 there are no tabs, splits, or ligature/IME polish, and the config surface is
 intentionally small.
 
@@ -16,7 +16,9 @@ intentionally small.
 
 Runtime:
 
-- A Wayland compositor.
+- A Wayland compositor. The GPU renderer requires `wp_linux_drm_syncobj`
+  (explicit sync); without it the GPU path is disabled and scrgo renders on
+  the CPU.
 - A Vulkan driver (Mesa or vendor ICD) for the GPU renderer. Without one,
   scrgo falls back to the CPU renderer.
 - fontconfig (font resolution), libpulseaudio (audible bell).
@@ -114,6 +116,12 @@ is not an error unless `-c` names it explicitly. All keys are optional.
   // the font's glyphs — seam-free lines and separators. false = use font.
   "custom_glyphs": true,
 
+  // Apply TrueType bytecode hinting to the primary face (fallback faces
+  // always render unhinted). No-op if the primary isn't a static TrueType
+  // font. Toggle at runtime from the command palette; this is the initial
+  // state.
+  "tt_hint": false,
+
   "bell": {
     "mode": "visual",           // none | visual | audible | both
     "visual_duration_ms": 150,
@@ -136,6 +144,7 @@ is not an error unless `-c` names it explicitly. All keys are optional.
 
 | Key | Action |
 | --- | --- |
+| `Ctrl+Shift+P` | Open the command palette (twiddle runtime settings) |
 | `Ctrl+Shift+C` | Copy selection to clipboard |
 | `Ctrl+Shift+V` | Paste from clipboard |
 | Middle click | Paste primary selection |
@@ -144,10 +153,8 @@ is not an error unless `-c` names it explicitly. All keys are optional.
 | `Ctrl+Shift+PageUp` / `PageDown` / `Home` / `End` / `Up` / `Down` | Scroll |
 
 Selection copies to the primary selection automatically; typing scrolls to the
-bottom.
-
-Debug bindings (for development): `Ctrl+Shift+F1` kills the active renderer,
-`F2` swaps CPU/GPU, `F3` clears the glyph atlas, `F4` cycles the hinting mode.
+bottom. Renderer debug actions (kill / swap CPU-GPU / clear atlas) live in the
+command palette.
 
 ## Renderer backends
 
