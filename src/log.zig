@@ -499,6 +499,9 @@ fn writeValue(line: *Line, value: anytype) void {
 }
 
 fn flush(bytes: []const u8) void {
+    // `log_io` / `write_mutex` aren't valid until `init`. A log before then
+    // (e.g. from a unit test that never calls `init`) is a no-op, not a crash.
+    if (!initialized) return;
     _ = c.pthread_mutex_lock(&write_mutex);
     defer _ = c.pthread_mutex_unlock(&write_mutex);
     std.Io.File.stderr().writeStreamingAll(log_io, bytes) catch {};
